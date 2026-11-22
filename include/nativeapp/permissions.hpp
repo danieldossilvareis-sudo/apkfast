@@ -19,6 +19,8 @@
 #include <android/native_activity.h>
 #include <jni.h>
 
+#include "permission_types.hpp"
+
 #include <algorithm>
 #include <functional>
 #include <string>
@@ -28,23 +30,6 @@
 #include <vector>
 
 namespace nativeapp {
-
-enum class PermissionState {
-    Unknown,
-    Granted,
-    Denied,           ///< negado, mas com "rationale" (pode perguntar de novo)
-    PermanentlyDenied ///< negado e "don't ask again" (só via configurações)
-};
-
-struct PermissionResult {
-    bool all_granted = false;
-    std::vector<std::string> granted;
-    std::vector<std::string> denied;
-    bool should_show_rationale = false;
-    bool permanently_denied = false;
-
-    bool empty() const { return granted.empty() && denied.empty(); }
-};
 
 class Permissions {
 public:

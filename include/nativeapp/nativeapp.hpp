@@ -22,4 +22,5 @@
 #include "app.hpp"
 #include "gl.hpp"
 #include "permissions.hpp"
+#include "permissions_jni.hpp"
 #include "vk.hpp"

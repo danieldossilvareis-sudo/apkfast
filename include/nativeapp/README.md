@@ -104,6 +104,25 @@ Você **não precisa escrever Java** nem sobrescrever
 
 Exemplo de teste real: `examples/permissions-test`.
 
+## Permissões com raylib / SDL2 / SDL3
+
+A API funciona com qualquer engine, não só com `nativeapp::App`:
+
+| Engine | Como obter o Activity | API |
+|---|---|---|
+| `nativeapp::App` | `activity()` | `Permissions::instance(activity())` |
+| raylib | `GetAndroidApp()->activity` | `Permissions::instance(app->activity)` |
+| SDL2 | `SDL_AndroidGetActivity()` | `JniPermissions::instance(env, jobject)` |
+| SDL3 | `SDL_GetAndroidActivity()` | `JniPermissions::instance(env, jobject)` |
+
+raylib expõe `GetAndroidApp()` internamente (declare
+`extern "C" android_app* GetAndroidApp(void);`). SDL2/3 retornam o `jobject`
+da Activity; use `JniPermissions` do header `permissions_jni.hpp`, que faz o
+mesmo trabalho com `JNIEnv*` puro. Em SDL3 o JNIEnv vem de
+`SDL_GetAndroidJNIEnv()`.
+
+Exemplos: `examples/raylib-permissions` e `examples/sdl3-permissions`.
+
 ## Referência da API
 
 ### `App` — ciclo de vida

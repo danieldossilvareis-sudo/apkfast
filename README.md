@@ -109,6 +109,11 @@ Documentação completa: [`include/nativeapp/README.md`](include/nativeapp/READM
 Exemplos: `examples/nativeapp-gl`, `examples/nativeapp-vulkan` e
 `examples/permissions-test` (teste real de permissões com callback).
 
+A API de permissões também funciona com **raylib** (`GetAndroidApp()`) e
+**SDL2/SDL3** (`JniPermissions` via `SDL_AndroidGetActivity()` /
+`SDL_GetAndroidActivity()`). Exemplos: `examples/raylib-permissions` e
+`examples/sdl3-permissions`.
+
 ## Uso rápido
 
 ```sh
