@@ -163,6 +163,68 @@ public:
     bool is_shown() const { return shown_; }
     JNIEnv* env() const { return env_; }
 
+    /// Obtém o Unicode real do evento de tecla, compatível com API 21+.
+    /// - API 35+: converte o AInputEvent direto via AInputEvent_toJava.
+    /// - API 21..34: reconstrói um android.view.KeyEvent via JNI com os dados
+    ///   nativos (todos disponíveis desde API 9) e chama getUnicodeChar(meta).
+    int32_t unicode_from_event(AInputEvent* event) const {
+        if (!event || AInputEvent_getType(event) != AINPUT_EVENT_TYPE_KEY) return 0;
+        JNIEnv* env = env_;
+        if (!env) return 0;
+
+#if __ANDROID_API__ >= 35 && !defined(APKFAST_TEST_LEGACY_IME)
+        jobject java_event = AInputEvent_toJava(env, event);
+        if (java_event) {
+            jclass clazz = env->GetObjectClass(java_event);
+            jmethodID get_unicode = env->GetMethodID(clazz, "getUnicodeChar", "()I");
+            const int32_t unicode = get_unicode
+                ? env->CallIntMethod(java_event, get_unicode) : 0;
+            env->DeleteLocalRef(clazz);
+            env->DeleteLocalRef(java_event);
+            if (unicode != 0) return unicode;
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+#endif
+
+        // Fallback universal: monta KeyEvent com a assinatura de 8 argumentos
+        // existente desde API 1. getUnicodeChar(meta) resolve acentos e IMEs.
+        jclass key_class = env->FindClass("android/view/KeyEvent");
+        if (!key_class) { if (env->ExceptionCheck()) env->ExceptionClear(); return 0; }
+
+        jmethodID ctor = env->GetMethodID(
+            key_class, "<init>", "(JJIIIIII)V");
+        if (!ctor) { env->DeleteLocalRef(key_class); return 0; }
+
+        const jlong down_time = static_cast<jlong>(AKeyEvent_getDownTime(event));
+        const jlong event_time = static_cast<jlong>(AKeyEvent_getEventTime(event));
+        const jint action = AKeyEvent_getAction(event);
+        const jint code = AKeyEvent_getKeyCode(event);
+        const jint repeat = AKeyEvent_getRepeatCount(event);
+        const jint meta = AKeyEvent_getMetaState(event);
+        const jint device_id = AInputEvent_getDeviceId(event);
+        const jint scan_code = AKeyEvent_getScanCode(event);
+
+        jobject key_event = env->NewObject(
+            key_class, ctor,
+            down_time, event_time, action, code, repeat, meta, device_id, scan_code);
+        int32_t unicode = 0;
+        if (key_event) {
+            jmethodID get_unicode = env->GetMethodID(
+                key_class, "getUnicodeChar", "(I)I");
+            if (get_unicode) {
+                unicode = env->CallIntMethod(key_event, get_unicode, meta);
+            }
+            env->DeleteLocalRef(key_event);
+        }
+        env->DeleteLocalRef(key_class);
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+            return 0;
+        }
+        return unicode;
+    }
+
     using Callback = std::function<void(const std::string&, bool /*done*/)>;
     void set_callback(Callback callback) { callback_ = std::move(callback); }
 

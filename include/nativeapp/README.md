@@ -148,8 +148,15 @@ Exemplo completo: `examples/device-demo`. Validado no dispositivo:
 
 Abre o teclado do Android **sem EditText e sem classes Java customizadas**.
 Usa `InputMethodManager.toggleSoftInput(SHOW_FORCED)` (API 1+) e recebe o texto
-via eventos de tecla do IME, com unicode real via `AInputEvent_toJava()` →
-`KeyEvent.getUnicodeChar()` (API 35+). Funciona em NativeActivity, raylib e SDL.
+via eventos de tecla do IME, com unicode real em **qualquer versão (API 21+)**:
+- API 35+: `AInputEvent_toJava()` → `KeyEvent.getUnicodeChar()`
+- API 21–34: reconstrói um `android.view.KeyEvent` via JNI com os dados nativos
+  (downTime, eventTime, action, code, repeat, meta, deviceId, scanCode) e chama
+  `getUnicodeChar(meta)` — acentos e IMEs internacionais funcionam também.
+- Último recurso: mapeamento ASCII embutido.
+
+Funciona em NativeActivity, raylib e SDL. Validado nos dois caminhos (35+ e
+fallback legado forçado) com digitação `abc123`, sem crash.
 
 ```cpp
 #include <nativeapp/text_input.hpp>

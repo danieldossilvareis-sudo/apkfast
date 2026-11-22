@@ -285,23 +285,10 @@ private:
             // Repassa ao teclado virtual (se estiver aberto). O unicode vem
             // do IME e inclui acentos/símbolos de teclados internacionais.
             if (TextInput::instance(nullptr, nullptr).is_shown()) {
-                int32_t unicode = 0;
-                // API 35+: converte o evento nativo em java KeyEvent para
-                // obter o unicode real do IME (acentos, símbolos, CJK).
-                JNIEnv* jenv = TextInput::instance(nullptr, nullptr).env();
-                if (jenv) {
-                    jobject java_event = AInputEvent_toJava(jenv, event);
-                    if (java_event) {
-                        jclass clazz = jenv->GetObjectClass(java_event);
-                        jmethodID get_unicode = jenv->GetMethodID(
-                            clazz, "getUnicodeChar", "()I");
-                        if (get_unicode) {
-                            unicode = jenv->CallIntMethod(java_event, get_unicode);
-                        }
-                        jenv->DeleteLocalRef(clazz);
-                        jenv->DeleteLocalRef(java_event);
-                    }
-                }
+                // Unicode real do IME (API 21+ via fallback JNI), com
+                // mapeamento ASCII como último recurso.
+                const int32_t unicode =
+                    TextInput::instance(nullptr, nullptr).unicode_from_event(event);
                 if (TextInput::instance(nullptr, nullptr).on_key(code, down, unicode)) {
                     return 1;
                 }
