@@ -237,6 +237,18 @@ public:
     JNIEnv* env() const { return env_; }
     jobject activity() const { return activity_; }
 
+    /// Libera refs globais. Chamado pelo App::on_destroy().
+    void shutdown() {
+        if (env_ && activity_class_) {
+            env_->UnregisterNatives(activity_class_);
+            env_->DeleteGlobalRef(activity_class_);
+            activity_class_ = nullptr;
+        }
+        pending_.clear();
+        callback_ = nullptr;
+        activity_ = nullptr;
+    }
+
 private:
     JniPermissions(JNIEnv* env, jobject activity) : env_(env), activity_(activity) {
         if (env_ && activity_) {

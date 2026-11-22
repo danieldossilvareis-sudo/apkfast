@@ -7,6 +7,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from xml.sax.saxutils import escape, quoteattr
 
 TEMPLATES = ("nativeapp-gl", "nativeapp-vulkan", "raylib", "sdl2", "sdl3", "bare")
 ALL_ABIS = ("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
@@ -87,11 +88,31 @@ def _ask_permissions() -> list[str]:
     return selected
 
 
+_PACKAGE_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+")
+
+
+def _ask_int(prompt: str, default: int) -> int:
+    while True:
+        raw = _ask(prompt, str(default))
+        try:
+            return int(raw)
+        except ValueError:
+            print("  [!] Digite um número inteiro.")
+
+
 def interactive_config(args, target: Path) -> ProjectConfig | None:
     if args.yes:
+        package = f"com.example.{_slug(target.name)}"
+        # _slug pode começar com dígito (ex.: "3d-game" -> "com.example.3dgame")
+        segments = package.split(".")
+        if segments[-1] and segments[-1][0].isdigit():
+            segments[-1] = "app" + segments[-1]
+            package = ".".join(segments)
+        if not _PACKAGE_RE.fullmatch(package):
+            package = "com.example.app"
         return ProjectConfig(
             name=target.name,
-            package=f"com.example.{_slug(target.name)}",
+            package=package,
             template=args.template or "nativeapp-gl",
             abis=args.abis,
             api=args.api,
@@ -105,7 +126,7 @@ def interactive_config(args, target: Path) -> ProjectConfig | None:
     name = _ask("Nome do app", target.name)
     default_pkg = f"com.example.{_slug(name)}"
     package = _ask("Package (ex: com.empresa.app)", default_pkg)
-    if not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+", package):
+    if not _PACKAGE_RE.fullmatch(package):
         print(f"[✗] Package inválido: {package}", file=sys.stderr)
         return None
 
@@ -117,9 +138,9 @@ def interactive_config(args, target: Path) -> ProjectConfig | None:
         print("  ABIs disponíveis: " + ", ".join(ALL_ABIS))
         abis = _ask("Lista separada por vírgula", "arm64-v8a,armeabi-v7a")
 
-    api = int(_ask("API do NDK/clang", str(args.api)))
-    min_sdk = int(_ask("minSdkVersion", str(args.min_sdk)))
-    target_sdk = int(_ask("targetSdkVersion", str(args.target_sdk)))
+    api = _ask_int("API do NDK/clang", args.api)
+    min_sdk = _ask_int("minSdkVersion", args.min_sdk)
+    target_sdk = _ask_int("targetSdkVersion", args.target_sdk)
     optimize = _ask_choice(
         "Otimização:", ("release", "size", "none"), "release"
     )
@@ -166,7 +187,7 @@ def render_manifest(config: ProjectConfig) -> str:
         )
 
     permissions = "".join(
-        f'    <uses-permission android:name="{p}" />\n' for p in config.permissions
+        f'    <uses-permission android:name={quoteattr(p)} />\n' for p in config.permissions
     )
 
     activity_name = (
@@ -200,12 +221,12 @@ def render_manifest(config: ProjectConfig) -> str:
 
     return f"""<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="{config.package}">
+    package={quoteattr(config.package)}>
 
 {uses_sdk}{uses_feature}{permissions}
-    <application android:label="{config.name}"{has_code}{theme}>
+    <application android:label={quoteattr(config.name)}{has_code}{theme}>
         <activity android:name="{activity_name}"
-                  android:label="{config.name}"
+                  android:label={quoteattr(config.name)}
                   android:exported="true"{orientation}
                   android:configChanges="orientation|keyboardHidden|screenSize">
             {extra_meta}            <intent-filter>

@@ -65,6 +65,27 @@ segurança e compatibilidade.
 - TextInput: teclado abre, digitação chega
 - CI verde
 
+## Rodada final (conclusão das correções)
+
+Últimos itens fechados sem alterar comportamento já validado:
+- `Permissions::shutdown()` / `JniPermissions::shutdown()` chamados pelo
+  `App::finish()` — libera global refs mesmo se a subclasse sobrescrever
+  `on_destroy()` sem chamar a base
+- scaffold: `xml.sax.saxutils.quoteattr()` em nome/package/permissões do
+  manifest (nome `Jogo & Teste` gera `Jogo &amp; Teste`, XML válido)
+- scaffold: `_ask_int()` com retry e validação de package também no modo `-y`
+  (`3d-game` → `com.example.app3dgame`)
+- `GLES2Scene::init()` agora deriva viewport da janela automaticamente
+- `MeshData::add_triangle()` rejeita malhas acima de 65535 vértices
+- textura que falha em `load()` não fica cacheada como textura 0
+- `draw_mesh()` desativa os 4 attribute arrays após o draw
+- `mat4_look_at()` usa up alternativo quando paralelo à direção de visão
+- `Device::orientation()` usa `Display.getRotation()` (multi-window safe)
+- `Device::set_brightness()` clampa para `[-1, 1]`
+
+Validação extra: app com nome `Jogo & Teste` e diretório `3d-game` gera
+manifesto XML válido e compila; 4 apps no dispositivo vivos, 0 crash.
+
 ## Não corrigido (aceito / fora de escopo)
 - `stb_image.h` (terceirizado) continua com `STB_IMAGE_IMPLEMENTATION` no header
   público — gera código por TU, mas funciona e é opt-in implícito

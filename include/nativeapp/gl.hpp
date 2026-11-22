@@ -460,6 +460,9 @@ protected:
 
         shader_.compile(kVertexShader, kFragmentShader);
         mesh_.upload(default_mesh());
+        const int w = window ? ANativeWindow_getWidth(window) : 0;
+        const int h = window ? ANativeWindow_getHeight(window) : 0;
+        if (w > 0 && h > 0) resize(w, h);
         initialized_ = true;
     }
 
@@ -510,8 +513,14 @@ public:
             auto it = textures_.find(material.texture);
             if (it == textures_.end()) {
                 auto texture = std::make_unique<Texture>();
-                texture->load(material.texture);
-                it = textures_.emplace(material.texture, std::move(texture)).first;
+                if (!texture->load(material.texture)) {
+                    __android_log_print(ANDROID_LOG_WARN, "nativeapp-gl",
+                                        "Textura nao carregada: %s",
+                                        material.texture.c_str());
+                    shader.set_uniform("u_use_texture", 0);
+                } else {
+                    it = textures_.emplace(material.texture, std::move(texture)).first;
+                }
             }
             it->second->bind(0);
             shader.set_uniform("u_texture", 0);
@@ -523,6 +532,10 @@ public:
         else glDisable(GL_BLEND);
 
         mesh.draw();
+        glDisableVertexAttribArray(0);
+        glDisableVertexAttribArray(1);
+        glDisableVertexAttribArray(2);
+        glDisableVertexAttribArray(3);
         gl_check("draw_mesh");
     }
 

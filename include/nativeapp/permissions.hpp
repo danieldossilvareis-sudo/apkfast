@@ -335,6 +335,18 @@ private:
         }
     }
 
+public:
+    /// Libera refs globais. Chamado pelo App::on_destroy().
+    void shutdown() {
+        JNIEnv* jenv = env();
+        if (jenv) release_global_refs(jenv);
+        pending_.clear();
+        callback_ = nullptr;
+        activity_class_ = nullptr;
+        activity_ = nullptr;
+    }
+
+private:
     void release_global_refs(JNIEnv* jenv) {
         if (activity_class_) {
             jenv->DeleteGlobalRef(activity_class_);

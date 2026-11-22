@@ -71,28 +71,37 @@ public:
 
     Orientation orientation() const {
         if (!env_ || !activity_) return Orientation::Unknown;
-        jclass clazz = env_->FindClass("android/content/res/Resources");
-        if (!clazz) return Orientation::Unknown;
-        jmethodID get_config = env_->GetMethodID(
-            find_class("android/content/Context"), "getResources",
-            "()Landroid/content/res/Resources;");
-        jobject res = env_->CallObjectMethod(activity_, get_config);
-        if (!res) { env_->DeleteLocalRef(clazz); return Orientation::Unknown; }
-        jmethodID get_conf = env_->GetMethodID(
-            clazz, "getConfiguration", "()Landroid/content/res/Configuration;");
-        jobject conf = env_->CallObjectMethod(res, get_conf);
+        // getRotation() reflete a rotação real da janela mesmo em multi-window.
+        jclass context_class = find_class("android/content/Context");
+        if (!context_class) return Orientation::Unknown;
+        jmethodID get_wm = env_->GetMethodID(
+            context_class, "getWindowManager", "()Landroid/view/WindowManager;");
+        env_->DeleteLocalRef(context_class);
+        if (!get_wm) return Orientation::Unknown;
+
+        jobject wm = env_->CallObjectMethod(activity_, get_wm);
+        if (!wm) return Orientation::Unknown;
+        jclass wm_class = env_->GetObjectClass(wm);
+        jmethodID get_display = wm_class
+            ? env_->GetMethodID(wm_class, "getDefaultDisplay", "()Landroid/view/Display;")
+            : nullptr;
+        jobject display = get_display ? env_->CallObjectMethod(wm, get_display) : nullptr;
         Orientation result = Orientation::Unknown;
-        if (conf) {
-            jclass conf_class = env_->GetObjectClass(conf);
-            jfieldID field = env_->GetFieldID(conf_class, "orientation", "I");
-            const int value = env_->GetIntField(conf, field);
-            if (value == 1) result = Orientation::Portrait;
-            else if (value == 2) result = Orientation::Landscape;
-            env_->DeleteLocalRef(conf_class);
-            env_->DeleteLocalRef(conf);
+        if (display) {
+            jclass display_class = env_->GetObjectClass(display);
+            jmethodID get_rotation = display_class
+                ? env_->GetMethodID(display_class, "getRotation", "()I") : nullptr;
+            if (get_rotation) {
+                const int rotation = env_->CallIntMethod(display, get_rotation);
+                // ROTATION_0=0, 90=1, 180=2, 270=3
+                result = (rotation == 1 || rotation == 3)
+                    ? Orientation::Landscape : Orientation::Portrait;
+            }
+            if (display_class) env_->DeleteLocalRef(display_class);
+            env_->DeleteLocalRef(display);
         }
-        env_->DeleteLocalRef(res);
-        env_->DeleteLocalRef(clazz);
+        if (wm_class) env_->DeleteLocalRef(wm_class);
+        env_->DeleteLocalRef(wm);
         return result;
     }
 
@@ -128,7 +137,9 @@ public:
         jobject attrs = env_->CallObjectMethod(window, get_attrs);
         if (attrs && params_clazz) {
             jfieldID screen = env_->GetFieldID(params_clazz, "screenBrightness", "F");
-            if (screen) env_->SetFloatField(attrs, screen, value < 0 ? -1.0f : value);
+            const float clamped = value < 0 ? -1.0f
+                : (value > 1.0f ? 1.0f : value);
+            if (screen) env_->SetFloatField(attrs, screen, clamped);
             jmethodID set_attrs = env_->GetMethodID(
                 win_clazz, "setAttributes", "(Landroid/view/WindowManager$LayoutParams;)V");
             if (set_attrs) env_->CallVoidMethod(window, set_attrs, attrs);

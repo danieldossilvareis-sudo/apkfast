@@ -110,10 +110,18 @@ inline Mat4 mat4_look_at(const Vec3& eye, const Vec3& center, const Vec3& up) {
     const float zl = zl_raw > 0.0f ? zl_raw : 1.0f;
     const float z0 = zx/zl, z1 = zy/zl, z2 = zz/zl;
 
-    const float xx = up[1]*z2 - up[2]*z1;
-    const float xy = up[2]*z0 - up[0]*z2;
-    const float xz = up[0]*z1 - up[1]*z0;
-    const float xl_raw = std::sqrt(xx*xx + xy*xy + xz*xz);
+    float xx = up[1]*z2 - up[2]*z1;
+    float xy = up[2]*z0 - up[0]*z2;
+    float xz = up[0]*z1 - up[1]*z0;
+    float xl_raw = std::sqrt(xx*xx + xy*xy + xz*xz);
+    // up paralelo à direção de visão: usa eixo alternativo.
+    if (xl_raw < 1e-6f) {
+        const Vec3 alt = (std::fabs(z1) < 0.99f) ? Vec3{0,1,0} : Vec3{0,0,1};
+        xx = alt[1]*z2 - alt[2]*z1;
+        xy = alt[2]*z0 - alt[0]*z2;
+        xz = alt[0]*z1 - alt[1]*z0;
+        xl_raw = std::sqrt(xx*xx + xy*xy + xz*xz);
+    }
     const float xl = xl_raw > 0.0f ? xl_raw : 1.0f;
     const float x0 = xx/xl, x1 = xy/xl, x2 = xz/xl;
 

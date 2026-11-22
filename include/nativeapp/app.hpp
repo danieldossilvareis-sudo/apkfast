@@ -23,6 +23,7 @@
 #include "graphics_types.hpp"
 #include "input_helpers.hpp"
 #include "permissions.hpp"
+#include "permissions_jni.hpp"
 #include "text_input.hpp"
 
 #include <chrono>
@@ -75,7 +76,7 @@ public:
                 if (source) source->process(app_, source);
                 processed++;
                 if (app_->destroyRequested || state_ == Lifecycle::Destroyed) {
-                    on_destroy();
+                    finish();
                     return 0;
                 }
                 if (state_ != Lifecycle::Ready) break;
@@ -94,8 +95,15 @@ public:
                 frame_count_++;
             }
         }
-        on_destroy();
+        finish();
         return 0;
+    }
+
+    void finish() {
+        // Cleanup de refs JNI globais antes de notificar a subclasse.
+        Permissions::instance(nullptr).shutdown();
+        JniPermissions::instance(nullptr, nullptr).shutdown();
+        on_destroy();
     }
 
     // ----- Consulta de estado ----------------------------------------------
