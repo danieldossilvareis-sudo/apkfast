@@ -123,8 +123,10 @@ Exemplos: `examples/nativeapp-gl`, `examples/nativeapp-vulkan`,
 
 A API agora inclui `Shader`, `Mesh`, `Texture`, `GLContext`, `GraphicsPipeline`
 Vulkan com depth + 2 frames in-flight, matemática `Mat4`, `on_update(dt)`,
-input polling, assets via `AAssetManager` e **`TextInput`** (teclado virtual
-via JNI, sem EditText e sem Java extra). Exemplo: `examples/text-input-hello`. Veja a
+input polling, assets via `AAssetManager`, **`TextInput`** (teclado virtual
+via JNI, sem EditText), **áudio** (AAudio + OpenSLES), **sensores**,
+**gamepad/mouse** e **device** (vibração/bateria/orientação).
+Exemplos: `examples/text-input-hello` e `examples/device-demo`. Veja a
 [documentação completa](include/nativeapp/README.md).
 
 A API de permissões também funciona com **raylib** (`GetAndroidApp()`) e

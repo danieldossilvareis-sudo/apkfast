@@ -21,6 +21,7 @@
 
 #include "assets.hpp"
 #include "graphics_types.hpp"
+#include "input_helpers.hpp"
 #include "permissions.hpp"
 #include "text_input.hpp"
 
@@ -271,6 +272,7 @@ private:
     }
 
     int32_t on_input(AInputEvent* event) {
+        InputHelpers::instance().on_event(event);
         const int32_t type = AInputEvent_getType(event);
         if (type == AINPUT_EVENT_TYPE_KEY) {
             const int32_t action = AKeyEvent_getAction(event);

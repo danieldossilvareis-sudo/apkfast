@@ -20,8 +20,12 @@
 #pragma once
 
 #include "app.hpp"
+#include "audio.hpp"
+#include "device.hpp"
 #include "gl.hpp"
+#include "input_helpers.hpp"
 #include "permissions.hpp"
 #include "permissions_jni.hpp"
+#include "sensor.hpp"
 #include "text_input.hpp"
 #include "vk.hpp"

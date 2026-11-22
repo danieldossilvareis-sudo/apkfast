@@ -342,6 +342,7 @@ def _native_build(
         "-ldl",
         "-landroid",
         "-llog",
+        "-Wl,--no-as-needed", "-lOpenSLES", "-laaudio", "-Wl,--as-needed",
         *( ["-lEGL", "-lGLESv2"] if uses_gles else [] ),
         *options.extra_ldflags,
     ]

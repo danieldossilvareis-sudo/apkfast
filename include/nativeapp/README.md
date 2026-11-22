@@ -115,6 +115,35 @@ Melhorias implementadas:
 Para desenhar geometria no Vulkan, crie shaders `.spv` em `assets/` e chame
 `set_pipeline()` com o bytecode SPIR-V.
 
+## Áudio, sensores e dispositivo
+
+### `audio.hpp`
+- `Audio::instance().init()` — AAudio (API 26+, baixa latência) com fallback OpenSLES
+- `load_wav("assets/efeito.wav", buffer)` — WAV PCM 16-bit de assets
+- `play(buffer, volume)` — toca efeito
+- `set_volume(0..1)`, `using_aaudio()`
+- O builder linka automaticamente `-lOpenSLES -laaudio`
+
+### `sensor.hpp`
+- `Sensors::instance().init()` — acelerômetro + giroscópio via ASensorManager
+- `update()` a cada frame, `acceleration()` / `angular_velocity()`
+- `has_accelerometer()` / `has_gyroscope()`
+
+### `device.hpp`
+- `vibrate(ms)`, `battery_level()`, `is_charging()`
+- `orientation()` (Portrait/Landscape), `device_model()`, `android_version()`, `api_level()`
+- `set_brightness(0..1)`
+
+### `input_helpers.hpp`
+- `InputHelpers::instance()` é alimentado automaticamente pelo `App`
+- Gamepad: `gamepad_connected()`, `left_stick()`, `right_stick()`,
+  `left_trigger()`, `button_a()` etc.
+- Mouse: `mouse_x()`, `mouse_y()`, `mouse_down(Left/Right/...)`, `scroll_y()`
+- Teclado: `is_down(AKEYCODE_...)`, `last_key()`
+
+Exemplo completo: `examples/device-demo`. Validado no dispositivo:
+`device=SM-A266M`, `AAudio=1`, `accel≈9.76` (gravidade), sem crash.
+
 ## Teclado virtual (`text_input.hpp`)
 
 Abre o teclado do Android **sem EditText e sem classes Java customizadas**.
@@ -186,4 +215,8 @@ Exemplos: `examples/permissions-test`, `examples/raylib-permissions`,
 | `vk.hpp` | GraphicsPipeline, GpuBuffer, VulkanScene |
 | `permissions.hpp` / `permissions_jni.hpp` / `permission_types.hpp` | Permissões |
 | `text_input.hpp` | Teclado virtual via JNI puro |
+| `audio.hpp` | Áudio AAudio + OpenSLES, WAV de assets |
+| `sensor.hpp` | Acelerômetro/giroscópio via ASensorManager |
+| `device.hpp` | Vibração, bateria, orientação, brilho |
+| `input_helpers.hpp` | Mouse, gamepad (analog), estado de teclas |
 | `stb_image.h` | Carregamento de imagem (domínio público) |
