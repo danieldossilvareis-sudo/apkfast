@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.apkfast.sdl2hello">
+
+    <uses-feature android:glEsVersion="0x00020000" android:required="true" />
+
+    <application android:label="SDL2 hello">
+        <activity android:name="com.apkfast.sdl2hello.MainActivity"
+                  android:label="SDL2 hello"
+                  android:exported="true"
+                  android:configChanges="orientation|keyboardHidden|screenSize">
+            <meta-data android:name="android.app.lib_name" android:value="main" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

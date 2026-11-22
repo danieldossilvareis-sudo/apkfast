@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.nativehello">
+
+    <uses-feature android:glEsVersion="0x00020000" android:required="true" />
+
+    <application android:label="Native Hello" android:hasCode="false">
+        <activity android:name="android.app.NativeActivity"
+                  android:label="Native Hello"
+                  android:exported="true"
+                  android:configChanges="orientation|keyboardHidden|screenSize">
+            <meta-data android:name="android.app.lib_name"
+                       android:value="main" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

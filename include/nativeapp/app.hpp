@@ -1,0 +1,279 @@
+// nativeapp/app.hpp — Ciclo de vida e eventos para NativeActivity.
+//
+// Máquina de estados:
+//   Created -> Ready <-> Paused -> Destroyed
+//   A surface (janela nativa) pode nascer/morrer várias vezes dentro de Ready
+//   (rotação, background, diálogo de permissão). Cada mudança dispara
+//   on_surface_created() / on_surface_destroyed().
+//
+// Uso mínimo:
+//   class MeuApp : public nativeapp::App {
+//     void on_ready() override { /* init uma vez */ }
+//     void on_surface_created() override { scene_.init(window()); }
+//     void on_surface_destroyed() override { scene_.invalidate(); }
+//     void on_draw() override { scene_.render(); }
+//   };
+//   APP_MAIN(MeuApp);
+
+#pragma once
+
+#include <android_native_app_glue.h>
+
+#include "permissions.hpp"
+
+#include <cstdint>
+#include <vector>
+
+namespace nativeapp {
+
+enum class TouchAction { Down, Up, Move, Cancel };
+
+struct TouchPoint {
+    int32_t id;
+    float x;
+    float y;
+};
+
+/// Estados do ciclo de vida da aplicação.
+enum class Lifecycle {
+    Created,    ///< android_main iniciou, sem janela ainda
+    Ready,      ///< janela ativa, renderizando
+    Paused,     ///< em background (janela pode ter sido destruída)
+    Destroyed,  ///< APP_CMD_DESTROY recebido
+};
+
+class App {
+public:
+    explicit App(android_app* app) : app_(app) {}
+    virtual ~App() = default;
+
+    int run() {
+        app_->userData = this;
+        app_->onAppCmd = &App::on_app_command_thunk;
+        app_->onInputEvent = &App::on_input_thunk;
+        state_ = Lifecycle::Created;
+
+        while (state_ != Lifecycle::Destroyed) {
+            int events = 0;
+            android_poll_source* source = nullptr;
+            // timeout=0 evita travar quando o looper tem wake pendente após
+            // diálogos/rotação (bug observado em devices Samsung).
+            int processed = 0;
+            while (processed < 8 &&
+                   ALooper_pollOnce(0, nullptr, &events,
+                                    reinterpret_cast<void**>(&source)) >= 0) {
+                if (source) source->process(app_, source);
+                processed++;
+                if (app_->destroyRequested || state_ == Lifecycle::Destroyed) {
+                    on_destroy();
+                    return 0;
+                }
+                if (state_ != Lifecycle::Ready) break;
+            }
+            if (state_ == Lifecycle::Ready && native_window_ && !paused_) {
+                on_tick();
+                on_draw();
+                frame_count_++;
+            }
+        }
+        on_destroy();
+        return 0;
+    }
+
+    // ----- Consulta de estado ----------------------------------------------
+    Lifecycle lifecycle() const { return state_; }
+    bool is_ready() const { return state_ == Lifecycle::Ready && !paused_; }
+    ANativeActivity* activity() const { return app_->activity; }
+    android_app* native_app() const { return app_; }
+    ANativeWindow* window() const { return native_window_; }
+    int width() const { return width_; }
+    int height() const { return height_; }
+    uint64_t frames() const { return frame_count_; }
+    bool paused() const { return paused_; }
+    bool focused() const { return focused_; }
+
+    void request_exit() { ANativeActivity_finish(app_->activity); }
+
+    // ----- Eventos de ciclo de vida ----------------------------------------
+    virtual void on_ready() {}          ///< uma vez, após primeira janela
+    virtual void on_destroy() {}        ///< uma vez, antes de sair
+
+    virtual void on_surface_created() {}  ///< janela criada (init GL/Vulkan aqui)
+    virtual void on_surface_destroyed() {}///< janela destruída (invalidar swapchain)
+    virtual void on_surface_changed(int, int) {}  ///< resize/rotação
+
+    virtual void on_pause() {}          ///< app foi para background
+    virtual void on_resume() {}         ///< app voltou para foreground
+
+    virtual void on_draw() {}
+    virtual void on_touch(TouchAction, const std::vector<TouchPoint>&) {}
+    virtual void on_key(int32_t, bool) {}
+
+    /// Chamado a cada frame antes de on_draw().
+    virtual void on_tick() {
+        Permissions::instance(app_->activity).update();
+    }
+
+protected:
+    // Compatibilidade com código antigo. O estado agora é gerenciado pelo
+    // ciclo de vida; chamar isto não é necessário mas é inofensivo.
+    void set_ready() {}
+
+private:
+    static void on_app_command_thunk(android_app* app, int32_t cmd) {
+        static_cast<App*>(app->userData)->on_app_command(cmd);
+    }
+
+    static int32_t on_input_thunk(android_app* app, AInputEvent* event) {
+        return static_cast<App*>(app->userData)->on_input(event);
+    }
+
+    bool has_valid_window() const {
+        if (!app_->window) return false;
+        return ANativeWindow_getWidth(app_->window) > 0 &&
+               ANativeWindow_getHeight(app_->window) > 0;
+    }
+
+    /// Cria (ou recria) a surface e notifica a subclasse.
+    void activate_surface() {
+        if (!has_valid_window()) return;
+
+        const bool is_new = (native_window_ != app_->window) || !surface_active_;
+        native_window_ = app_->window;
+        width_ = ANativeWindow_getWidth(native_window_);
+        height_ = ANativeWindow_getHeight(native_window_);
+
+        if (!initialized_) {
+            initialized_ = true;
+            on_ready();
+            state_ = Lifecycle::Ready;
+        }
+
+        if (is_new) {
+            on_surface_created();
+            surface_active_ = true;
+        } else {
+            on_surface_changed(width_, height_);
+        }
+    }
+
+    /// Libera a surface atual e notifica a subclasse.
+    void deactivate_surface() {
+        if (surface_active_) {
+            on_surface_destroyed();
+            surface_active_ = false;
+        }
+        native_window_ = nullptr;
+    }
+
+    void on_app_command(int32_t cmd) {
+        switch (cmd) {
+            case APP_CMD_INIT_WINDOW:
+                activate_surface();
+                break;
+
+            case APP_CMD_TERM_WINDOW:
+                deactivate_surface();
+                if (state_ == Lifecycle::Ready) state_ = Lifecycle::Paused;
+                break;
+
+            case APP_CMD_WINDOW_RESIZED:
+            case APP_CMD_WINDOW_REDRAW_NEEDED:
+                if (has_valid_window() && surface_active_) {
+                    native_window_ = app_->window;
+                    const int w = ANativeWindow_getWidth(native_window_);
+                    const int h = ANativeWindow_getHeight(native_window_);
+                    if (w > 0 && h > 0 && (w != width_ || h != height_)) {
+                        width_ = w;
+                        height_ = h;
+                        on_surface_changed(w, h);
+                    }
+                }
+                break;
+
+            case APP_CMD_PAUSE:
+                paused_ = true;
+                on_pause();
+                break;
+
+            case APP_CMD_RESUME:
+                paused_ = false;
+                Permissions::instance(app_->activity).notify_activity_result();
+                on_resume();
+                if (state_ == Lifecycle::Paused) state_ = Lifecycle::Ready;
+                // Ao voltar de background a janela pode ser nova.
+                activate_surface();
+                break;
+
+            case APP_CMD_GAINED_FOCUS:
+                focused_ = true;
+                if (has_valid_window()) activate_surface();
+                break;
+
+            case APP_CMD_LOST_FOCUS:
+                focused_ = false;
+                break;
+
+            case APP_CMD_DESTROY:
+                deactivate_surface();
+                state_ = Lifecycle::Destroyed;
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    int32_t on_input(AInputEvent* event) {
+        const int32_t type = AInputEvent_getType(event);
+        if (type == AINPUT_EVENT_TYPE_KEY) {
+            const int32_t action = AKeyEvent_getAction(event);
+            on_key(AKeyEvent_getKeyCode(event),
+                   action == AKEY_EVENT_ACTION_DOWN || action == AKEY_EVENT_ACTION_MULTIPLE);
+            return 1;
+        }
+        if (type != AINPUT_EVENT_TYPE_MOTION) return 0;
+
+        const int32_t action = AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK;
+        TouchAction ta;
+        switch (action) {
+            case AMOTION_EVENT_ACTION_DOWN: ta = TouchAction::Down; break;
+            case AMOTION_EVENT_ACTION_UP: ta = TouchAction::Up; break;
+            case AMOTION_EVENT_ACTION_MOVE: ta = TouchAction::Move; break;
+            default: ta = TouchAction::Cancel; break;
+        }
+
+        std::vector<TouchPoint> points;
+        const size_t count = AMotionEvent_getPointerCount(event);
+        points.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            points.push_back({
+                AMotionEvent_getPointerId(event, i),
+                AMotionEvent_getX(event, i),
+                AMotionEvent_getY(event, i),
+            });
+        }
+        on_touch(ta, points);
+        return 1;
+    }
+
+    android_app* app_;
+    Lifecycle state_ = Lifecycle::Created;
+    ANativeWindow* native_window_ = nullptr;
+    int width_ = 0;
+    int height_ = 0;
+    bool initialized_ = false;  // on_ready já foi chamado
+    bool surface_active_ = false;
+    bool paused_ = false;
+    bool focused_ = false;
+    uint64_t frame_count_ = 0;
+};
+
+// Cria a instância e chama run(). Use no lugar de android_main().
+#define APP_MAIN(AppClass)                                              \
+    void android_main(struct android_app* app) {                         \
+        AppClass instance(app);                                          \
+        instance.run();                                                  \
+    }
+
+}  // namespace nativeapp

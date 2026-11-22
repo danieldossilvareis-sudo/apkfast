@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Build outputs
+build/
+dist/
+*.apk
+*.a
+*.so
+*.o
+*.dex
+*.idsig
+
+# Vendor: bibliotecas e fontes baixadas sob demanda via `apkfast setup-libs`
+vendor/
+
+# Locais/IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Secrets
+*.jks
+*.keystore
+*.pem
+*.p12
+.env
