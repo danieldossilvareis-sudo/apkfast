@@ -1,6 +1,7 @@
 # apkfast
 
 [![CI](https://github.com/danieldossilvareis-sudo/apkfast/actions/workflows/ci.yml/badge.svg)](https://github.com/danieldossilvareis-sudo/apkfast/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 CLI para **montar, compilar, otimizar e entregar APKs sem Gradle**, com suporte

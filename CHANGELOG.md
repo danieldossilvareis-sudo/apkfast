@@ -1,0 +1,66 @@
+# Changelog
+
+## [1.0.0] - 2026-11-22
+
+Primeira versão estável do apkfast. Build Android completo sem Gradle, com
+API nativa `nativeapp` e suporte a raylib/SDL2/SDL3.
+
+### Adicionado
+
+**CLI (`python3 apkfast.py`)**
+- `build` — pipeline aapt2 → clang/NDK → aapt2 link → zipalign → apksigner
+- `init` — assistente interativo (nome, pacote, template, ABIs, permissões,
+  orientação, otimização, ofuscação, keystore) com modo `-y` para CI
+- `doctor` — verificação de toolchain
+- `devices` / `install` / `logs` / `info` — operação no dispositivo via adb
+- `setup-sdk` — instala SDK/NDK pré-compilados para Termux
+- `setup-libs` / `raylib-install` / `sdl-install` — bibliotecas sob demanda
+- Multi-ABI (fat APK), `--release`, `--obfuscate`, `-q`/`--quiet`
+
+**API `nativeapp` (header-only)**
+- `App` — ciclo de vida (`Created → Ready ↔ Paused → Destroyed`), eventos de
+  superfície, `on_update(dt)`, `set_scene()`, input polling
+- `GLES2Scene` / `GLES3Scene` — `GLContext`, `Shader`, `Mesh`, `Texture`,
+  matrizes e assets via `AAssetManager`
+- `VulkanScene` — instance/device/surface/swapchain, depth buffer, render pass,
+  `GraphicsPipeline` (SPIR-V), `GpuBuffer`, 2 frames in-flight, present modes
+- `Permissions` / `JniPermissions` — runtime (API 21+), estados
+  Granted/Denied/PermanentlyDenied, callbacks assíncronos
+- `TextInput` — teclado virtual sem EditText nem Java (API 21+), unicode real
+  de IME via JNI, backspace/enter
+- `Audio` — AAudio (API 26+) com fallback OpenSLES, WAV de assets
+- `Sensors` — acelerômetro/giroscópio via callbacks no looper do App
+- `Device` — vibração, bateria, orientação, modelo, brilho
+- `InputHelpers` — mouse, gamepad analógico, estado de teclas
+- `math.hpp` — Mat4, projeções, look_at
+
+**Exemplos (10)**
+`native-hello`, `nativeapp-gl`, `nativeapp-vulkan`, `nativeapp-advanced`,
+`permissions-test`, `raylib-hello`, `raylib-permissions`, `sdl2-hello`,
+`sdl3-hello`, `sdl3-permissions`, `text-input-hello`, `device-demo`.
+
+**Infraestrutura**
+- MIT License, CONTRIBUTING.md, AUDIT.md (59 achados auditados e corrigidos)
+- CI (GitHub Actions): sintaxe Python, help dos comandos, manifests XML
+- `.gitignore` — nenhum binário versionado (repo com ~1.5 MB de .git)
+
+### Corrigido
+
+- Host-arch aware toolchain (binários x86_64 ignorados no Termux/arm64)
+- Símbolos de linkagem: `-llog`, `-lEGL/-lGLESv2`, `-lvulkan` (sem LTO),
+  `-lOpenSLES/-laaudio` com `--no-as-needed`
+- `.so`/`.dex` `ZIP_STORED` + `zipalign -P 16` (Android 15+/16 KB pages)
+- Tela preta ao voltar de background (recriação de surface/swapchain)
+- JNI na thread errada, global refs, `string_view` não terminada
+- WAV parser bounds, `SLDataSink`, volume
+- Multi-toque, busy-loop, looper roubado por sensores
+- Scaffolds SDL2/SDL3 (classes Java e constantes corretas)
+- XML escape e validação de package no assistente
+
+### Validado
+
+- 10 exemplos compilam e rodam no dispositivo (SM-A266M, Android 16, API 36)
+- 0 crash; geometria confirmada via `glReadPixels`; teclado via
+  `dumpsys input_method`; assinatura v1/v2/v3 e `zipalign -c -P 16` OK
+- Build com `--api 21` sem `-laaudio` OK
+- CI verde
