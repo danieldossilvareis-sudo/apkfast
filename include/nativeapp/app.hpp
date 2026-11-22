@@ -19,9 +19,14 @@
 
 #include <android_native_app_glue.h>
 
+#include "assets.hpp"
+#include "graphics_types.hpp"
 #include "permissions.hpp"
 
+#include <chrono>
 #include <cstdint>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace nativeapp {
@@ -52,6 +57,7 @@ public:
         app_->onAppCmd = &App::on_app_command_thunk;
         app_->onInputEvent = &App::on_input_thunk;
         state_ = Lifecycle::Created;
+        last_frame_ = std::chrono::steady_clock::now();
 
         while (state_ != Lifecycle::Destroyed) {
             int events = 0;
@@ -71,8 +77,16 @@ public:
                 if (state_ != Lifecycle::Ready) break;
             }
             if (state_ == Lifecycle::Ready && native_window_ && !paused_) {
+                const auto now = std::chrono::steady_clock::now();
+                const float dt = std::chrono::duration<float>(now - last_frame_).count();
+                last_frame_ = now;
+                delta_time_ = dt > 0.25f ? 0.25f : dt;  // clamp após background
+
                 on_tick();
+                on_update(delta_time_);
+                if (scene_) scene_->begin_frame();
                 on_draw();
+                if (scene_) scene_->present();
                 frame_count_++;
             }
         }
@@ -89,8 +103,26 @@ public:
     int width() const { return width_; }
     int height() const { return height_; }
     uint64_t frames() const { return frame_count_; }
+    float delta_time() const { return delta_time_; }
+    float fps() const { return delta_time_ > 0.0f ? 1.0f / delta_time_ : 0.0f; }
     bool paused() const { return paused_; }
     bool focused() const { return focused_; }
+
+    /// Define uma cena para o App gerenciar present() automaticamente.
+    void set_scene(Scene* scene) { scene_ = scene; }
+    Scene* scene() const { return scene_; }
+
+    // ----- Input helpers ----------------------------------------------------
+    bool is_key_down(int32_t keycode) const {
+        return keys_down_.count(keycode) > 0;
+    }
+    bool is_touch_down(int32_t pointer_id = 0) const {
+        return touches_down_.count(pointer_id) > 0;
+    }
+    TouchPoint last_touch(int32_t pointer_id = 0) const {
+        auto it = last_touches_.find(pointer_id);
+        return it != last_touches_.end() ? it->second : TouchPoint{pointer_id, 0, 0};
+    }
 
     void request_exit() { ANativeActivity_finish(app_->activity); }
 
@@ -106,6 +138,8 @@ public:
     virtual void on_resume() {}         ///< app voltou para foreground
 
     virtual void on_draw() {}
+    /// Chamado a cada frame com o delta time em segundos.
+    virtual void on_update(float) {}
     virtual void on_touch(TouchAction, const std::vector<TouchPoint>&) {}
     virtual void on_key(int32_t, bool) {}
 
@@ -145,6 +179,8 @@ private:
 
         if (!initialized_) {
             initialized_ = true;
+            // Injeta o AAssetManager antes de qualquer cena carregar assets.
+            Assets::instance(app_->activity).set_activity(app_->activity);
             on_ready();
             state_ = Lifecycle::Ready;
         }
@@ -228,8 +264,12 @@ private:
         const int32_t type = AInputEvent_getType(event);
         if (type == AINPUT_EVENT_TYPE_KEY) {
             const int32_t action = AKeyEvent_getAction(event);
-            on_key(AKeyEvent_getKeyCode(event),
-                   action == AKEY_EVENT_ACTION_DOWN || action == AKEY_EVENT_ACTION_MULTIPLE);
+            const int32_t code = AKeyEvent_getKeyCode(event);
+            const bool down = action == AKEY_EVENT_ACTION_DOWN ||
+                              action == AKEY_EVENT_ACTION_MULTIPLE;
+            if (down) keys_down_.insert(code);
+            else if (action == AKEY_EVENT_ACTION_UP) keys_down_.erase(code);
+            on_key(code, down);
             return 1;
         }
         if (type != AINPUT_EVENT_TYPE_MOTION) return 0;
@@ -253,6 +293,14 @@ private:
                 AMotionEvent_getY(event, i),
             });
         }
+        for (const auto& point : points) {
+            if (ta == TouchAction::Down || ta == TouchAction::Move) {
+                touches_down_.insert(point.id);
+                last_touches_[point.id] = point;
+            } else {
+                touches_down_.erase(point.id);
+            }
+        }
         on_touch(ta, points);
         return 1;
     }
@@ -267,6 +315,12 @@ private:
     bool paused_ = false;
     bool focused_ = false;
     uint64_t frame_count_ = 0;
+    float delta_time_ = 0.0f;
+    std::chrono::steady_clock::time_point last_frame_{};
+    Scene* scene_ = nullptr;
+    std::unordered_set<int32_t> keys_down_;
+    std::unordered_set<int32_t> touches_down_;
+    std::unordered_map<int32_t, TouchPoint> last_touches_;
 };
 
 // Cria a instância e chama run(). Use no lugar de android_main().

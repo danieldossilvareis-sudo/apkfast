@@ -106,8 +106,14 @@ APP_MAIN(App)
   ao voltar de background (evita tela preta)
 
 Documentação completa: [`include/nativeapp/README.md`](include/nativeapp/README.md).
-Exemplos: `examples/nativeapp-gl`, `examples/nativeapp-vulkan` e
+Exemplos: `examples/nativeapp-gl`, `examples/nativeapp-vulkan`,
+`examples/nativeapp-advanced` (Mesh/Material/matrizes/dt/Scene) e
 `examples/permissions-test` (teste real de permissões com callback).
+
+A API agora inclui `Shader`, `Mesh`, `Texture`, `GLContext`, `GraphicsPipeline`
+Vulkan com depth + 2 frames in-flight, matemática `Mat4`, `on_update(dt)`,
+input polling e assets via `AAssetManager`. Veja a
+[documentação completa](include/nativeapp/README.md).
 
 A API de permissões também funciona com **raylib** (`GetAndroidApp()`) e
 **SDL2/SDL3** (`JniPermissions` via `SDL_AndroidGetActivity()` /

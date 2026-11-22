@@ -1,10 +1,11 @@
 # nativeapp API
 
-API C++ header-only para criar apps `NativeActivity` sem Java, com OpenGL ES,
+API C++ header-only para criar apps nativos Android (sem Java) com OpenGL ES,
 Vulkan e permissões em runtime. O `apkfast` adiciona automaticamente
-`-I<apkfast>/include` e compila o `android_native_app_glue`.
+`-I<apkfast>/include`, compila o `android_native_app_glue` e linka as libs
+necessárias.
 
-## Início rápido (OpenGL ES)
+## Início rápido (GLES2)
 
 ```cpp
 #include <nativeapp/nativeapp.hpp>
@@ -12,207 +13,135 @@ Vulkan e permissões em runtime. O `apkfast` adiciona automaticamente
 using namespace nativeapp;
 
 class MeuApp : public App {
+public:
+    explicit MeuApp(android_app* app) : App(app) {}
+private:
     GLES2Scene scene_;
+    MeshData triangle_ = MeshData::triangle();
 
     void on_ready() override {
-        scene_.init(window());
-        scene_.resize(width(), height());
-
-        Permissions::instance(activity())
-            .request({"android.permission.VIBRATE"});
-
-        set_ready();
+        set_scene(&scene_);  // App chama begin_frame()/present()
+        scene_.set_clear_color(0.05f, 0.05f, 0.1f);
     }
-
-    void on_resize(int w, int h) override { scene_.resize(w, h); }
-    void on_draw() override { scene_.render(); }
-    void on_touch(TouchAction a, const std::vector<TouchPoint>& pts) override {
-        if (!pts.empty()) scene_.set_offset(pts[0].x / width(), pts[0].y / height());
+    void on_surface_created() override { scene_.init(window()); }
+    void on_surface_destroyed() override { scene_.destroy(); }
+    void on_surface_changed(int w, int h) override { scene_.resize(w, h); }
+    void on_draw() override {
+        Material material;
+        scene_.draw(triangle_, material);
+    }
+    void on_update(float dt) override {
+        // lógica por frame com delta time em segundos
     }
 };
-
 APP_MAIN(MeuApp)
 ```
 
-Build:
-```sh
-python3 apkfast.py build .
-```
+Exemplo completo: `examples/nativeapp-advanced`.
 
-## Vulkan
-
-Mesmo código, trocando `GLES2Scene` por `VulkanScene`:
-
-```cpp
-VulkanScene scene_;
-void on_ready() override {
-    scene_.init(activity(), window());
-    scene_.set_clear_color(0.1f, 0.2f, 0.35f);
-    set_ready();
-}
-void on_draw() override { scene_.render(); }
-```
-
-O `apkfast` detecta `#include <nativeapp/vk.hpp>` (ou `vulkan/vulkan.h`),
-adiciona `-lvulkan` e embute o stub `libvulkan.so` no APK.
-
-## Permissões em runtime
-
-### Estilo síncrono (simples)
-
-```cpp
-auto& perms = Permissions::instance(activity());
-auto r = perms.request({"android.permission.CAMERA"});
-if (!r.all_granted && r.should_show_rationale) {
-    perms.openAppSettings();
-}
-```
-
-### Estilo assíncrono (recomendado)
-
-```cpp
-void on_ready() override {
-    Permissions::instance(activity()).request_async(
-        {"android.permission.CAMERA", "android.permission.RECORD_AUDIO"},
-        [](const PermissionResult& result) {
-            if (result.all_granted) {
-                // iniciar câmera/microfone
-            } else {
-                // explicar ao usuário; result.denied contém as negadas
-            }
-        });
-}
-```
-
-O `App` já chama `Permissions::update()` a cada frame (`on_tick()`) e
-`notify_activity_result()` quando a Activity volta do diálogo (`APP_CMD_RESUME`).
-Você **não precisa escrever Java** nem sobrescrever
-`onRequestPermissionsResult` — o polling via `is_granted()` detecta a resposta.
-
-- API < 23: permissões são tratadas como já concedidas (modo legado).
-- API >= 23: usa `checkSelfPermission` / `requestPermissions` via JNI.
-- `env()` usa `JavaVM::GetEnv` + `AttachCurrentThread` — seguro na thread do
-  `android_main`, que é diferente da thread da UI.
-- Estados: `Granted`, `Denied` (pode perguntar de novo) e
-  `PermanentlyDenied` ("não perguntar novamente" — só via configurações).
-- `request_async()` dispara o callback no `APP_CMD_RESUME` seguinte ao diálogo,
-  mesmo que o usuário tenha negado (estado igual ao inicial).
-- `update()` é chamado automaticamente pelo `App::on_tick()`.
-- `openAppSettings()` / `open_app_settings()` abrem a tela de configurações.
-- `-g` no `apkfast install` concede permissões perigosas automaticamente em
-  dispositivos de teste: `python3 apkfast.py install app.apk -g`.
-
-Exemplo de teste real: `examples/permissions-test`.
-
-## Permissões com raylib / SDL2 / SDL3
-
-A API funciona com qualquer engine, não só com `nativeapp::App`:
-
-| Engine | Como obter o Activity | API |
-|---|---|---|
-| `nativeapp::App` | `activity()` | `Permissions::instance(activity())` |
-| raylib | `GetAndroidApp()->activity` | `Permissions::instance(app->activity)` |
-| SDL2 | `SDL_AndroidGetActivity()` | `JniPermissions::instance(env, jobject)` |
-| SDL3 | `SDL_GetAndroidActivity()` | `JniPermissions::instance(env, jobject)` |
-
-raylib expõe `GetAndroidApp()` internamente (declare
-`extern "C" android_app* GetAndroidApp(void);`). SDL2/3 retornam o `jobject`
-da Activity; use `JniPermissions` do header `permissions_jni.hpp`, que faz o
-mesmo trabalho com `JNIEnv*` puro. Em SDL3 o JNIEnv vem de
-`SDL_GetAndroidJNIEnv()`.
-
-Exemplos: `examples/raylib-permissions` e `examples/sdl3-permissions`.
-
-## Referência da API
-
-### `App` — ciclo de vida
+## Máquina de estados do App
 
 ```
-Created -> Ready <-> Paused -> Destroyed
+Created → Ready ↔ Paused → Destroyed
              ↕ surface
      on_surface_created / on_surface_destroyed
 ```
 
 | Método | Descrição |
 |---|---|
-| `on_ready()` | Uma vez, na primeira janela (init device/GL uma vez) |
-| `on_surface_created()` | Janela criada **ou recriada** (crie swapchain/EGL aqui) |
-| `on_surface_destroyed()` | Janela destruída (background/rotação) — invalide a swapchain |
-| `on_surface_changed(w,h)` | Resize/rotação com a surface viva |
-| `on_draw()` | Chamado a cada frame quando `is_ready()` |
-| `on_pause()` / `on_resume()` | App foi para background / voltou |
-| `on_touch(action, points)` | Multi-toque com `id/x/y` |
-| `on_key(code, down)` | Tecla física (ex.: `AKEYCODE_BACK`) |
-| `lifecycle()` | Estado atual (`Lifecycle::Created/Ready/Paused/Destroyed`) |
-| `is_ready()` | `true` se pode desenhar |
-| `width()` / `height()` / `frames()` | Estado |
+| `on_ready()` | Uma vez, antes da primeira janela |
+| `on_surface_created()` | Janela criada/recriada (init GL/Vulkan) |
+| `on_surface_destroyed()` | Janela destruída (background/rotação) |
+| `on_surface_changed(w,h)` | Resize/rotação |
+| `on_update(dt)` | Todo frame, com delta time (segundos) |
+| `on_draw()` | Todo frame (desenhe aqui) |
+| `on_pause()` / `on_resume()` | Background / foreground |
+| `on_tick()` | Processa permissões pendentes (automático) |
+| `on_touch(action, pts)` / `on_key(code, down)` | Input |
+| `set_scene(Scene*)` | App gerencia `begin_frame()`/`present()` |
+| `fps()`, `delta_time()`, `frames()` | Métricas |
+| `is_key_down(code)`, `is_touch_down(id)`, `last_touch(id)` | Input polling |
 | `request_exit()` | Encerra a Activity |
-| `APP_MAIN(Classe)` | Define `android_main()` automaticamente |
+| `lifecycle()`, `is_ready()` | Estado |
 
-> `set_ready()` ainda existe por compatibilidade, mas não é mais necessário.
-> O loop de render é controlado automaticamente pela máquina de estados.
+## API gráfica
 
-Exemplo correto para Vulkan:
+### Tipos comuns (`graphics_types.hpp`)
+- `Vertex` — posição, normal, UV, cor
+- `SpriteVertex` — versão 2D compacta
+- `MeshData` — geometria CPU com `add_triangle()`, `add_quad()`,
+  `MeshData::quad(w,h)`, `MeshData::triangle()`
+- `Material` — cor RGBA, textura (caminho em `assets/`), depth/blend
+- `Topology` — Triangles, TriangleStrip, Lines, Points...
+- `Scene` — interface comum GL/Vulkan:
+  `resize()`, `begin_frame()`, `draw()`, `present()`, `set_clear_color()`
 
-```cpp
-void on_ready() override { scene_.init(activity()); }        // device único
-void on_surface_created() override { scene_.attach(window()); }
-void on_surface_destroyed() override { scene_.invalidate(); }
-void on_surface_changed(int w, int h) override { scene_.resize(w, h); }
-void on_draw() override { scene_.render(); }
-```
+### Matemática (`math.hpp`)
+`Mat4` (column-major), `Vec3`:
+- `mat4_identity`, `mat4_multiply`, `mat4_translate`, `mat4_scale`
+- `mat4_rotate_x/y/z`, `mat4_ortho`, `mat4_ortho2d`
+- `mat4_perspective` (Vulkan 0..1), `mat4_perspective_gl` (-1..1)
+- `mat4_look_at`
 
-Isso evita a tela preta ao voltar de background: a swapchain é recriada no
-`APP_CMD_RESUME`/`APP_CMD_INIT_WINDOW`, e `VulkanScene::render()` também trata
-`VK_ERROR_OUT_OF_DATE_KHR`, `VK_SUBOPTIMAL_KHR` e `VK_ERROR_DEVICE_LOST`.
-
-### `GLES2Scene`
-| Método | Descrição |
+### OpenGL ES (`gl.hpp`)
+| Classe | Descrição |
 |---|---|
-| `init(window)` | Configura EGL + contexto GLES2 + shader padrão |
-| `resize(w,h)` | `glViewport` |
-| `set_vertices(vector<Vertex>)` | Triângulo customizado (x,y,r,g,b) |
-| `set_offset(x,y)` | Move a geometria (NDC) |
-| `render()` | Limpa e desenha |
-| `destroy()` | Libera recursos (automático no destrutor) |
+| `GLContext` | Display/context/surface EGL, `set_swap_interval()`, `recreate_surface()` |
+| `Shader` | `compile(src,src)`, `load(assets/vs,assets/fs)`, `set_uniform*()` |
+| `Mesh` | VBO + IBO reutilizável, `upload(MeshData)`, `draw()` |
+| `Texture` | PNG/JPEG de `assets/` via stb_image, `bind(unit)` |
+| `GLES2Scene` | Implementa `Scene`, shaders padrão, `set_shader()`, `set_mesh()`, `set_projection()` |
+| `GLES3Scene` | Extende GLES2 com `draw_instanced()` |
 
-### `VulkanScene`
-| Método | Descrição |
+Carregamento de assets usa `AAssetManager` (injetado automaticamente pelo App).
+`glGetError()` só é chamado em modo debug (`-DAPKFAST_DEBUG`).
+
+### Vulkan (`vk.hpp`)
+| Classe | Descrição |
 |---|---|
-| `init(activity)` | Instance/physical device/device (uma vez) |
-| `init(activity, window)` | Atalho que também chama `attach()` |
-| `attach(window)` | Cria/recria surface + swapchain |
-| `invalidate()` | Libera swapchain e surface (background) |
-| `recreate_swapchain()` | Recria com validação de extent |
-| `set_clear_color(r,g,b,a)` | Cor de clear |
-| `resize(w,h)` | Recria swapchain (alias) |
-| `render()` | Clear + present; trata OUT_OF_DATE / DEVICE_LOST |
+| `GraphicsPipeline` | Builder: vertex/fragment SPIR-V, depth, blend, topology |
+| `GpuBuffer` | Upload de `MeshData` para VBO/IBO |
+| `VulkanScene` | Instance/device/surface/swapchain/depth/framebuffers, **2 frames in-flight**, `set_pipeline()`, `set_present_mode()` |
 
-### `Permissions`
-| Método | Descrição |
+Melhorias implementadas:
+- **Depth buffer** (D32/D24/D16 conforme suporte)
+- **Render pass** com color + depth attachments
+- **2 frames in-flight** com fences por imagem (não serializa CPU/GPU)
+- **Device selection** prefere GPU discreta
+- **Present mode** configurável (FIFO padrão, MAILBOX/IMMEDIATE)
+- Tratamento de `VK_ERROR_OUT_OF_DATE_KHR`, `VK_SUBOPTIMAL_KHR`, `VK_ERROR_DEVICE_LOST`
+- Device loss/reenvio de swapchain preservam a janela corretamente
+
+Para desenhar geometria no Vulkan, crie shaders `.spv` em `assets/` e chame
+`set_pipeline()` com o bytecode SPIR-V.
+
+## Permissões em runtime
+
+`Permissions` (ANativeActivity*) e `JniPermissions` (JNIEnv* + jobject, para
+SDL2/SDL3) com `request_async(callback)` disparado no RESUME após o diálogo.
+
+ Estados: `Granted`, `Denied`, `PermanentlyDenied`.
+
+| Engine | API |
 |---|---|
-| `state_of(perm)` | Retorna `PermissionState` detalhado |
-| `is_granted(perm)` | Atalho para `state_of(...) == Granted` |
-| `request({perms})` | Solicita; retorna `PermissionResult` inicial |
-| `request_async({perms}, callback)` | Solicita e dispara callback quando respondido |
-| `update()` | Processa callback pendente (chamado por `App::on_tick`) |
-| `notify_activity_result()` | Sinaliza retorno do diálogo (chamado por `App`) |
-| `has_pending()` | `true` se há callback aguardando resposta |
-| `openAppSettings()` | Abre configurações do app |
-| `package_name()` | Nome do pacote |
-| `runtime_permissions_available()` | `true` se API >= 23 |
+| `nativeapp::App` | `Permissions::instance(activity())` |
+| raylib | `Permissions::instance(GetAndroidApp()->activity)` |
+| SDL2 | `JniPermissions::instance(env, SDL_AndroidGetActivity())` |
+| SDL3 | `JniPermissions::instance(SDL_GetAndroidJNIEnv(), SDL_GetAndroidActivity())` |
 
-## Notas
+Exemplos: `examples/permissions-test`, `examples/raylib-permissions`,
+`examples/sdl3-permissions`.
 
-- Use `--obfuscate` para esconder símbolos da sua cena (recomendado em release).
-- Use `--abi all` para gerar fat APK com todas as arquiteturas.
-- Exemplos completos: `examples/nativeapp-gl` e `examples/nativeapp-vulkan`.
-- `App::run()` usa `ALooper_pollOnce` com `timeout=0` e limita eventos por
-  iteração — isso evita o loop travar antes da janela existir (causa comum
-  de tela preta). `activate_window()` reconecta a surface após diálogos de
-  permissão, teclado ou rotação.
-- `GLES2Scene::set_clear_color(r,g,b,a)` define a cor de fundo.
-- Vulkan: use `-lvulkan`, mas **não embuta** `libvulkan.so` do NDK — o Android
-  fornece a implementação real em tempo de execução. O apkfast desativa LTO e
-  força `-Wl,--no-as-needed -lvulkan` para manter o `DT_NEEDED` (sem isso o
-  `dlopen` falha com `cannot locate symbol vkCreateInstance`).
+## Arquivos do módulo
+
+| Header | Conteúdo |
+|---|---|
+| `nativeapp.hpp` | Umbrella (inclui tudo) |
+| `app.hpp` | Ciclo de vida, input, Scene management |
+| `graphics_types.hpp` | Vertex, MeshData, Material, Scene |
+| `math.hpp` | Mat4, projeções |
+| `assets.hpp` | AAssetManager |
+| `gl.hpp` | GLContext, Shader, Mesh, Texture, GLES2/3Scene |
+| `vk.hpp` | GraphicsPipeline, GpuBuffer, VulkanScene |
+| `permissions.hpp` / `permissions_jni.hpp` / `permission_types.hpp` | Permissões |
+| `stb_image.h` | Carregamento de imagem (domínio público) |
