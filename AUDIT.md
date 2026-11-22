@@ -106,6 +106,12 @@ de eventos (já no HEAD) evita o travamento do `INIT_WINDOW` que causava
 Validação final: 10 exemplos compilam; GL e VK no dispositivo com PID ativo,
 0 crash; `glReadPixels` confirma geometria no framebuffer.
 
+TextInput também confirmado via `glReadPixels`: `nonbg=40000` pixels (exatamente
+o quadrado 200×200 do exemplo), `mInputShown=true` no `dumpsys input_method`,
+texto chegando via callback. O "não desenha/não abre teclado" relatado era
+limitação do `screencap` do adb neste dispositivo Samsung, que captura apenas
+o clear color das surfaces EGL — não o conteúdo renderizado.
+
 ## Não corrigido (aceito / fora de escopo)
 - `stb_image.h` (terceirizado) continua com `STB_IMAGE_IMPLEMENTATION` no header
   público — gera código por TU, mas funciona e é opt-in implícito
