@@ -91,9 +91,18 @@ Você **não precisa escrever Java** nem sobrescrever
 
 - API < 23: permissões são tratadas como já concedidas (modo legado).
 - API >= 23: usa `checkSelfPermission` / `requestPermissions` via JNI.
-- `permissions.hpp` usa `activity_->env` (thread principal, segura no `on_ready`).
+- `env()` usa `JavaVM::GetEnv` + `AttachCurrentThread` — seguro na thread do
+  `android_main`, que é diferente da thread da UI.
+- Estados: `Granted`, `Denied` (pode perguntar de novo) e
+  `PermanentlyDenied` ("não perguntar novamente" — só via configurações).
+- `request_async()` dispara o callback no `APP_CMD_RESUME` seguinte ao diálogo,
+  mesmo que o usuário tenha negado (estado igual ao inicial).
+- `update()` é chamado automaticamente pelo `App::on_tick()`.
+- `openAppSettings()` / `open_app_settings()` abrem a tela de configurações.
 - `-g` no `apkfast install` concede permissões perigosas automaticamente em
   dispositivos de teste: `python3 apkfast.py install app.apk -g`.
+
+Exemplo de teste real: `examples/permissions-test`.
 
 ## Referência da API
 
@@ -163,8 +172,9 @@ Isso evita a tela preta ao voltar de background: a swapchain é recriada no
 ### `Permissions`
 | Método | Descrição |
 |---|---|
-| `is_granted(perm)` | Consulta estado |
-| `request({perms})` | Solicita; retorna `PermissionResult` |
+| `state_of(perm)` | Retorna `PermissionState` detalhado |
+| `is_granted(perm)` | Atalho para `state_of(...) == Granted` |
+| `request({perms})` | Solicita; retorna `PermissionResult` inicial |
 | `request_async({perms}, callback)` | Solicita e dispara callback quando respondido |
 | `update()` | Processa callback pendente (chamado por `App::on_tick`) |
 | `notify_activity_result()` | Sinaliza retorno do diálogo (chamado por `App`) |

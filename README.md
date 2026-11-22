@@ -106,7 +106,8 @@ APP_MAIN(App)
   ao voltar de background (evita tela preta)
 
 Documentação completa: [`include/nativeapp/README.md`](include/nativeapp/README.md).
-Exemplos: `examples/nativeapp-gl` e `examples/nativeapp-vulkan`.
+Exemplos: `examples/nativeapp-gl`, `examples/nativeapp-vulkan` e
+`examples/permissions-test` (teste real de permissões com callback).
 
 ## Uso rápido
 
