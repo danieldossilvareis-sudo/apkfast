@@ -89,86 +89,6 @@ def _add_build_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-NATIVE_MANIFEST = """<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.example.nativehello">
-
-    <uses-feature android:glEsVersion="0x00020000" android:required="true" />
-
-    <application android:label="Native Hello" android:hasCode="false">
-        <activity android:name="android.app.NativeActivity"
-                  android:label="Native Hello"
-                  android:exported="true"
-                  android:configChanges="orientation|keyboardHidden|screenSize">
-            <meta-data android:name="android.app.lib_name"
-                       android:value="main" />
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
-    </application>
-</manifest>
-"""
-
-NATIVE_SOURCE = r"""#include <android/native_activity.h>
-#include <android/log.h>
-#include <android_native_app_glue.h>
-#include <EGL/egl.h>
-#include <GLES2/gl2.h>
-
-#include <cstring>
-
-#define LOG_TAG "native-hello"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-
-static void onAppCmd(struct android_app* app, int32_t cmd) {
-    switch (cmd) {
-        case APP_CMD_INIT_WINDOW:
-            LOGI("APP_CMD_INIT_WINDOW");
-            break;
-        case APP_CMD_TERM_WINDOW:
-            LOGI("APP_CMD_TERM_WINDOW");
-            break;
-        default:
-            break;
-    }
-}
-
-static int32_t onInputEvent(struct android_app*, AInputEvent*) {
-    return 0;
-}
-
-void android_main(struct android_app* app) {
-    app->onAppCmd = onAppCmd;
-    app->onInputEvent = onInputEvent;
-
-    LOGI("NativeActivity iniciada sem Java!");
-
-    ANativeWindow* window = nullptr;
-    while (true) {
-        int events;
-        struct android_poll_source* source;
-        while (ALooper_pollOnce(-1, nullptr, &events, (void**)&source) >= 0) {
-            if (source) source->process(app, source);
-            if (app->destroyRequested) return;
-        }
-        if (app->window && !window) {
-            window = app->window;
-            LOGI("Janela nativa pronta: %dx%d",
-                 ANativeWindow_getWidth(window), ANativeWindow_getHeight(window));
-        }
-    }
-}
-"""
-
-NATIVE_CMAKE_HINT = """# apkfast não usa CMake, mas este arquivo ajuda editores a indexarem o código.
-cmake_minimum_required(VERSION 3.22)
-project(native_hello C CXX)
-add_library(main SHARED main.cpp)
-"""
-
-
 def _cmd_build(args: argparse.Namespace) -> int:
     from .builder import Logger
 
@@ -209,20 +129,23 @@ def _cmd_build(args: argparse.Namespace) -> int:
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
+    from .scaffold import create_project, interactive_config
+
     target = Path(args.name).expanduser().resolve()
     if target.exists() and any(target.iterdir()) and not args.force:
         print(f"[✗] Diretório não vazio: {target} (use --force)", file=sys.stderr)
         return 1
-    (target / "jni").mkdir(parents=True, exist_ok=True)
-    (target / "assets").mkdir(parents=True, exist_ok=True)
-    (target / "AndroidManifest.xml").write_text(NATIVE_MANIFEST, encoding="utf-8")
-    (target / "jni" / "main.cpp").write_text(NATIVE_SOURCE, encoding="utf-8")
-    (target / "CMakeLists.txt").write_text(NATIVE_CMAKE_HINT, encoding="utf-8")
-    (target / "apkfast.json").write_text(
-        json.dumps({"nativeLibraryName": "main"}, indent=2) + "\n", encoding="utf-8"
-    )
-    _say(args, f"[✓] Projeto NativeActivity criado em {target}")
-    _say(args, f"    cd {target} && apkfast build")
+
+    config = interactive_config(args, target)
+    if config is None:
+        return 1
+
+    create_project(target, config)
+    _say(args, f"[✓] Projeto criado em {target}")
+    _say(args, f"    template: {config.template} | package: {config.package}")
+    _say(args, f"    cd {target} && python3 ../../apkfast.py build")
+    if config.template in ("raylib", "sdl2", "sdl3"):
+        _say(args, "    (instale as libs: python3 ../../apkfast.py setup-libs)")
     return 0
 
 
@@ -392,9 +315,22 @@ def create_parser() -> argparse.ArgumentParser:
     _add_build_args(p_build)
     p_build.set_defaults(func=_cmd_build)
 
-    p_init = sub.add_parser("init", help="cria projeto NativeActivity de exemplo")
+    p_init = sub.add_parser("init", help="cria projeto com assistente interativo")
     p_init.add_argument("name", help="nome/diretório do projeto")
     p_init.add_argument("--force", action="store_true", help="sobrescreve diretório existente")
+    p_init.add_argument(
+        "--template",
+        choices=("nativeapp-gl", "nativeapp-vulkan", "raylib", "sdl2", "sdl3", "bare"),
+        help="template (pula a pergunta)",
+    )
+    p_init.add_argument("--abis", default="arm64-v8a", help="ABIs (default: arm64-v8a)")
+    p_init.add_argument("--api", type=int, default=36, help="API do NDK (default: 36)")
+    p_init.add_argument("--min-sdk", type=int, default=21, help="minSdk (default: 21)")
+    p_init.add_argument("--target-sdk", type=int, default=36, help="targetSdk (default: 36)")
+    p_init.add_argument(
+        "-y", "--yes", action="store_true",
+        help="sem perguntas: usa defaults (ou --template/--abis)",
+    )
     _add_quiet(p_init)
     p_init.set_defaults(func=_cmd_init)
 

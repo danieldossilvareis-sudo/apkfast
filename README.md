@@ -58,6 +58,29 @@ class App : public nativeapp::App {
 APP_MAIN(App)
 ```
 
+## Assistente `init`
+
+`apkfast init` faz perguntas e gera um projeto completo:
+
+```sh
+python3 apkfast.py init meu-app
+```
+
+Perguntas: nome, package, template (`nativeapp-gl`, `nativeapp-vulkan`,
+`raylib`, `sdl2`, `sdl3`, `bare`), ABIs, API/minSdk/targetSdk, otimização,
+ofuscação, orientação, tela cheia, permissões (multi-select) e keystore release.
+
+O projeto gerado já vem com `AndroidManifest.xml`, `jni/main.cpp`,
+`apkfast.json` (com todas as escolhas), `README.md`, e — para SDL — a
+`MainActivity.java` com `getLibraries()` correto.
+
+Modo não-interativo:
+
+```sh
+python3 apkfast.py init meu-app -y --template nativeapp-vulkan --abis all
+python3 apkfast.py init jogo -y --template sdl3 --abis arm64-v8a,armeabi-v7a
+```
+
 ## API nativeapp (novo)
 
 Para não precisar escrever EGL/Vulkan/JNI na mão, use a API header-only em
@@ -91,8 +114,12 @@ Exemplos: `examples/nativeapp-gl` e `examples/nativeapp-vulkan`.
 # Verifica o ambiente
 python3 apkfast.py doctor
 
-# Cria projeto NativeActivity de exemplo
-python3 apkfast.py init examples/native-hello
+# Cria projeto com assistente interativo (nome, pacote, template, ABIs,
+# permissões, orientação, otimização, ofuscação, keystore...)
+python3 apkfast.py init meu-app
+
+# Modo não-interativo (para scripts/CI)
+python3 apkfast.py init meu-app -y --template sdl3 --abis all
 
 # Compila e gera APK assinado
 cd examples/native-hello

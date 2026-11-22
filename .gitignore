@@ -18,6 +18,9 @@ dist/
 # Vendor: bibliotecas e fontes baixadas sob demanda via `apkfast setup-libs`
 vendor/
 
+# Projetos locais de teste (fora de examples/)
+/sonicmaker/
+
 # Locais/IDE
 .vscode/
 .idea/
