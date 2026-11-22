@@ -27,6 +27,10 @@ git clone https://github.com/apkfast/apkfast.git
 cd apkfast
 chmod +x apkfast.py
 
+# (Opcional) Instala SDK + NDK pré-compilados para Termux
+python3 apkfast.py setup-sdk              # ~340 MB em ~/Android
+python3 apkfast.py setup-sdk --list-versions
+
 # Verifica o ambiente
 python3 apkfast.py doctor
 
@@ -39,6 +43,13 @@ ln -s "$PWD/apkfast.py" "$PREFIX/bin/apkfast"
 
 > O repositório **não versiona** bibliotecas binárias. `setup-libs` baixa e
 > compila raylib/SDL2/SDL3 para as ABIs escolhidas usando o seu NDK.
+>
+> `setup-sdk` instala SDK/NDK pré-compilados para `aarch64-linux-android`
+> (Termux) a partir dos releases de
+> [HomuHomu833/android-sdk-custom](https://github.com/HomuHomu833/android-sdk-custom)
+> e [HomuHomu833/android-ndk-custom](https://github.com/HomuHomu833/android-ndk-custom).
+> Se você já tem SDK/NDK em `~/Android`, o comando detecta e não baixa nada
+> (use `--force` para reinstalar).
 
 ## Novo modelo de ciclo de vida (nativeapp)
 

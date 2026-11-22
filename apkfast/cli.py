@@ -194,6 +194,37 @@ def _cmd_install(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_setup_sdk(args: argparse.Namespace) -> int:
+    from .sdk_setup import SetupError, install_sdk, list_versions
+
+    if args.list_versions:
+        print("SDK (android-sdk-custom):")
+        for version in list_versions("HomuHomu833/android-sdk-custom"):
+            print(f"  {version}")
+        print("NDK (android-ndk-custom):")
+        for version in list_versions("HomuHomu833/android-ndk-custom"):
+            print(f"  {version}")
+        return 0
+
+    try:
+        paths = install_sdk(
+            target=Path(args.target) if args.target else None,
+            sdk_version=args.sdk_version,
+            ndk_version=args.ndk_version,
+            platform_api=args.platform_api,
+            force=args.force,
+            quiet=args.quiet,
+            assume_yes=args.yes,
+        )
+    except SetupError as exc:
+        print(f"[✗] {exc}", file=sys.stderr)
+        return 1
+    _say(args, f"[✓] SDK: {paths['sdk']}")
+    _say(args, f"[✓] NDK: {paths['ndk']}")
+    _say(args, "Rode: python3 apkfast.py doctor")
+    return 0
+
+
 def _cmd_setup_libs(args: argparse.Namespace) -> int:
     """Baixa/compila raylib + SDL2 + SDL3 para as ABIs pedidas."""
     from .raylib import RaylibError, install as raylib_install
@@ -360,6 +391,20 @@ def create_parser() -> argparse.ArgumentParser:
     p_devices.add_argument("--restart", action="store_true", help="reinicia servidor adb antes")
     _add_quiet(p_devices)
     p_devices.set_defaults(func=_cmd_devices)
+
+    p_setup_sdk = sub.add_parser("setup-sdk", help="instala SDK/NDK para Termux")
+    p_setup_sdk.add_argument("--target", help="diretório base (default: ~/Android)")
+    p_setup_sdk.add_argument("--sdk-version", help="versão do SDK (ex: 37.0.0)")
+    p_setup_sdk.add_argument("--ndk-version", help="versão do NDK (ex: r30)")
+    p_setup_sdk.add_argument(
+        "--platform-api", type=int, default=36,
+        help="API da platform a instalar via sdkmanager (default: 36)",
+    )
+    p_setup_sdk.add_argument("--force", action="store_true", help="reinstala se já existir")
+    p_setup_sdk.add_argument("--list-versions", action="store_true", help="lista releases")
+    p_setup_sdk.add_argument("-y", "--yes", action="store_true", help="sem confirmação")
+    _add_quiet(p_setup_sdk)
+    p_setup_sdk.set_defaults(func=_cmd_setup_sdk)
 
     p_setup = sub.add_parser("setup-libs", help="baixa/compila raylib + SDL2 + SDL3")
     p_setup.add_argument(
