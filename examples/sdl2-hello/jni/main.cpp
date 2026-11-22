@@ -1,4 +1,4 @@
-// SDL2 em NativeActivity — sem Java, sem Gradle.
+// SDL2 com SDLActivity (classe Java oficial do SDL incluída em java/).
 #include <SDL.h>
 #include <SDL_main.h>
 
