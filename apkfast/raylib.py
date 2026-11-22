@@ -71,7 +71,7 @@ def install(abi: str = "arm64-v8a", api: int = 36, *, quiet: bool = False) -> Pa
         "-DCMAKE_BUILD_TYPE=Release",
         "-DBUILD_SHARED_LIBS=OFF",
         "-DPLATFORM=Android",
-        "-DRAYLIB_BUILD_EXAMPLES=OFF",
+        "-DBUILD_EXAMPLES=OFF",
     ], quiet=quiet)
     # Compila apenas o target raylib (evita exemplos que exigem GL desktop).
     _run([cmake, "--build", str(build_dir), "--target", "raylib", "-j4"], quiet=quiet)

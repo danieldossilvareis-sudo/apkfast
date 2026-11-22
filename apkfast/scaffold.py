@@ -298,29 +298,29 @@ int main(void) {
         create = (
             'SDL_CreateWindow("SDL", 0, 0, 0, 0, SDL_WINDOW_SHOWN)'
             if config.template == "sdl2"
-            else 'SDL_CreateWindow("SDL", 0, 0, SDL_WINDOW_SHOWN)'
+            else 'SDL_CreateWindow("SDL", 0, 0, 0)'
         )
+        quit_event = "SDL_QUIT" if config.template == "sdl2" else "SDL_EVENT_QUIT"
         color = "SDL_SetRenderDrawColor(renderer, 0, 82, 172, 255);"
+        create_renderer = (
+            "SDL_CreateRenderer(window, -1, 0)"
+            if config.template == "sdl2"
+            else "SDL_CreateRenderer(window, nullptr)"
+        )
         return f"""#include {include}
 #include {main_inc}
-#include <android_native_app_glue.h>
-#include <android/log.h>
 
-extern "C" void android_main(android_app* app) {{
-    (void)app;
-    SDL_main(0, nullptr);
-}}
-
+// SDLActivity (Java) chama SDL_main diretamente; não precisa de android_main.
 int main(int argc, char* argv[]) {{
     (void)argc; (void)argv;
     if ({init}) return 1;
     SDL_Window* window = {create};
-    SDL_Renderer* renderer = SDL_CreateRenderer(window, nullptr);
+    SDL_Renderer* renderer = {create_renderer};
     bool running = true;
     SDL_Event event;
     while (running) {{
         while (SDL_PollEvent(&event)) {{
-            if (event.type == SDL_QUIT) running = false;
+            if (event.type == {quit_event}) running = false;
         }}
         {color}
         SDL_RenderClear(renderer);
@@ -390,6 +390,33 @@ def create_project(target: Path, config: ProjectConfig) -> None:
         (java_root / "MainActivity.java").write_text(
             render_sdl_activity(config), encoding="utf-8"
         )
+
+        # SDLActivity e derivadas vivem no sdk do SDL e são necessárias para
+        # compilar o MainActivity. Copia-las para o projeto (nos exemplos isso
+        # era feito manualmente).
+        sdl_version = 2 if config.template == "sdl2" else 3
+        sdl_java = (
+            Path(__file__).resolve().parent.parent
+            / "vendor"
+            / f"sdl{sdl_version}"
+            / "src"
+            / "android-project"
+            / "app"
+            / "src"
+            / "main"
+            / "java"
+            / "org"
+            / "libsdl"
+            / "app"
+        )
+        if sdl_java.is_dir():
+            dest = target / "java" / "org" / "libsdl" / "app"
+            dest.mkdir(parents=True, exist_ok=True)
+            for source in sorted(sdl_java.glob("*.java")):
+                (dest / source.name).write_text(
+                    source.read_text(encoding="utf-8", errors="ignore"),
+                    encoding="utf-8",
+                )
 
     if config.template == "raylib" and config.abis == "all":
         (target / "NOTES.md").write_text(

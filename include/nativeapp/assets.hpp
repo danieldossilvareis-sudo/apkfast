@@ -36,10 +36,17 @@ public:
         if (!manager_) return result;
         AAsset* asset = AAssetManager_open(manager_, path.c_str(), AASSET_MODE_BUFFER);
         if (!asset) return result;
-        const size_t size = static_cast<size_t>(AAsset_getLength64(asset));
+        const int64_t length = AAsset_getLength64(asset);
+        if (length < 0) { AAsset_close(asset); return result; }
+        const size_t size = static_cast<size_t>(length);
         result.resize(size);
         if (size > 0) {
-            AAsset_read(asset, result.data(), size);
+            const int bytes = AAsset_read(asset, result.data(), size);
+            if (bytes > 0) {
+                result.resize(static_cast<size_t>(bytes));
+            } else {
+                result.clear();
+            }
         }
         AAsset_close(asset);
         return result;
@@ -47,6 +54,7 @@ public:
 
     std::string read_text(const std::string& path) const {
         const auto data = read(path);
+        if (data.empty()) return {};
         return std::string(reinterpret_cast<const char*>(data.data()), data.size());
     }
 

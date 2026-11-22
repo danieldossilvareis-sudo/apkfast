@@ -75,7 +75,8 @@ public:
         if (!jenv) return PermissionState::Unknown;
         if (!runtime_permissions_available()) return PermissionState::Granted;
 
-        jstring jperm = jenv->NewStringUTF(permission.data());
+        const std::string perm_str(permission);
+        jstring jperm = jenv->NewStringUTF(perm_str.c_str());
         const jint check = jenv->CallIntMethod(
             activity_->clazz,
             method(jenv, "checkSelfPermission", "(Ljava/lang/String;)I"),
@@ -89,7 +90,8 @@ public:
         // solicitação é o comportamento normal do Android.
         if (!was_requested(permission)) return PermissionState::Denied;
 
-        jstring jrationale = jenv->NewStringUTF(permission.data());
+        const std::string rationale_str(permission);
+        jstring jrationale = jenv->NewStringUTF(rationale_str.c_str());
         const jboolean rationale = jenv->CallBooleanMethod(
             activity_->clazz,
             method(jenv, "shouldShowRequestPermissionRationale", "(Ljava/lang/String;)Z"),

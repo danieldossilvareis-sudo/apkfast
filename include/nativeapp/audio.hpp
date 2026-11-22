@@ -29,6 +29,8 @@ struct AudioBuffer {
 
 class Audio {
 public:
+    ~Audio() { destroy(); }
+
     static Audio& instance() {
         static Audio singleton;
         return singleton;
@@ -65,6 +67,11 @@ public:
         while (offset + 8 <= data.size()) {
             const char* chunk_id = reinterpret_cast<const char*>(data.data() + offset);
             const uint32_t chunk_size = le32(data.data() + offset + 4);
+            // Valida o tamanho do chunk antes de qualquer leitura (evita OOB
+            // e wrap com valores corrompidos próximos de UINT32_MAX).
+            if (static_cast<size_t>(chunk_size) > data.size() - offset - 8) {
+                return false;
+            }
             const uint8_t* payload = data.data() + offset + 8;
             if (std::memcmp(chunk_id, "fmt ", 4) == 0 && chunk_size >= 16) {
                 audio_format = le16(payload);
@@ -72,12 +79,17 @@ public:
                 sample_rate = le32(payload + 4);
                 bits_per_sample = le16(payload + 14);
             } else if (std::memcmp(chunk_id, "data", 4) == 0) {
-                pcm.assign(payload, payload + std::min<size_t>(chunk_size, data.size() - (payload - data.data())));
+                pcm.assign(payload, payload + chunk_size);
             }
-            offset += 8 + chunk_size + (chunk_size & 1);
+            const size_t advance = 8 + static_cast<size_t>(chunk_size) + (chunk_size & 1);
+            if (advance > data.size() - offset) break;
+            offset += advance;
         }
 
-        if (audio_format != 1 || bits_per_sample != 16 || pcm.empty()) return false;
+        if (audio_format != 1 || bits_per_sample != 16 || pcm.empty() ||
+            sample_rate == 0 || num_channels < 1 || num_channels > 2) {
+            return false;
+        }
         out.sample_rate = static_cast<int32_t>(sample_rate);
         out.channels = num_channels;
         out.samples.resize(pcm.size() / 2);
@@ -89,7 +101,7 @@ public:
     void play(const AudioBuffer& buffer, float volume = 1.0f) {
         if (buffer.empty()) return;
         if (aaudio_stream_) {
-            play_aaudio(buffer);
+            play_aaudio(buffer, volume);
         } else if (sles_player_) {
             play_opensles(buffer, volume);
         }
@@ -136,16 +148,21 @@ private:
         return result == AAUDIO_OK && aaudio_stream_ != nullptr;
     }
 
-    void play_aaudio(const AudioBuffer& buffer) {
+    void play_aaudio(const AudioBuffer& buffer, float volume) {
         const int frames = static_cast<int>(buffer.samples.size() / buffer.channels);
         // Converte mono -> estéreo se necessário (enviamos 2 canais no stream).
         std::vector<int16_t> output;
         if (buffer.channels == 2) {
             output = buffer.samples;
+            if (volume < 1.0f) {
+                for (auto& sample : output) {
+                    sample = static_cast<int16_t>(sample * volume);
+                }
+            }
         } else {
             output.resize(frames * 2);
             for (int i = 0; i < frames; ++i) {
-                const int16_t s = static_cast<int16_t>(buffer.samples[i] * volume_);
+                const int16_t s = static_cast<int16_t>(buffer.samples[i] * volume);
                 output[i * 2] = s;
                 output[i * 2 + 1] = s;
             }
@@ -189,7 +206,10 @@ private:
             SL_BYTEORDER_LITTLEENDIAN};
 
         SLDataSource source{&locator, &format};
-        SLDataSink sink{&sles_output_mix_, nullptr};
+        // O locator de saída é uma struct, não o ponteiro do objeto.
+        SLDataLocator_OutputMix output_locator{
+            SL_DATALOCATOR_OUTPUTMIX, sles_output_mix_};
+        SLDataSink sink{&output_locator, nullptr};
 
         const SLInterfaceID ids[] = {SL_IID_PLAY, SL_IID_BUFFERQUEUE, SL_IID_VOLUME};
         const SLboolean req[] = {SL_BOOLEAN_TRUE, SL_BOOLEAN_TRUE, SL_BOOLEAN_TRUE};

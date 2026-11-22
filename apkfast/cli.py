@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import argparse
-import json
-import shutil
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 from . import __version__
 from .builder import BuildOptions, BuildError, build
-from .toolchain import Toolchain, detect
+from .toolchain import detect
 
 BANNER = r"""
   _    ____  __  __  ___  _   _   _
@@ -143,7 +142,8 @@ def _cmd_init(args: argparse.Namespace) -> int:
     create_project(target, config)
     _say(args, f"[✓] Projeto criado em {target}")
     _say(args, f"    template: {config.template} | package: {config.package}")
-    _say(args, f"    cd {target} && python3 ../../apkfast.py build")
+    cli_relative = os.path.relpath(Path(__file__).resolve().parent.parent, target)
+    _say(args, f"    cd {target} && python3 {cli_relative}/apkfast.py build")
     if config.template in ("raylib", "sdl2", "sdl3"):
         _say(args, "    (instale as libs: python3 ../../apkfast.py setup-libs)")
     return 0

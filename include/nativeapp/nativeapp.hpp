@@ -12,7 +12,7 @@
 //       nativeapp::Permissions::instance(activity())
 //         .request({"android.permission.VIBRATE"});
 //     }
-//     void on_resize(int w, int h) override { scene_.resize(w, h); }
+//     void on_surface_changed(int w, int h) override { scene_.resize(w, h); }
 //     void on_draw() override { scene_.render(); }
 //   };
 //   APP_MAIN(MeuApp);

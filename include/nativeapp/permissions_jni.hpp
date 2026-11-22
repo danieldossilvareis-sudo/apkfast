@@ -78,7 +78,8 @@ public:
         if (!env_ || !activity_) return PermissionState::Unknown;
         if (!runtime_permissions_available()) return PermissionState::Granted;
 
-        jstring jperm = env_->NewStringUTF(permission.data());
+        const std::string perm_str(permission);
+        jstring jperm = env_->NewStringUTF(perm_str.c_str());
         const jint check = env_->CallIntMethod(
             activity_, method("checkSelfPermission", "(Ljava/lang/String;)I"), jperm);
         env_->DeleteLocalRef(jperm);
@@ -86,7 +87,8 @@ public:
 
         if (!was_requested(permission)) return PermissionState::Denied;
 
-        jstring jrationale = env_->NewStringUTF(permission.data());
+        const std::string rationale_str(permission);
+        jstring jrationale = env_->NewStringUTF(rationale_str.c_str());
         const jboolean rationale = env_->CallBooleanMethod(
             activity_, method("shouldShowRequestPermissionRationale", "(Ljava/lang/String;)Z"),
             jrationale);

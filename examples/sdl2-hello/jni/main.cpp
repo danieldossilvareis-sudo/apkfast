@@ -3,17 +3,12 @@
 #include <SDL_main.h>
 
 #include <android/log.h>
-#include <android_native_app_glue.h>
 
 #define LOG_TAG "sdl2-hello"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-// Entry point chamado pelo glue do NDK. O SDL renomeia main() -> SDL_main().
-extern "C" void android_main(struct android_app* app) {
-    (void)app;
-    SDL_main(0, nullptr);
-}
-
+// SDLActivity (Java) chama SDL_main via dlsym — não precisa de android_main.
+// SDL_main.h renomeia main() para SDL_main().
 int main(int argc, char* argv[]) {
     (void)argc; (void)argv;
     LOGI("SDL_main iniciado");

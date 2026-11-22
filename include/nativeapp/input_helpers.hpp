@@ -3,6 +3,7 @@
 #pragma once
 
 #include <android/input.h>
+#include <android/keycodes.h>
 
 #include <array>
 #include <cstdint>
@@ -51,12 +52,10 @@ public:
             if (action == AMOTION_EVENT_ACTION_SCROLL) {
                 scroll_x_ = AMotionEvent_getXOffset(event);
                 scroll_y_ = AMotionEvent_getYOffset(event);
-            } else {
-                scroll_x_ = scroll_y_ = 0;
             }
         }
 
-        if (is_gamepad || source == AINPUT_SOURCE_JOYSTICK) {
+        if (is_gamepad) {
             // Analog sticks (AXIS_X/Y = esquerdo, Z/RZ = direito)
             stick_left_  = {AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_X, 0),
                             AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_Y, 0)};
@@ -79,11 +78,11 @@ public:
     float left_trigger() const { return triggers_[0]; }
     float right_trigger() const { return triggers_[1]; }
 
-    bool button_a() const { return is_down(188); } // KEYCODE_BUTTON_A
-    bool button_b() const { return is_down(189); }
-    bool button_x() const { return is_down(190); }
-    bool button_y() const { return is_down(191); }
-    bool button_start() const { return is_down(108); }
+    bool button_a() const { return is_down(AKEYCODE_BUTTON_A); }
+    bool button_b() const { return is_down(AKEYCODE_BUTTON_B); }
+    bool button_x() const { return is_down(AKEYCODE_BUTTON_X); }
+    bool button_y() const { return is_down(AKEYCODE_BUTTON_Y); }
+    bool button_start() const { return is_down(AKEYCODE_BUTTON_START); }
 
     // ----- Mouse ------------------------------------------------------------
     float mouse_x() const { return mouse_x_; }
@@ -101,6 +100,17 @@ public:
     void reset() {
         keys_.clear();
         mouse_buttons_ = 0;
+        scroll_x_ = scroll_y_ = 0;
+        last_key_ = 0;
+        stick_left_ = stick_right_ = {};
+        triggers_ = {};
+        gamepad_connected_ = false;
+    }
+
+    /// Consome o delta de scroll acumulado (zera após a leitura).
+    void consume_scroll(float& x, float& y) {
+        x = scroll_x_;
+        y = scroll_y_;
         scroll_x_ = scroll_y_ = 0;
     }
 

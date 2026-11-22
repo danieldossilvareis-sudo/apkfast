@@ -37,9 +37,9 @@ class Device:
 def find_adb(explicit: str | None = None) -> Path:
     if explicit:
         path = Path(explicit).expanduser()
-        if path.is_file():
+        if path.is_file() and os.access(path, os.X_OK):
             return path
-        raise DeviceError(f"adb não encontrado: {path}")
+        raise DeviceError(f"adb não executável: {path}")
     candidates = [
         HOME / "Android" / "android-sdk" / "platform-tools" / "adb",
         HOME / "Android" / "Sdk" / "platform-tools" / "adb",
@@ -66,6 +66,8 @@ def _run(adb: Path, args: list[str], *, timeout: int = 30) -> subprocess.Complet
         )
     except subprocess.TimeoutExpired as exc:
         raise DeviceError(f"adb {args[0]} expirou após {timeout}s") from exc
+    except OSError as exc:
+        raise DeviceError(f"Falha ao executar adb: {exc}") from exc
 
 
 def list_devices(adb: Path) -> list[Device]:
@@ -73,7 +75,10 @@ def list_devices(adb: Path) -> list[Device]:
     if result.returncode != 0:
         raise DeviceError(f"adb devices falhou:\n{result.stdout.strip()}")
     devices: list[Device] = []
-    for line in result.stdout.splitlines()[1:]:
+    lines = result.stdout.splitlines()
+    if lines and "List of devices" in lines[0]:
+        lines = lines[1:]
+    for line in lines:
         line = line.strip()
         if not line:
             continue
@@ -128,9 +133,10 @@ def resolve_device(
 
     online = [d for d in devices if d.online]
     if online:
-        if len(online) > 1:
-            # Prefere usb; se todos forem emulator, pega o primeiro.
-            return online[0]
+        # Prefere dispositivo USB real a emulador.
+        for device in online:
+            if not device.serial.startswith("emulator-"):
+                return device
         return online[0]
 
     if not devices:

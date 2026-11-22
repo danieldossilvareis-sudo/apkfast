@@ -447,11 +447,12 @@ public:
     GLES2Scene(const GLES2Scene&) = delete;
     GLES2Scene& operator=(const GLES2Scene&) = delete;
 
-    virtual void init(ANativeWindow* window) {
+    virtual void init(ANativeWindow* window) { init(window, 2); }
+
+protected:
+    void init(ANativeWindow* window, int client_version) {
         if (initialized_) return;
-        // Injeta o assets manager no singleton (pode vir de outra instância).
-        Assets::instance(nullptr);  // garante criação
-        egl_.init(window, 2);
+        egl_.init(window, client_version);
         glEnable(GL_DEPTH_TEST);
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -462,6 +463,7 @@ public:
         initialized_ = true;
     }
 
+public:
     void set_shader(Shader* shader) { shader_override_ = shader; }
     void set_mesh(Mesh* mesh) { mesh_override_ = mesh; }
 
@@ -527,6 +529,10 @@ public:
     void begin_frame() override {
         if (!initialized_) return;
         egl_.make_current();
+        // Restaura defaults para que um material anterior não vaze estado.
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glClearColor(clear_[0], clear_[1], clear_[2], clear_[3]);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     }
@@ -614,8 +620,10 @@ private:
 
 class GLES3Scene : public GLES2Scene {
 public:
-    void init(ANativeWindow* window) {
-        GLES2Scene::init(window);
+    using GLES2Scene::init;  // expõe a sobrecarga init(window, version)
+
+    void init(ANativeWindow* window) override {
+        GLES2Scene::init(window, 3);  // tenta GLES3; GLContext faz fallback para 2
         if (egl().version() < 3) {
             __android_log_print(ANDROID_LOG_WARN, "nativeapp-gl",
                                 "GLES3 solicitado mas contexto GLES%d em uso",

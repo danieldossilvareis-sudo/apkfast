@@ -12,7 +12,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -89,7 +88,7 @@ def resolve_release(repo: str, version: str | None) -> Release:
                 name = str(asset["name"])
                 if "ndk" in repo:
                     matched_version = expected_pattern.match(name).group("version")
-                    if version and matched_version != version.lstrip("r") and matched_version != version:
+                    if version and matched_version.lstrip("r") != version.lstrip("r"):
                         continue
                 return Release(
                     tag=str(release.get("tag_name", "")),
@@ -177,7 +176,7 @@ def _install_platform(sdk_dir: Path, api: int, quiet: bool = False) -> None:
     try:
         result = subprocess.run(
             [str(sdkmanager), f"--sdk_root={sdk_dir}", f"platforms;android-{api}"],
-            input="y\n",
+            input="y\ny\ny\n",
             text=True,
             stdout=subprocess.DEVNULL if quiet else None,
             stderr=subprocess.DEVNULL if quiet else None,
@@ -232,6 +231,8 @@ def install_sdk(
     _download(sdk_release.url, sdk_archive, quiet)
     _download(ndk_release.url, ndk_archive, quiet)
 
+    sdk_existed = sdk_dir.is_dir()
+    ndk_existed = ndk_dir.is_dir()
     if force:
         for directory in (sdk_dir, ndk_dir):
             if directory.is_dir():
@@ -247,10 +248,10 @@ def install_sdk(
         _install_platform(sdk_dir, platform_api, quiet)
         _validate(sdk_dir, ndk_dir)
     except SetupError:
-        # Não deixa instalação quebrada: remove só os diretórios que criamos.
-        if sdk_dir.is_dir():
+        # Remove apenas diretórios criados por esta execução.
+        if not sdk_existed and sdk_dir.is_dir():
             shutil.rmtree(sdk_dir, ignore_errors=True)
-        if ndk_dir.is_dir():
+        if not ndk_existed and ndk_dir.is_dir():
             shutil.rmtree(ndk_dir, ignore_errors=True)
         raise
     if not quiet:

@@ -64,11 +64,13 @@ public:
         while (state_ != Lifecycle::Destroyed) {
             int events = 0;
             android_poll_source* source = nullptr;
-            // timeout=0 evita travar quando o looper tem wake pendente após
-            // diálogos/rotação (bug observado em devices Samsung).
+            // Bloqueia quando não há janela ou app está pausado (evita
+            // busy-loop a 100% de CPU); 0 apenas enquanto renderizando.
+            const int timeout =
+                (state_ != Lifecycle::Ready || paused_ || !native_window_) ? -1 : 0;
             int processed = 0;
             while (processed < 8 &&
-                   ALooper_pollOnce(0, nullptr, &events,
+                   ALooper_pollOnce(timeout, nullptr, &events,
                                     reinterpret_cast<void**>(&source)) >= 0) {
                 if (source) source->process(app_, source);
                 processed++;
@@ -199,18 +201,22 @@ private:
         if (is_new) {
             on_surface_created();
             surface_active_ = true;
-        } else {
+        } else if (width_ != last_notified_width_ || height_ != last_notified_height_) {
             on_surface_changed(width_, height_);
         }
+        last_notified_width_ = width_;
+        last_notified_height_ = height_;
     }
 
     /// Libera a surface atual e notifica a subclasse.
     void deactivate_surface() {
+        // Limpa o ponteiro ANTES do callback: a janela está sendo destruída
+        // e window() não deve devolver um ponteiro inválido.
+        native_window_ = nullptr;
         if (surface_active_) {
             on_surface_destroyed();
             surface_active_ = false;
         }
-        native_window_ = nullptr;
     }
 
     void on_app_command(int32_t cmd) {
@@ -245,6 +251,7 @@ private:
 
             case APP_CMD_RESUME:
                 paused_ = false;
+                last_frame_ = std::chrono::steady_clock::now();
                 Permissions::instance(app_->activity).notify_activity_result();
                 on_resume();
                 if (state_ == Lifecycle::Paused) state_ = Lifecycle::Ready;
@@ -294,17 +301,22 @@ private:
                 }
             }
             on_key(code, down);
-            return 1;
+            // Não consome teclas do sistema (volume, HOME, multimídia).
+            return 0;
         }
         if (type != AINPUT_EVENT_TYPE_MOTION) return 0;
 
-        const int32_t action = AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK;
+        const int32_t action_raw = AMotionEvent_getAction(event);
+        const int32_t action = action_raw & AMOTION_EVENT_ACTION_MASK;
         TouchAction ta;
         switch (action) {
-            case AMOTION_EVENT_ACTION_DOWN: ta = TouchAction::Down; break;
-            case AMOTION_EVENT_ACTION_UP: ta = TouchAction::Up; break;
+            case AMOTION_EVENT_ACTION_DOWN:
+            case AMOTION_EVENT_ACTION_POINTER_DOWN: ta = TouchAction::Down; break;
+            case AMOTION_EVENT_ACTION_UP:
+            case AMOTION_EVENT_ACTION_POINTER_UP: ta = TouchAction::Up; break;
             case AMOTION_EVENT_ACTION_MOVE: ta = TouchAction::Move; break;
-            default: ta = TouchAction::Cancel; break;
+            case AMOTION_EVENT_ACTION_CANCEL: ta = TouchAction::Cancel; break;
+            default: return 0;  // hover/out-of-frame: ignora
         }
 
         std::vector<TouchPoint> points;
@@ -317,7 +329,21 @@ private:
                 AMotionEvent_getY(event, i),
             });
         }
+        const bool pointer_specific =
+            action == AMOTION_EVENT_ACTION_POINTER_DOWN ||
+            action == AMOTION_EVENT_ACTION_POINTER_UP;
+        int32_t changed_id = -1;
+        if (pointer_specific) {
+            const int32_t index =
+                (action_raw >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT) &
+                AMOTION_EVENT_ACTION_POINTER_INDEX_MASK;
+            if (index < static_cast<int32_t>(points.size())) {
+                changed_id = points[static_cast<size_t>(index)].id;
+            }
+        }
+
         for (const auto& point : points) {
+            if (pointer_specific && point.id != changed_id) continue;
             if (ta == TouchAction::Down || ta == TouchAction::Move) {
                 touches_down_.insert(point.id);
                 last_touches_[point.id] = point;
@@ -334,6 +360,8 @@ private:
     ANativeWindow* native_window_ = nullptr;
     int width_ = 0;
     int height_ = 0;
+    int last_notified_width_ = -1;
+    int last_notified_height_ = -1;
     bool initialized_ = false;  // on_ready já foi chamado
     bool surface_active_ = false;
     bool paused_ = false;

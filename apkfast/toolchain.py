@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable
@@ -69,10 +70,8 @@ def _first_runnable(candidates: Iterable[Path]) -> Path | None:
 def _version_sort_key(name: str) -> tuple[int, ...]:
     parts = []
     for piece in name.split("."):
-        try:
-            parts.append(int(piece))
-        except ValueError:
-            parts.append(0)
+        match = re.search(r"(\d+)$", piece)
+        parts.append(int(match.group(1)) if match else 0)
     return tuple(parts)
 
 
@@ -229,7 +228,7 @@ def _find_build_tools(sdk_dir: Path, explicit: str | None) -> Path:
         reverse=True,
     )
     for path in candidates:
-        if _first_runnable([path / "aapt2", path / "zipalign", path / "apksigner"]):
+        if all(_runnable(path / tool) for tool in ("aapt2", "zipalign", "apksigner")):
             return path
     if candidates:
         return candidates[0]

@@ -148,9 +148,13 @@ private:
 
     jobject system_service(const char* name) const {
         if (!env_ || !activity_) return nullptr;
+        jclass context_class = find_class("android/content/Context");
+        if (!context_class) return nullptr;
         jmethodID get_service = env_->GetMethodID(
-            find_class("android/content/Context"), "getSystemService",
+            context_class, "getSystemService",
             "(Ljava/lang/String;)Ljava/lang/Object;");
+        env_->DeleteLocalRef(context_class);
+        if (!get_service) return nullptr;
         jstring key = env_->NewStringUTF(name);
         jobject service = env_->CallObjectMethod(activity_, get_service, key);
         env_->DeleteLocalRef(key);
@@ -160,15 +164,21 @@ private:
     jobject register_receiver(const char* action) const {
         if (!env_ || !activity_) return nullptr;
         jclass intent_filter = find_class("android/content/IntentFilter");
+        if (!intent_filter) return nullptr;
         jmethodID ctor = env_->GetMethodID(intent_filter, "<init>", "(Ljava/lang/String;)V");
+        if (!ctor) { env_->DeleteLocalRef(intent_filter); return nullptr; }
         jstring action_str = env_->NewStringUTF(action);
         jobject filter = env_->NewObject(intent_filter, ctor, action_str);
         env_->DeleteLocalRef(action_str);
 
+        jclass ctx = find_class("android/content/Context");
+        if (!ctx) { env_->DeleteLocalRef(intent_filter); return nullptr; }
         jmethodID register_method = env_->GetMethodID(
-            find_class("android/content/Context"), "registerReceiver",
+            ctx, "registerReceiver",
             "(Landroid/content/BroadcastReceiver;Landroid/content/IntentFilter;)"
             "Landroid/content/Intent;");
+        env_->DeleteLocalRef(ctx);
+        if (!register_method) { env_->DeleteLocalRef(intent_filter); return nullptr; }
         jobject intent = env_->CallObjectMethod(activity_, register_method, nullptr, filter);
         env_->DeleteLocalRef(filter);
         env_->DeleteLocalRef(intent_filter);

@@ -8,7 +8,6 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
 
 from .manifest import ManifestInfo, is_native_activity, parse_manifest
 from .toolchain import NDK_ARCH_DIR, Toolchain, detect
@@ -342,7 +341,9 @@ def _native_build(
         "-ldl",
         "-landroid",
         "-llog",
-        "-Wl,--no-as-needed", "-lOpenSLES", "-laaudio", "-Wl,--as-needed",
+        "-Wl,--no-as-needed", "-lOpenSLES",
+        *( ["-laaudio"] if tc.api >= 26 else [] ),
+        "-Wl,--as-needed",
         *( ["-lEGL", "-lGLESv2"] if uses_gles else [] ),
         *options.extra_ldflags,
     ]
@@ -376,7 +377,7 @@ def _native_build(
     if uses_raylib:
         if not raylib_static.is_file():
             raise BuildError(
-                f"raylib não encontrada para {options.abi}: {raylib_static}. "
+                f"raylib não encontrada para {tc.abi}: {raylib_static}. "
                 "Rode: python3 apkfast.py raylib-install"
             )
         # Ordem importa: libraylib.a primeiro, depois as dependências.
@@ -560,9 +561,6 @@ def _link_apk(
         manifest.version_name or "1.0",
         "--auto-add-overlay",
     ]
-    if dex is not None:
-        # aapt2 não aceita dex diretamente; será inserido via zip depois.
-        pass
     for flat in flat_files:
         cmd += ["-R", str(flat)]
     assets = options.assets_dir or (options.project / "assets")
@@ -591,9 +589,13 @@ def _add_extra_files_with_zip(apk: Path, extra_root: Path) -> None:
             dst.writestr(info, src.read(info.filename))
         for extra in extra_files:
             arcname = str(extra.relative_to(extra_root))
-            # dex precisa ser STORED (não comprimido) para ser mapeado pela ART.
+            # dex e .so precisam ser STORED: dex é mapeado pela ART e .so
+            # precisa ser page-aligned/comprimido pelo instalador em Android
+            # 15+ (16 KB pages). Comprimidos, o dlopen falha.
             method = (
-                zipfile.ZIP_STORED if extra.suffix == ".dex" else zipfile.ZIP_DEFLATED
+                zipfile.ZIP_STORED
+                if extra.suffix in (".dex", ".so")
+                else zipfile.ZIP_DEFLATED
             )
             dst.write(extra, arcname, compress_type=method)
     tmp.replace(apk)
@@ -608,7 +610,14 @@ def _align_and_sign(
     log = options.log
     assert log is not None
     aligned = work / "apk" / "unsigned_aligned.apk"
-    _run([tc.zipalign, "-f", "4", str(unsigned), str(aligned)], log)
+    # -P 16 alinha para páginas de 16 KB (Android 15+). Versões antigas do
+    # zipalign aceitam -P; se não aceitar, tenta sem.
+    align_cmd = [tc.zipalign, "-f", "-P", "16", "4", str(unsigned), str(aligned)]
+    try:
+        _run(align_cmd, log)
+    except BuildError:
+        log.warn("[!] zipalign sem suporte a -P 16; usando alinhamento 4.")
+        _run([tc.zipalign, "-f", "4", str(unsigned), str(aligned)], log)
 
     keystore = options.keystore
     if keystore is None:
@@ -671,6 +680,15 @@ def build(options: BuildOptions) -> Path:
     manifest = parse_manifest(manifest_path)
 
     abis = options.selected_abis()
+    if not abis:
+        raise BuildError("Nenhuma ABI selecionada.")
+    invalid = [abi for abi in abis if abi not in ALL_ABIS]
+    if invalid:
+        raise BuildError(
+            f"ABI(s) inválida(s): {', '.join(invalid)}. "
+            f"Use: {', '.join(ALL_ABIS)}"
+        )
+
     tc = detect(
         abi=abis[0],
         api=options.api,
@@ -680,6 +698,11 @@ def build(options: BuildOptions) -> Path:
     )
 
     work = (options.build_dir or (project / "build" / "apkfast")).expanduser().resolve()
+    # Nunca permite que a limpeza apague o próprio projeto ou um ancestral.
+    if work == project or work in project.parents:
+        raise BuildError(
+            f"--build-dir não pode ser o projeto nem um ancestral dele: {work}"
+        )
     _clean(work)
     (work / "apk").mkdir(parents=True, exist_ok=True)
 

@@ -1,4 +1,7 @@
 // nativeapp/sensor.hpp — Sensores (acelerômetro, giroscópio) via NDK.
+//
+// As filas são registradas no MESMO looper do App, com callback. O App::run()
+// já faz o poll e despacha — este módulo NÃO consome eventos do looper.
 
 #pragma once
 
@@ -7,7 +10,6 @@
 #include <android/log.h>
 
 #include <array>
-#include <cstring>
 
 namespace nativeapp {
 
@@ -29,39 +31,37 @@ public:
         gyroscope_ = ASensorManager_getDefaultSensor(manager_, ASENSOR_TYPE_GYROSCOPE);
         if (!accelerometer_ && !gyroscope_) return false;
 
-        looper_ = ALooper_prepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS);
+        // 0 = usa o looper da thread atual (o mesmo do App) com callbacks.
+        looper_ = ALooper_prepare(0);
         if (!looper_) return false;
 
         if (accelerometer_) {
             accel_event_queue_ = ASensorManager_createEventQueue(
-                manager_, looper_, kLooperId, nullptr, nullptr);
-            ASensorEventQueue_enableSensor(accel_event_queue_, accelerometer_);
-            ASensorEventQueue_setEventRate(
-                accel_event_queue_, accelerometer_, 1000000 / 60); // 60 Hz
+                manager_, looper_, kAccelId, &Sensors::accel_callback, this);
+            if (accel_event_queue_) {
+                ASensorEventQueue_enableSensor(accel_event_queue_, accelerometer_);
+                ASensorEventQueue_setEventRate(
+                    accel_event_queue_, accelerometer_, 1000000 / 60);
+            }
         }
         if (gyroscope_) {
             gyro_event_queue_ = ASensorManager_createEventQueue(
-                manager_, looper_, kLooperId + 1, nullptr, nullptr);
-            ASensorEventQueue_enableSensor(gyro_event_queue_, gyroscope_);
-            ASensorEventQueue_setEventRate(
-                gyro_event_queue_, gyroscope_, 1000000 / 60);
+                manager_, looper_, kGyroId, &Sensors::gyro_callback, this);
+            if (gyro_event_queue_) {
+                ASensorEventQueue_enableSensor(gyro_event_queue_, gyroscope_);
+                ASensorEventQueue_setEventRate(
+                    gyro_event_queue_, gyroscope_, 1000000 / 60);
+            }
         }
         initialized_ = true;
         return true;
     }
 
-    /// Chamado a cada frame (ou no on_tick do App).
-    void update() {
-        if (!initialized_) return;
-        ALooper_pollOnce(0, nullptr, nullptr, nullptr);
-
+    /// Chamado automaticamente pelo callback do looper — não precisa chamar.
+    void drain() {
         if (accel_event_queue_) {
             ASensorEvent event;
             while (ASensorEventQueue_getEvents(accel_event_queue_, &event, 1) > 0) {
-                // ASENSOR_TYPE_ACCELEROMETER usa vector (x,y,z) com escala do sensor.
-                const float scale = ASensor_getResolution(accelerometer_) > 0
-                    ? 1.0f / ASensor_getResolution(accelerometer_) : 1.0f;
-                (void)scale;
                 acceleration_ = {event.vector.x, event.vector.y, event.vector.z};
             }
         }
@@ -73,13 +73,15 @@ public:
         }
     }
 
+    /// Compatibilidade: não faz mais poll (evita roubar eventos do App).
+    void update() { drain(); }
+
     Vec3f acceleration() const { return acceleration_; }
     Vec3f angular_velocity() const { return angular_velocity_; }
     bool has_accelerometer() const { return accelerometer_ != nullptr; }
     bool has_gyroscope() const { return gyroscope_ != nullptr; }
 
     void destroy() {
-        if (!initialized_) return;
         if (accel_event_queue_) {
             ASensorManager_destroyEventQueue(manager_, accel_event_queue_);
             accel_event_queue_ = nullptr;
@@ -88,12 +90,28 @@ public:
             ASensorManager_destroyEventQueue(manager_, gyro_event_queue_);
             gyro_event_queue_ = nullptr;
         }
+        accelerometer_ = nullptr;
+        gyroscope_ = nullptr;
+        looper_ = nullptr;
+        manager_ = nullptr;
         initialized_ = false;
     }
 
+    ~Sensors() { destroy(); }
+
 private:
     Sensors() = default;
-    static constexpr int kLooperId = 42;
+    static constexpr int kAccelId = 42;
+    static constexpr int kGyroId = 43;
+
+    static int accel_callback(int, int, void* data) {
+        static_cast<Sensors*>(data)->drain();
+        return 1;
+    }
+    static int gyro_callback(int, int, void* data) {
+        static_cast<Sensors*>(data)->drain();
+        return 1;
+    }
 
     ASensorManager* manager_ = nullptr;
     const ASensor* accelerometer_ = nullptr;

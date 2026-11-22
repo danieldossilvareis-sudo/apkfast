@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -52,7 +51,8 @@ def install(version: int, abi: str = "arm64-v8a", api: int = 21, *, quiet: bool 
         raise SDLError(f"Versão SDL inválida: {version}")
     if abi not in ABI_TRIPLES:
         raise SDLError(f"ABI não suportada: {abi}")
-    tc = detect(abi=abi, api=max(api, 21))
+    effective_api = max(api, 21)
+    tc = detect(abi=abi, api=effective_api)
 
     source = ensure_source(version, quiet=quiet)
     cmake = shutil.which("cmake")
@@ -71,7 +71,7 @@ def install(version: int, abi: str = "arm64-v8a", api: int = 21, *, quiet: bool 
         cmake, "-S", str(source), "-B", str(build_dir),
         f"-DCMAKE_TOOLCHAIN_FILE={toolchain}",
         f"-DANDROID_ABI={abi}",
-        f"-DANDROID_PLATFORM=android-{api}",
+        f"-DANDROID_PLATFORM=android-{effective_api}",
         "-DCMAKE_BUILD_TYPE=Release",
         "-DBUILD_SHARED_LIBS=OFF",
         "-DSDL_TEST=OFF",
