@@ -65,21 +65,18 @@ public:
         while (state_ != Lifecycle::Destroyed) {
             int events = 0;
             android_poll_source* source = nullptr;
-            // Bloqueia quando não há janela ou app está pausado (evita
-            // busy-loop a 100% de CPU); 0 apenas enquanto renderizando.
-            const int timeout =
-                (state_ != Lifecycle::Ready || paused_ || !native_window_) ? -1 : 0;
-            int processed = 0;
-            while (processed < 8 &&
-                   ALooper_pollOnce(timeout, nullptr, &events,
+            // timeout=0 sempre. Processa TODOS os eventos pendentes (sem
+            // limite artificial) — um limite de 8 events deixava INIT_WINDOW
+            // pendente em devices com fila cheia no startup, causando tela
+            // preta. Com timeout=0 o poll retorna -1 quando a fila esvazia.
+            while (ALooper_pollOnce(0, nullptr, &events,
                                     reinterpret_cast<void**>(&source)) >= 0) {
                 if (source) source->process(app_, source);
-                processed++;
                 if (app_->destroyRequested || state_ == Lifecycle::Destroyed) {
                     finish();
                     return 0;
                 }
-                if (state_ != Lifecycle::Ready) break;
+                if (state_ != Lifecycle::Ready && !native_window_) break;
             }
             if (state_ == Lifecycle::Ready && native_window_ && !paused_) {
                 const auto now = std::chrono::steady_clock::now();
@@ -209,6 +206,10 @@ private:
         if (is_new) {
             on_surface_created();
             surface_active_ = true;
+            // Notifica dimensões também na criação: muitas cenas precisam de
+            // resize() para configurar projection/viewport. Sem isso, a
+            // geometria em coordenadas de tela fica fora do NDC (tela preta).
+            on_surface_changed(width_, height_);
         } else if (width_ != last_notified_width_ || height_ != last_notified_height_) {
             on_surface_changed(width_, height_);
         }

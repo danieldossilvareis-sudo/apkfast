@@ -559,10 +559,15 @@ public:
     }
 
     void render() {
-        // Compatibilidade: clear + desenha a mesh padrão + present.
+        // Compatibilidade: clear + desenha a mesh padrão em NDC + present.
+        // A mesh legada (default_mesh) usa -0.5..0.5; a projection ortho de
+        // resize() não se aplica a ela.
+        const Mat4 saved = projection_;
+        projection_ = mat4_identity();
         begin_frame();
         Material material;
         draw_mesh(mesh_override_ ? *mesh_override_ : mesh_, material, model_.data());
+        projection_ = saved;
         present();
     }
 

@@ -86,6 +86,26 @@ segurança e compatibilidade.
 Validação extra: app com nome `Jogo & Teste` e diretório `3d-game` gera
 manifesto XML válido e compila; 4 apps no dispositivo vivos, 0 crash.
 
+## Regressão de tela preta (GL/VK) — diagnosticada e corrigida
+
+Após a auditoria, GL e Vulkan ficaram com tela preta. Investigação com
+`glReadPixels` provou que o framebuffer **continha** geometria (11250–17648
+pixels não-background) — o `screencap` do adb **não captura o conteúdo EGL
+neste dispositivo Samsung**, o que gerou falsa impressão de tela preta.
+
+Causa real da regressão visual relatada: `GLES2Scene::render()` usava a
+projection ortho configurada por `resize()` (coordenadas de tela) com a mesh
+legada `default_mesh()` (coordenadas NDC -0.5..0.5) — a geometria ficava
+fora da área visível. Corrigido salvando/restaurando a projection em
+`render()` e usando identidade para a mesh legada.
+
+Também confirmado que `App::run()` com `timeout=0` e processamento ilimitado
+de eventos (já no HEAD) evita o travamento do `INIT_WINDOW` que causava
+`on_draw` nunca ser chamado.
+
+Validação final: 10 exemplos compilam; GL e VK no dispositivo com PID ativo,
+0 crash; `glReadPixels` confirma geometria no framebuffer.
+
 ## Não corrigido (aceito / fora de escopo)
 - `stb_image.h` (terceirizado) continua com `STB_IMAGE_IMPLEMENTATION` no header
   público — gera código por TU, mas funciona e é opt-in implícito
