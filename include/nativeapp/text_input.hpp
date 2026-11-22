@@ -1,19 +1,24 @@
-// nativeapp/text_input.hpp — Teclado virtual (soft keyboard) para apps nativos.
+// nativeapp/text_input.hpp — Teclado virtual sem EditText e sem Java custom.
 //
-// Implementação 100% JNI com classes do framework Android — NÃO exige classes
-// Java customizadas, funciona com NativeActivity, raylib e SDL2/SDL3.
-//
-// O texto é obtido por polling (update()) — você decide quando ler.
+// Estratégia (funciona em QUALQUER dispositivo Android, API 1+):
+//   1. InputMethodManager.toggleSoftInput(SHOW_FORCED) — NÃO precisa de View.
+//   2. O IME envia eventos de tecla (AINPUT_EVENT_TYPE_KEY) para a Activity.
+//   3. Usamos AKeyEvent_getUnicodeChar() para obter o caractere real
+//      (inclui acentos, símbolos e caracteres de IMEs internacionais).
+//   4. Backspace/ENTER são tratados explicitamente.
 //
 // Uso:
 //   auto& input = nativeapp::TextInput::instance(env, activity);
-//   input.show("Digite seu nome:");
-//   input.update();                       // a cada frame
-//   if (input.is_done()) { auto text = input.text(); ... }
+//   input.show();                                  // abre o teclado
+//   // no seu on_key(code, down, event):
+//   input.on_key(code, down, AKeyEvent_getUnicodeChar(event));
+//   std::string typed = input.text();
+//   input.hide();                                  // fecha o teclado
 
 #pragma once
 
 #include <android/log.h>
+#include <android/input.h>
 #include <jni.h>
 
 #include <functional>
@@ -23,218 +28,202 @@ namespace nativeapp {
 
 class TextInput {
 public:
+    enum class KeyAction { None, Character, Backspace, Enter };
+
     static TextInput& instance(JNIEnv* env, jobject activity) {
         static TextInput* singleton = nullptr;
         if (!singleton) singleton = new TextInput(env, activity);
-        if (activity && singleton->activity_ != activity) singleton->recreate(env, activity);
+        if (env && activity && singleton->activity_ != activity) {
+            singleton->activity_ = activity;
+            singleton->env_ = env;
+        }
         return *singleton;
     }
 
-    bool available() const { return edit_text_ != nullptr && env_ != nullptr; }
+    /// Abre o teclado virtual.Não precisa de View/EditText.
+    void show() {
+        JNIEnv* env = env_;
+        if (!env || !activity_) return;
 
-    /// Mostra o teclado virtual ancorado em um EditText invisível.
-    void show(const std::string& hint = "") {
-        if (!env_ || !activity_) return;
-        if (!edit_text_) create_edit_text();
-        if (!edit_text_) return;
-
-        if (!hint.empty()) set_hint(hint);
-
-        env_->CallBooleanMethod(edit_text_, m("requestFocus", "()Z"));
-        jclass imm_class = env_->FindClass("android/view/inputmethod/InputMethodManager");
-        if (!imm_class) return;
-        jmethodID get_service = env_->GetMethodID(
-            find_class("android/content/Context"), "getSystemService",
-            "(Ljava/lang/String;)Ljava/lang/Object;");
-        jstring service_name = env_->NewStringUTF("input_method");
-        jobject service = env_->CallObjectMethod(activity_, get_service, service_name);
-        env_->DeleteLocalRef(service_name);
-        if (service) {
-            jmethodID show_soft = env_->GetMethodID(
-                imm_class, "showSoftInput", "(Landroid/view/View;I)Z");
-            if (show_soft) {
-                env_->CallBooleanMethod(service, show_soft, edit_text_, 0);
-            }
-            env_->DeleteLocalRef(service);
+        jclass imm_class = find_class(env, "android/view/inputmethod/InputMethodManager");
+        if (!imm_class) {
+            log("InputMethodManager nao encontrado");
+            return;
         }
-        env_->DeleteLocalRef(imm_class);
-        shown_ = true;
+
+        jclass context_class = find_class(env, "android/content/Context");
+        jmethodID get_service = env->GetMethodID(
+            context_class, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+        jstring name = env->NewStringUTF("input_method");
+        jobject service = env->CallObjectMethod(activity_, get_service, name);
+        env->DeleteLocalRef(name);
+
+        if (service) {
+            // INPUT_METHOD_SERVICE.showSoftInput(view, flags) exige view;
+            // toggleSoftInput(showFlags, hideFlags) NÃO exige nenhuma view.
+            jmethodID toggle = env->GetMethodID(imm_class, "toggleSoftInput", "(II)V");
+            if (toggle) {
+                // InputMethodManager.SHOW_FORCED = 2, HIDE_IMPLICIT_ONLY = 1
+                env->CallVoidMethod(service, toggle, 2, 0);
+                shown_ = true;
+            } else {
+                log("toggleSoftInput nao encontrado");
+            }
+            env->DeleteLocalRef(service);
+        } else {
+            log("servico input_method nao obtido");
+        }
+        env->DeleteLocalRef(imm_class);
+        env->DeleteLocalRef(context_class);
     }
 
+    /// Fecha o teclado virtual.
     void hide() {
-        if (!env_ || !edit_text_) return;
-        jclass imm_class = env_->FindClass("android/view/inputmethod/InputMethodManager");
+        JNIEnv* env = env_;
+        if (!env || !activity_) return;
+
+        jclass imm_class = find_class(env, "android/view/inputmethod/InputMethodManager");
         if (!imm_class) return;
-        jmethodID get_service = env_->GetMethodID(
-            find_class("android/content/Context"), "getSystemService",
-            "(Ljava/lang/String;)Ljava/lang/Object;");
-        jstring name = env_->NewStringUTF("input_method");
-        jobject service = env_->CallObjectMethod(activity_, get_service, name);
-        env_->DeleteLocalRef(name);
+        jclass context_class = find_class(env, "android/content/Context");
+        jmethodID get_service = env->GetMethodID(
+            context_class, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+        jstring name = env->NewStringUTF("input_method");
+        jobject service = env->CallObjectMethod(activity_, get_service, name);
+        env->DeleteLocalRef(name);
+
         if (service) {
-            jmethodID hide_soft = env_->GetMethodID(
-                imm_class, "hideSoftInputFromWindow", "(Landroid/os/IBinder;I)Z");
-            jobject token = env_->CallObjectMethod(edit_text_, m("getWindowToken", "()Landroid/os/IBinder;"));
-            if (hide_soft && token) {
-                env_->CallBooleanMethod(service, hide_soft, token, 0);
+            jmethodID toggle = env->GetMethodID(imm_class, "toggleSoftInput", "(II)V");
+            if (toggle) {
+                // SHOW_IMPLICIT = 1? Usamos HIDE_IMPLICIT_ONLY=1 via hideSoftInputFromWindow
+                // alternativa: toggleSoftInput(0, HIDE_IMPLICIT_ONLY=1) esconde.
+                env->CallVoidMethod(service, toggle, 0, 1);
             }
-            if (token) env_->DeleteLocalRef(token);
-            env_->DeleteLocalRef(service);
+            env->DeleteLocalRef(service);
         }
-        env_->DeleteLocalRef(imm_class);
         shown_ = false;
+        env->DeleteLocalRef(imm_class);
+        env->DeleteLocalRef(context_class);
     }
 
-    void set_text(const std::string& text) {
-        if (!env_ || !edit_text_) return;
-        jstring value = env_->NewStringUTF(text.c_str());
-        env_->CallVoidMethod(edit_text_, m("setText", "(Ljava/lang/CharSequence;)V"), value);
-        env_->DeleteLocalRef(value);
-    }
-
-    void set_hint(const std::string& hint) {
-        if (!env_ || !edit_text_) return;
-        jstring value = env_->NewStringUTF(hint.c_str());
-        env_->CallVoidMethod(edit_text_, m("setHint", "(Ljava/lang/CharSequence;)V"), value);
-        env_->DeleteLocalRef(value);
-    }
-
-    void set_multiline(bool multiline) {
-        if (!env_ || !edit_text_) return;
-        env_->CallVoidMethod(edit_text_, m("setSingleLine", "(Z)V"), multiline ? JNI_FALSE : JNI_TRUE);
-    }
-
-    /// Chamado a cada frame. Detecta mudanças de texto e ENTER.
-    void update() {
-        if (!env_ || !edit_text_ || !shown_) return;
-        const std::string current = text();
-        if (current != last_text_) {
-            last_text_ = current;
-            if (callback_) callback_(current, false);
-        }
-    }
-
-    /// Chame no seu on_key(); retorna true se o evento foi consumido.
-    bool on_key(int32_t keycode, bool down) {
+    /// Repasse eventos de tecla do App::on_key. Retorna true se consumiu.
+    /// unicode = AKeyEvent_getUnicodeChar(event) (0 para teclas de controle).
+    bool on_key(int32_t keycode, bool down, int32_t unicode = 0) {
         if (!down || !shown_) return false;
-        constexpr int32_t KEYCODE_ENTER = 66;
-        constexpr int32_t KEYCODE_NUMPAD_ENTER = 160;
-        if (keycode == KEYCODE_ENTER || keycode == KEYCODE_NUMPAD_ENTER) {
-            done_ = true;
+
+        // BACK: fecha o teclado
+        if (keycode == 4 /* AKEYCODE_BACK */) {
             hide();
-            if (callback_) callback_(text(), true);
             return true;
         }
+
+        // ENTER / DPAD_CENTER / NUM_ENTER: confirma
+        if (keycode == 66 /* ENTER */ || keycode == 23 /* DPAD_CENTER */ ||
+            keycode == 160 /* NUMPAD_ENTER */) {
+            if (callback_) callback_(text_, true);
+            hide();
+            return true;
+        }
+
+        // BACKSPACE / DEL
+        if (keycode == 67 /* DEL */ || keycode == 112 /* FORWARD_DEL */) {
+            if (!text_.empty()) {
+                // remove último codepoint UTF-8
+                size_t pos = text_.size() - 1;
+                while (pos > 0 && (static_cast<unsigned char>(text_[pos]) & 0xC0) == 0x80) {
+                    --pos;
+                }
+                text_.erase(pos);
+                if (callback_) callback_(text_, false);
+            }
+            return true;
+        }
+
+        // Caractere imprimível (unicode fornecido pelo chamador, quando disponível)
+        if (unicode > 0 && unicode != 10 && unicode != 13) {
+            append_utf8(static_cast<uint32_t>(unicode));
+            if (callback_) callback_(text_, false);
+            return true;
+        }
+
+        // Fallback: mapeia keycode -> caractere ASCII (funciona em todos devices).
+        const char ch = ascii_from_keycode(keycode);
+        if (ch != 0) {
+            text_ += ch;
+            if (callback_) callback_(text_, false);
+            return true;
+        }
+
         return false;
     }
 
-    std::string text() const {
-        if (!env_ || !edit_text_) return {};
-        jstring value = static_cast<jstring>(
-            env_->CallObjectMethod(edit_text_, m("getText", "()Ljava/lang/CharSequence;")));
-        if (!value) return {};
-        const char* chars = env_->GetStringUTFChars(value, nullptr);
-        std::string result = chars ? chars : "";
-        if (chars) env_->ReleaseStringUTFChars(value, chars);
-        env_->DeleteLocalRef(value);
-        return result;
-    }
+    void set_text(const std::string& text) { text_ = text; }
+    void clear() { text_.clear(); }
 
+    std::string text() const { return text_; }
     bool is_shown() const { return shown_; }
-    bool is_done() const { return done_; }
-    void clear_done() { done_ = false; }
+    JNIEnv* env() const { return env_; }
 
     using Callback = std::function<void(const std::string&, bool /*done*/)>;
     void set_callback(Callback callback) { callback_ = std::move(callback); }
 
-    void destroy() {
-        if (!env_ || !edit_text_) return;
-        hide();
-        env_->DeleteGlobalRef(edit_text_);
-        edit_text_ = nullptr;
-    }
+    void destroy() { shown_ = false; text_.clear(); }
 
 private:
-    explicit TextInput(JNIEnv* env, jobject activity) : env_(env), activity_(activity) {
-        create_edit_text();
+    explicit TextInput(JNIEnv* env, jobject activity) : env_(env), activity_(activity) {}
+
+    static jclass find_class(JNIEnv* env, const char* name) {
+        jclass local = env->FindClass(name);
+        return local; // chamador faz DeleteLocalRef
     }
 
-    void recreate(JNIEnv* env, jobject activity) {
-        destroy();
-        env_ = env;
-        activity_ = activity;
-        create_edit_text();
-    }
-
-    jclass find_class(const char* name) const {
-        return env_ ? env_->FindClass(name) : nullptr;
-    }
-
-    jmethodID m(const char* name, const char* signature) const {
-        if (!env_ || !edit_text_) return nullptr;
-        return env_->GetMethodID(env_->GetObjectClass(edit_text_), name, signature);
-    }
-
-    void create_edit_text() {
-        if (!env_ || !activity_) return;
-        jclass edit_class = env_->FindClass("android/widget/EditText");
-        if (!edit_class) {
-            __android_log_print(ANDROID_LOG_WARN, "nativeapp-text", "EditText nao encontrado");
-            return;
+    static void append_utf8(std::string& out, uint32_t codepoint) {
+        if (codepoint <= 0x7F) {
+            out += static_cast<char>(codepoint);
+        } else if (codepoint <= 0x7FF) {
+            out += static_cast<char>(0xC0 | (codepoint >> 6));
+            out += static_cast<char>(0x80 | (codepoint & 0x3F));
+        } else if (codepoint <= 0xFFFF) {
+            out += static_cast<char>(0xE0 | (codepoint >> 12));
+            out += static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (codepoint & 0x3F));
+        } else {
+            out += static_cast<char>(0xF0 | (codepoint >> 18));
+            out += static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F));
+            out += static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (codepoint & 0x3F));
         }
-        jmethodID constructor = env_->GetMethodID(edit_class, "<init>", "(Landroid/content/Context;)V");
-        jobject local = env_->NewObject(edit_class, constructor, activity_);
-        env_->DeleteLocalRef(edit_class);
-        if (!local) return;
-        edit_text_ = static_cast<jobject>(env_->NewGlobalRef(local));
-        env_->DeleteLocalRef(local);
-
-        ConfigurarView();
     }
 
-    void ConfigurarView() {
-        // Background transparente, texto branco, single-line, alpha baixo.
-        jclass color = env_->FindClass("android/graphics/Color");
-        jmethodID transparent = env_->GetStaticMethodID(color, "parseColor", "(Ljava/lang/String;)I");
-        jstring black = env_->NewStringUTF("#00000000");
-        jint argb = env_->CallStaticIntMethod(color, transparent, black);
-        env_->DeleteLocalRef(black);
-        env_->DeleteLocalRef(color);
-        env_->CallVoidMethod(edit_text_, m("setBackgroundColor", "(I)V"), argb);
+    void append_utf8(uint32_t codepoint) { append_utf8(text_, codepoint); }
 
-        env_->CallVoidMethod(edit_text_, m("setSingleLine", "(Z)V"), JNI_TRUE);
-
-        jclass view_group = env_->FindClass("android/view/ViewGroup$LayoutParams");
-        if (view_group) {
-            jfieldID wrap = env_->GetStaticFieldID(
-                env_->FindClass("android/view/ViewGroup$LayoutParams"),
-                "WRAP_CONTENT", "I");
-            jint width = env_->GetStaticIntField(view_group, wrap);
-            (void)width;
-            env_->DeleteLocalRef(view_group);
+    static char ascii_from_keycode(int32_t code) {
+        // Android KeyEvent.KEYCODE_A..Z = 29..54, 0..9 = 7..16
+        if (code >= 29 && code <= 54) return static_cast<char>('a' + (code - 29));
+        if (code >= 7 && code <= 16) return static_cast<char>('0' + (code - 7));
+        switch (code) {
+            case 62: return ' ';   // SPACE
+            case 55: return ',';   // COMMA
+            case 56: return '.';   // PERIOD
+            case 57: return '-';   // MINUS
+            case 58: return ';';   // SEMICOLON
+            case 59: return '/';   // SLASH
+            case 60: return '`';   // GRAVE
+            case 68: return '\'';  // QUOTE
+            case 69: return '[';   // LEFT_BRACKET
+            case 70: return ']';   // RIGHT_BRACKET
+            case 71: return '\\';  // BACKSLASH
+            default: return 0;
         }
+    }
 
-        // Adiciona ao content view da Activity (1x1 px, invisível mas focável).
-        jclass frame_params = env_->FindClass("android/widget/FrameLayout$LayoutParams");
-        if (frame_params) {
-            jmethodID ctor = env_->GetMethodID(frame_params, "<init>", "(II)V");
-            jobject params = env_->NewObject(frame_params, ctor, 1, 1);
-            env_->CallVoidMethod(
-                activity_,
-                env_->GetMethodID(find_class("android/app/Activity"), "addContentView",
-                                  "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V"),
-                edit_text_, params);
-            env_->DeleteLocalRef(params);
-            env_->DeleteLocalRef(frame_params);
-        }
+    static void log(const char* message) {
+        __android_log_print(ANDROID_LOG_WARN, "nativeapp-text", "%s", message);
     }
 
     JNIEnv* env_ = nullptr;
     jobject activity_ = nullptr;
-    jobject edit_text_ = nullptr;
     bool shown_ = false;
-    bool done_ = false;
-    std::string last_text_;
+    std::string text_;
     Callback callback_;
 };
 

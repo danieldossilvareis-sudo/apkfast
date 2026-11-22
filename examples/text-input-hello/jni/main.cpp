@@ -1,58 +1,67 @@
-// Teclado virtual com raylib + nativeapp::TextInput (100% JNI, sem Java extra).
-#include <raylib.h>
-#include <android_native_app_glue.h>
-#include <nativeapp/text_input.hpp>
+// Teclado virtual sem EditText — NativeActivity + nativeapp::TextInput.
+// O texto digitado aparece no logcat (tag "text-input") e muda a cor da cena.
+#include <nativeapp/nativeapp.hpp>
+#include <android/log.h>
 
-#include <string>
+#define LOG_TAG "text-input"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-extern "C" android_app* GetAndroidApp(void);
+using namespace nativeapp;
 
-int main(void) {
-    android_app* app = GetAndroidApp();
-    ANativeActivity* activity = app->activity;
+class TextApp : public App {
+public:
+    explicit TextApp(android_app* app) : App(app) {}
 
-    JNIEnv* env = nullptr;
-    activity->vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
-    if (!env) activity->vm->AttachCurrentThread(&env, nullptr);
+private:
+    void on_ready() override {
+        set_scene(&scene_);
+        scene_.set_clear_color(0.05f, 0.05f, 0.10f);
 
-    auto& input = nativeapp::TextInput::instance(env, activity->clazz);
-
-    std::string text;
-    input.set_callback([&](const std::string& value, bool) { text = value; });
-
-    InitWindow(0, 0, "text input");
-    SetTargetFPS(60);
-
-    bool focused = false;
-    while (!WindowShouldClose()) {
-        input.update();
-
-        if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) ||
-            (GetTouchPointCount() > 0 && GetTouchPosition(0).y > GetScreenHeight() * 0.55f)) {
-            if (!focused) {
-                input.show("Digite algo:");
-                focused = true;
-            } else {
-                input.hide();
-                focused = false;
-            }
-        }
-
-        BeginDrawing();
-          ClearBackground((Color){20, 20, 31, 255});
-          DrawText("apkfast - teclado virtual", 40, 100, 40, (Color){245, 245, 245, 255});
-          DrawText(focused ? "Toque para FECHAR o teclado" : "Toque para ABRIR o teclado",
-                   40, 180, 28, (Color){180, 180, 180, 255});
-          DrawRectangleLines(40, 260, GetScreenWidth() - 80, 120,
-                             (Color){94, 202, 112, 255});
-          DrawText(text.empty() ? "(vazio)" : text.c_str(), 60, 300, 36,
-                   (Color){94, 202, 112, 255});
-          DrawText("ENTER finaliza - suporte a acentos/emoji via IME",
-                   40, 430, 24, (Color){140, 140, 140, 255});
-        EndDrawing();
+        auto& input = TextInput::instance(nullptr, nullptr);
+        input.set_callback([this](const std::string& text, bool done) {
+            typed_ = text;
+            LOGI("texto='%s' done=%d", text.c_str(), done);
+            // Muda a cor conforme o tamanho do texto (feedback visual).
+            const float t = static_cast<float>(text.size()) / 20.0f;
+            scene_.set_clear_color(0.05f + t * 0.5f, 0.05f, 0.10f + t * 0.3f);
+        });
+        LOGI("ready");
     }
 
-    input.destroy();
-    CloseWindow();
-    return 0;
-}
+    void on_surface_created() override { scene_.init(window()); }
+    void on_surface_destroyed() override { scene_.destroy(); }
+    void on_surface_changed(int w, int h) override { scene_.resize(w, h); }
+
+    void on_draw() override {
+        // Cena gerencia begin_frame/present; apenas desenhamos um quadrado.
+        Material material;
+        Mat4 model = mat4_translate(width() / 2.0f, height() / 2.0f, 0.0f);
+        model = mat4_multiply(model, mat4_scale(200.0f, 200.0f, 1.0f));
+        scene_.draw(tile_, material, model.data());
+    }
+
+    void on_touch(TouchAction action, const std::vector<TouchPoint>&) override {
+        if (action != TouchAction::Down) return;
+        auto& input = TextInput::instance(nullptr, nullptr);
+        if (!input.is_shown()) {
+            input.show();
+            LOGI("show() -> is_shown=%d", input.is_shown());
+        } else {
+            input.hide();
+        }
+    }
+
+    void on_key(int32_t code, bool down) override {
+        if (down && code == 4 /* BACK */) {
+            auto& input = TextInput::instance(nullptr, nullptr);
+            if (input.is_shown()) input.hide();
+            else request_exit();
+        }
+    }
+
+    GLES2Scene scene_;
+    MeshData tile_ = MeshData::quad();
+    std::string typed_;
+};
+
+APP_MAIN(TextApp)

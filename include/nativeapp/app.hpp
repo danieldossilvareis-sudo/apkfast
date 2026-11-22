@@ -22,6 +22,7 @@
 #include "assets.hpp"
 #include "graphics_types.hpp"
 #include "permissions.hpp"
+#include "text_input.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -181,6 +182,15 @@ private:
             initialized_ = true;
             // Injeta o AAssetManager antes de qualquer cena carregar assets.
             Assets::instance(app_->activity).set_activity(app_->activity);
+            // Inicializa o TextInput com o JNIEnv/Activity da UI thread.
+            JNIEnv* ui_env = nullptr;
+            if (app_->activity->vm) {
+                app_->activity->vm->GetEnv(reinterpret_cast<void**>(&ui_env),
+                                           JNI_VERSION_1_6);
+            }
+            if (ui_env) {
+                TextInput::instance(ui_env, app_->activity->clazz);
+            }
             on_ready();
             state_ = Lifecycle::Ready;
         }
@@ -269,6 +279,31 @@ private:
                               action == AKEY_EVENT_ACTION_MULTIPLE;
             if (down) keys_down_.insert(code);
             else if (action == AKEY_EVENT_ACTION_UP) keys_down_.erase(code);
+
+            // Repassa ao teclado virtual (se estiver aberto). O unicode vem
+            // do IME e inclui acentos/símbolos de teclados internacionais.
+            if (TextInput::instance(nullptr, nullptr).is_shown()) {
+                int32_t unicode = 0;
+                // API 35+: converte o evento nativo em java KeyEvent para
+                // obter o unicode real do IME (acentos, símbolos, CJK).
+                JNIEnv* jenv = TextInput::instance(nullptr, nullptr).env();
+                if (jenv) {
+                    jobject java_event = AInputEvent_toJava(jenv, event);
+                    if (java_event) {
+                        jclass clazz = jenv->GetObjectClass(java_event);
+                        jmethodID get_unicode = jenv->GetMethodID(
+                            clazz, "getUnicodeChar", "()I");
+                        if (get_unicode) {
+                            unicode = jenv->CallIntMethod(java_event, get_unicode);
+                        }
+                        jenv->DeleteLocalRef(clazz);
+                        jenv->DeleteLocalRef(java_event);
+                    }
+                }
+                if (TextInput::instance(nullptr, nullptr).on_key(code, down, unicode)) {
+                    return 1;
+                }
+            }
             on_key(code, down);
             return 1;
         }

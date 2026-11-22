@@ -117,42 +117,44 @@ Para desenhar geometria no Vulkan, crie shaders `.spv` em `assets/` e chame
 
 ## Teclado virtual (`text_input.hpp`)
 
-Abre o teclado do Android e recebe texto via JNI puro — **sem classes Java
-customizadas**. Funciona com NativeActivity, raylib e SDL2/SDL3.
+Abre o teclado do Android **sem EditText e sem classes Java customizadas**.
+Usa `InputMethodManager.toggleSoftInput(SHOW_FORCED)` (API 1+) e recebe o texto
+via eventos de tecla do IME, com unicode real via `AInputEvent_toJava()` →
+`KeyEvent.getUnicodeChar()` (API 35+). Funciona em NativeActivity, raylib e SDL.
 
 ```cpp
 #include <nativeapp/text_input.hpp>
 
-JNIEnv* env = /* ... */;
-jobject activity = /* jobject da Activity */;
-
-auto& input = TextInput::instance(env, activity);
+// O App inicializa o TextInput automaticamente com o JNIEnv correto.
+auto& input = TextInput::instance(nullptr, nullptr);
 input.set_callback([](const std::string& text, bool done) {
-    // chamado quando o texto muda ou ENTER é pressionado
+    // texto mudou ou ENTER foi pressionado
 });
 
-input.show("Digite seu nome:");   // abre o teclado
-input.update();                   // chame a cada frame
-input.hide();                     // fecha
-input.text();                     // texto atual
+input.show();        // abre o teclado (toque, botão, etc.)
+input.hide();        // fecha
+input.text();        // texto atual
 input.is_shown();
-input.on_key(keycode, down);      // repasse eventos de tecla do App
 ```
+
+O `App` repassa automaticamente os key events ao TextInput quando ele está
+aberto — você não precisa fazer nada além de `show()`/`hide()`.
 
 | Método | Descrição |
 |---|---|
-| `instance(env, activity)` | Singleton (chamar uma vez) |
-| `show(hint)` / `hide()` | Abre/fecha o teclado virtual |
-| `update()` | Detecta mudanças de texto (chame por frame) |
-| `text()` | Texto atual |
+| `instance(env, activity)` | Singleton (o App já chama) |
+| `show()` / `hide()` | Abre/fecha o teclado via `toggleSoftInput` |
+| `text()` / `set_text()` / `clear()` | Texto atual |
 | `set_callback(cb)` | Callback `(texto, done)` |
-| `set_text()` / `set_hint()` / `set_multiline()` | Configuração |
-| `on_key(code, down)` | ENTER finaliza (consome o evento) |
-| `is_shown()` / `is_done()` / `clear_done()` | Estado |
-| `destroy()` | Libera recursos |
+| `on_key(code, down, unicode)` | Backspace/ENTER/caracteres (App chama) |
+| `is_shown()` | Teclado visível |
 
-Exemplo funcional: `examples/text-input-hello` (raylib). Validei no dispositivo
-que `show()` realmente abre o teclado (`dumpsys input_method` → `mInputShown=true`).
+Acentos/símbolos/CJK funcionam via unicode do IME. Backspace apaga (UTF-8
+aware) e ENTER finaliza.
+
+Exemplo funcional: `examples/text-input-hello`. Validado no dispositivo:
+teclado abre (`mInputShown=true`), digitação `abc123` chega corretamente,
+BACKSPACE apaga, ENTER finaliza e o app não fecha.
 
 ## Permissões em runtime
 
