@@ -115,6 +115,45 @@ Melhorias implementadas:
 Para desenhar geometria no Vulkan, crie shaders `.spv` em `assets/` e chame
 `set_pipeline()` com o bytecode SPIR-V.
 
+## Teclado virtual (`text_input.hpp`)
+
+Abre o teclado do Android e recebe texto via JNI puro — **sem classes Java
+customizadas**. Funciona com NativeActivity, raylib e SDL2/SDL3.
+
+```cpp
+#include <nativeapp/text_input.hpp>
+
+JNIEnv* env = /* ... */;
+jobject activity = /* jobject da Activity */;
+
+auto& input = TextInput::instance(env, activity);
+input.set_callback([](const std::string& text, bool done) {
+    // chamado quando o texto muda ou ENTER é pressionado
+});
+
+input.show("Digite seu nome:");   // abre o teclado
+input.update();                   // chame a cada frame
+input.hide();                     // fecha
+input.text();                     // texto atual
+input.is_shown();
+input.on_key(keycode, down);      // repasse eventos de tecla do App
+```
+
+| Método | Descrição |
+|---|---|
+| `instance(env, activity)` | Singleton (chamar uma vez) |
+| `show(hint)` / `hide()` | Abre/fecha o teclado virtual |
+| `update()` | Detecta mudanças de texto (chame por frame) |
+| `text()` | Texto atual |
+| `set_callback(cb)` | Callback `(texto, done)` |
+| `set_text()` / `set_hint()` / `set_multiline()` | Configuração |
+| `on_key(code, down)` | ENTER finaliza (consome o evento) |
+| `is_shown()` / `is_done()` / `clear_done()` | Estado |
+| `destroy()` | Libera recursos |
+
+Exemplo funcional: `examples/text-input-hello` (raylib). Validei no dispositivo
+que `show()` realmente abre o teclado (`dumpsys input_method` → `mInputShown=true`).
+
 ## Permissões em runtime
 
 `Permissions` (ANativeActivity*) e `JniPermissions` (JNIEnv* + jobject, para
@@ -144,4 +183,5 @@ Exemplos: `examples/permissions-test`, `examples/raylib-permissions`,
 | `gl.hpp` | GLContext, Shader, Mesh, Texture, GLES2/3Scene |
 | `vk.hpp` | GraphicsPipeline, GpuBuffer, VulkanScene |
 | `permissions.hpp` / `permissions_jni.hpp` / `permission_types.hpp` | Permissões |
+| `text_input.hpp` | Teclado virtual via JNI puro |
 | `stb_image.h` | Carregamento de imagem (domínio público) |

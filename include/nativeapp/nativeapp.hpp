@@ -23,4 +23,5 @@
 #include "gl.hpp"
 #include "permissions.hpp"
 #include "permissions_jni.hpp"
+#include "text_input.hpp"
 #include "vk.hpp"

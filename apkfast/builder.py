@@ -471,6 +471,7 @@ def _compile_java(
     """
     java_sources = _iter_files(options.project, ".java", DEFAULT_IGNORED_DIRS)
     jars = _iter_files(options.project, ".jar", DEFAULT_IGNORED_DIRS)
+
     if not java_sources and not jars:
         return None
 
