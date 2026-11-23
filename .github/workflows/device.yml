@@ -65,6 +65,7 @@ jobs:
         run: |
           set -e
           python3 apkfast.py build --generate-lock \
+            --api 35 --min-sdk 21 --target-sdk 36 \
             --sdk-dir "$ANDROID_HOME" \
             --ndk-dir "$ANDROID_HOME/ndk/$NDK_VERSION" \
             --build-tools "$BUILD_TOOLS"
