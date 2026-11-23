@@ -25,6 +25,13 @@
 #include <functional>
 #include <string>
 
+// NDKs mais antigos (ex.: r27) ainda permitem --target android-35, mas não
+// declaram AInputEvent_toJava. A declaração é idêntica à do NDK r30+; em NDKs
+// que já a possuem, redeclará-la é inofensiva.
+#if defined(__ANDROID_API__) && __ANDROID_API__ >= 35 && !defined(APKFAST_TEST_LEGACY_IME)
+extern "C" jobject AInputEvent_toJava(JNIEnv* env, const AInputEvent* event);
+#endif
+
 namespace nativeapp {
 
 class TextInput {
