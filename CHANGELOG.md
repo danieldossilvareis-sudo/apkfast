@@ -26,8 +26,9 @@ Duas frentes paralelas: **limites da 2.3.0** e **consolidação da base**.
 - **Instalação**: `pyproject.toml`, entry point `apkfast`, `pip install -e .`,
   wheel/sdist com `include/`, `src/`, `patches/` e `docs/`
 - **Completions**: bash/zsh/fish via `--completions` ou `completions`
-- **CI de dispositivo**: `.github/workflows/device.yml` com matriz
-  API 21/28/36 × arm64-v8a/armeabi-v7a
+- **Matriz de build no CI**: `.github/workflows/device.yml` com API 21/28/35
+  × x86_64 e API 35 × arm64-v8a/armeabi-v7a; validação em dispositivo fica
+  local (runners GitHub-hosted não bootam emuladores ARM de forma confiável)
 - Governança: `SECURITY.md`, `CODE_OF_CONDUCT.md`, `THIRD_PARTY_NOTICES.md`,
   `RELEASE.md`
 

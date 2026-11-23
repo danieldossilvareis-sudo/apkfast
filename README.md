@@ -80,9 +80,11 @@ ln -s "$PWD/apkfast.py" "$PREFIX/bin/apkfast"
   Builds divergentes falham; `--ignore-lock` transforma em aviso.
 - **Config validada:** chaves/tipos de `apkfast.json` são checados com mensagens
   claras. Inspecione com `apkfast config show .`.
-- **CI real em dispositivo:** a matriz API 21/28/36 × arm64-v8a/armeabi-v7a
-  instala `native-hello`, `image-demo` e `permissions-test` no emulator e
-  falha se o logcat contiver `FATAL` ou `dlopen failed`.
+- **Matriz de build no CI:** API 21/28/35 × x86_64 e API 35 × arm64-v8a/
+  armeabi-v7a compilam `native-hello`, `image-demo` e `permissions-test` com
+  lockfile validado. GitHub-hosted runners não bootam emuladores ARM de forma
+  confiável; a validação em dispositivo é feita localmente com `apkfast
+  install` + `apkfast logs`.
 - **Migração:** veja [docs/migration.md](docs/migration.md) (inclui o aviso de
   que o cache schema 1 da v2.2 foi invalidado na v2.3).
 

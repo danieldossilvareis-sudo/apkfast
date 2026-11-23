@@ -11,8 +11,10 @@ A versão vive em `apkfast/__init__.py` (`__version__`) e é lida por
 - [ ] `python3 apkfast.py config show examples/native-hello` → sem erros.
 - [ ] `python3 apkfast.py --completions bash|zsh|fish` → scripts gerados.
 - [ ] `CI` verde (`ci.yml`), incluindo validação de lockfile/config.
-- [ ] `Device matrix` verde (`device.yml`): API 21/28/36 × arm64-v8a/
-      armeabi-v7a, com logcat sem `FATAL`/`dlopen failed`.
+- [ ] `Build matrix` verde (`device.yml`): API 21/28/35 × x86_64 e API 35 ×
+      arm64-v8a/armeabi-v7a, com lockfile validado e APKs gerados.
+- [ ] Validação local em dispositivo: `apkfast install` + `apkfast logs` sem
+      `FATAL`/`dlopen failed` (runners GitHub-hosted não bootam emuladores ARM).
 - [ ] `apkfast build . --generate-lock` funciona e o lockfile está coerente.
 - [ ] `pip install -e .` e `apkfast --version` funcionam em Python 3.11+.
 - [ ] Wheel de teste contém `include/`, `src/`, `patches/` e `docs/`
