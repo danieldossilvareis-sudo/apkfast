@@ -1,6 +1,6 @@
 # Changelog
 
-## [2.0.0] - 2026-11-23 (pós-release)
+## [2.0.1] - 2026-11-23 — Correção de renderização de texto
 
 ### Corrigido
 - **Texto não aparecia no media-demo**: o atlas de fonte era uploaded como
