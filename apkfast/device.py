@@ -44,9 +44,15 @@ def find_adb(explicit: str | None = None) -> Path:
         HOME / "Android" / "android-sdk" / "platform-tools" / "adb",
         HOME / "Android" / "Sdk" / "platform-tools" / "adb",
     ]
+    not_executable: Path | None = None
     for path in candidates:
-        if path.is_file():
+        if not path.is_file():
+            continue
+        if os.access(path, os.X_OK):
             return path
+        not_executable = not_executable or path
+    if not_executable is not None:
+        raise DeviceError(f"adb não executável: {not_executable}")
     found = shutil.which("adb")
     if found:
         return Path(found)
@@ -55,7 +61,18 @@ def find_adb(explicit: str | None = None) -> Path:
     )
 
 
-def _run(adb: Path, args: list[str], *, timeout: int = 30) -> subprocess.CompletedProcess:
+def _run(
+    adb: Path,
+    args: list[str],
+    *,
+    timeout: int = 30,
+    label: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Executa um subcomando adb; erros de IO/timeout viram DeviceError.
+
+    ``label`` evita mensagens como "adb -s expirou" quando o comando começa
+    com opções globais (ex.: ``-s <serial> install``).
+    """
     try:
         return subprocess.run(
             [str(adb), *args],
@@ -65,23 +82,31 @@ def _run(adb: Path, args: list[str], *, timeout: int = 30) -> subprocess.Complet
             timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
-        raise DeviceError(f"adb {args[0]} expirou após {timeout}s") from exc
+        command = label or (args[0] if args else "comando")
+        raise DeviceError(f"adb {command} expirou após {timeout}s") from exc
     except OSError as exc:
-        raise DeviceError(f"Falha ao executar adb: {exc}") from exc
+        raise DeviceError(f"Falha ao executar adb ({adb}): {exc}") from exc
 
 
 def list_devices(adb: Path) -> list[Device]:
     result = _run(adb, ["devices", "-l"])
     if result.returncode != 0:
         raise DeviceError(f"adb devices falhou:\n{result.stdout.strip()}")
-    devices: list[Device] = []
     lines = result.stdout.splitlines()
-    if lines and "List of devices" in lines[0]:
-        lines = lines[1:]
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
+    header = next(
+        (index for index, line in enumerate(lines) if "List of devices" in line),
+        None,
+    )
+    if header is None:
+        raise DeviceError(
+            "Saída inesperada de 'adb devices' (sem cabeçalho):\n"
+            f"{result.stdout.strip()}"
+        )
+
+    devices: list[Device] = []
+    # Ignora mensagens do daemon ("starting now", "server didn't ACK", ...)
+    # que podem vir ANTES do cabeçalho em versões recentes do adb.
+    for line in lines[header + 1 :]:
         parts = line.split()
         if len(parts) < 2:
             continue
@@ -99,9 +124,25 @@ def list_devices(adb: Path) -> list[Device]:
 
 def restart_server(adb: Path) -> None:
     """Reinicia o servidor adb quando há estados travados/offline."""
-    _run(adb, ["kill-server"])
-    _run(adb, ["start-server"])
+    for command in ("kill-server", "start-server"):
+        result = _run(adb, [command], label=command)
+        if result.returncode != 0:
+            raise DeviceError(f"adb {command} falhou:\n{result.stdout.strip()}")
     time.sleep(1.5)
+
+
+def _prefer_usb(devices: list[Device]) -> Device:
+    """Prefere aparelho USB/real a emulador; ``devices`` não pode estar vazio."""
+    for device in devices:
+        if not device.serial.startswith("emulator-"):
+            return device
+    return devices[0]
+
+
+def _state_hint(state: str) -> str:
+    if state == "unauthorized":
+        return "Aceite a solicitação 'Permitir depuração USB?' no aparelho."
+    return "Verifique a depuração USB / autorização na tela do aparelho."
 
 
 def resolve_device(
@@ -114,18 +155,20 @@ def resolve_device(
 
     if serial:
         for device in devices:
-            if device.serial == serial:
-                if device.online:
-                    return device
-                if try_restart:
-                    restart_server(adb)
-                    for refreshed in list_devices(adb):
-                        if refreshed.serial == serial and refreshed.online:
+            if device.serial != serial:
+                continue
+            if device.online:
+                return device
+            state = device.state
+            if try_restart:
+                restart_server(adb)
+                for refreshed in list_devices(adb):
+                    if refreshed.serial == serial:
+                        if refreshed.online:
                             return refreshed
-                raise DeviceError(
-                    f"Dispositivo {serial} está '{device.state}'. "
-                    "Verifique a depuração USB / autorização na tela do aparelho."
-                )
+                        state = refreshed.state
+                        break
+            raise DeviceError(f"Dispositivo {serial} está '{state}'. {_state_hint(state)}")
         raise DeviceError(
             f"Dispositivo {serial} não aparece em 'adb devices'. "
             f"Disponíveis: {', '.join(d.label() for d in devices) or 'nenhum'}"
@@ -133,37 +176,25 @@ def resolve_device(
 
     online = [d for d in devices if d.online]
     if online:
-        # Prefere dispositivo USB real a emulador.
-        for device in online:
-            if not device.serial.startswith("emulator-"):
-                return device
-        return online[0]
+        return _prefer_usb(online)
+
+    if try_restart:
+        restart_server(adb)
+        devices = list_devices(adb)
+        online = [d for d in devices if d.online]
+        if online:
+            return _prefer_usb(online)
 
     if not devices:
-        if try_restart:
-            restart_server(adb)
-            devices = list_devices(adb)
-            online = [d for d in devices if d.online]
-            if online:
-                return online[0]
         raise DeviceError(
             "Nenhum dispositivo conectado. Conecte o aparelho via USB com "
             "depuração USB ativada, ou use 'adb connect <ip>:5555'."
         )
 
     states = ", ".join(f"{d.serial}={d.state}" for d in devices)
-    if try_restart:
-        restart_server(adb)
-        devices = list_devices(adb)
-        online = [d for d in devices if d.online]
-        if online:
-            return online[0]
-        states = ", ".join(f"{d.serial}={d.state}" for d in devices)
-
     if any(d.state == "unauthorized" for d in devices):
         raise DeviceError(
-            f"Dispositivo não autorizado ({states}). "
-            "Aceite a solicitação 'Permitir depuração USB?' no aparelho."
+            f"Dispositivo não autorizado ({states}). {_state_hint('unauthorized')}"
         )
     raise DeviceError(
         f"Dispositivo offline ({states}). Reconecte o USB ou autorize a depuração."
@@ -184,17 +215,22 @@ def install(
     adb = find_adb(adb_path)
     device = resolve_device(adb, serial)
 
-    cmd = [str(adb), "-s", device.serial, "install"]
+    # Opções globais (-s) vêm antes do subcomando; nada de reconstruir a linha
+    # de comando com cmd[1:] (isso também quebrava a mensagem de timeout).
+    args = ["-s", device.serial, "install"]
     if reinstall:
-        cmd.append("-r")
+        args.append("-r")
     if allow_downgrade:
-        cmd.append("-d")
+        args.append("-d")
     if grant_permissions:
-        cmd.append("-g")
-    cmd.append(str(apk))
+        args.append("-g")
+    args.append(str(apk))
 
-    result = _run(adb, [c for c in cmd[1:]], timeout=180)
+    result = _run(adb, args, timeout=180, label="install")
     output = result.stdout.strip()
-    if result.returncode != 0 or "Failure" in output:
+    failed = result.returncode != 0 or any(
+        line.lstrip().startswith("Failure") for line in output.splitlines()
+    )
+    if failed:
         raise DeviceError(f"Falha ao instalar em {device.label()}:\n{output}")
     return output or "Success"

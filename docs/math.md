@@ -88,16 +88,21 @@ operam somente sobre `Mat4`/`Vec3` e floats.
 | `mat4_multiply(a, b)` | `const Mat4& a`, `const Mat4& b` | `a * b` (composição) | `out[col*4+row] = Σ_k a[k*4+row] * b[col*4+k]` |
 | `mat4_translate(x, y, z)` | 3 floats | Translação | Escreve `m[12]=x`, `m[13]=y`, `m[14]=z` sobre a identidade |
 | `mat4_scale(x, y, z)` | 3 floats | Escala | Escreve `m[0]=x`, `m[5]=y`, `m[10]=z` sobre a identidade |
-| `mat4_rotate_x(angle)` | `float angle` | Rotação em torno de X | `cos`/`sin` em `m[5], m[6], m[9], m[10]` |
-| `mat4_rotate_y(angle)` | `float angle` | Rotação em torno de Y | `cos`/`sin` em `m[0], m[2], m[8], m[10]` |
-| `mat4_rotate_z(angle)` | `float angle` | Rotação em torno de Z | `cos`/`sin` em `m[0], m[1], m[4], m[5]` |
-| `mat4_ortho(l, r, b, t, near, far)` | 4 obrigatórios + 2 com default | Projeção ortográfica | Defaults: `near = -1.0f`, `far = 1.0f` |
-| `mat4_ortho2d(width, height)` | 2 floats | Ortográfica 2D | Chama `mat4_ortho(0, width, height, 0, -1, 1)` |
-| `mat4_perspective(fovy_rad, aspect, near, far)` | 4 floats | Perspectiva com profundidade **0..1** (Vulkan-style) | `m[10]=far/(near-far)`, `m[14]=(far*near)/(near-far)` |
-| `mat4_perspective_gl(fovy_rad, aspect, near, far)` | 4 floats | Perspectiva com profundidade **-1..1** (OpenGL-style) | `m[10]=(far+near)/(near-far)`, `m[14]=(2*far*near)/(near-far)` |
-| `mat4_look_at(eye, center, up)` | `const Vec3&`, `const Vec3&`, `const Vec3&` | Matriz de visão | Normaliza `z` e `x`, com fallbacks para casos degenerados |
+| `mat4_rotate_x(angle)` | `float angle` | Rotação em torno de X | `cos`/`sin` em `m[5], m[6], m[9], m[10]`; NaN/∞ ⇒ identidade |
+| `mat4_rotate_y(angle)` | `float angle` | Rotação em torno de Y | `cos`/`sin` em `m[0], m[2], m[8], m[10]`; NaN/∞ ⇒ identidade |
+| `mat4_rotate_z(angle)` | `float angle` | Rotação em torno de Z | `cos`/`sin` em `m[0], m[1], m[4], m[5]`; NaN/∞ ⇒ identidade |
+| `mat4_ortho(l, r, b, t, near, far)` | 4 obrigatórios + 2 com default | Projeção ortográfica | Defaults: `near = -1.0f`, `far = 1.0f`; volume degenerado/não finito ⇒ identidade |
+| `mat4_ortho2d(width, height)` | 2 floats | Ortográfica 2D | Chama `mat4_ortho(0, width, height, 0, -1, 1)` (herda o guarda) |
+| `mat4_perspective(fovy_rad, aspect, near, far)` | 4 floats | Perspectiva com profundidade **0..1** (Vulkan-style) | `m[10]=far/(near-far)`, `m[14]=(far*near)/(near-far)`; parâmetros inválidos ⇒ identidade |
+| `mat4_perspective_gl(fovy_rad, aspect, near, far)` | 4 floats | Perspectiva com profundidade **-1..1** (OpenGL-style) | `m[10]=(far+near)/(near-far)`, `m[14]=(2*far*near)/(near-far)`; mesmos guards |
+| `mat4_look_at(eye, center, up)` | `const Vec3&`, `const Vec3&`, `const Vec3&` | Matriz de visão | Normaliza `z` e `x`, com fallbacks para casos degenerados; vetores não finitos ⇒ identidade |
 
-Todas retornam `Mat4` **por valor** e são funções `inline`.
+Todas retornam `Mat4` **por valor** e são funções `inline`. Existem ainda dois
+helpers internos em `namespace detail` (não fazem parte da API pública, mas são
+usados pelos guards): `all_finite(Vec3)` e `perspective_params_valid(fovy_rad,
+aspect, near, far)`. Nas funções com guarda, parâmetros inválidos **nunca** geram
+NaN/inf: a função devolve `mat4_identity()` (ou, em `look_at`, uma translação
+neutra). `mat4_multiply()`, `mat4_translate()` e `mat4_scale()` não validam nada.
 
 ---
 
@@ -201,9 +206,17 @@ Não há verificação de zero nos fatores: `mat4_scale(0, 0, 0)` é aceito.
 
 ### Rotações
 
-As três usam `const float c = std::cos(angle), s = std::sin(angle);` sobre a
-identidade. **`angle` está em radianos**, porque `std::cos`/`std::sin` da
-biblioteca padrão recebem radianos; o header não faz conversão de graus.
+As três começam com um guarda e depois usam
+`const float c = std::cos(angle), s = std::sin(angle);` sobre a identidade:
+
+```cpp
+if (!std::isfinite(angle)) return mat4_identity();
+```
+
+**`angle` está em radianos**, porque `std::cos`/`std::sin` da biblioteca padrão
+recebem radianos; o header não faz conversão de graus. Um `angle` NaN ou
+infinito (por exemplo, resultado de divisão por zero na sua lógica) devolve a
+**identidade**, em vez de propagar NaN para a matriz.
 
 `mat4_rotate_x(angle)` — `m[5]=c; m[6]=s; m[9]=-s; m[10]=c;`
 
@@ -251,13 +264,20 @@ const Mat4 r = mat4_rotate_y(rad);
 ### `mat4_ortho(left, right, bottom, top, near, far)`
 
 ```cpp
+const float dx = right - left;
+const float dy = top - bottom;
+const float dz = far - near;
+if (!std::isfinite(dx) || !std::isfinite(dy) || !std::isfinite(dz) ||
+    dx == 0.0f || dy == 0.0f || dz == 0.0f) {
+    return mat4_identity();
+}
 Mat4 m = mat4_identity();
-m[0]  = 2.0f / (right - left);
-m[5]  = 2.0f / (top - bottom);
-m[10] = -2.0f / (far - near);
-m[12] = -(right + left) / (right - left);
-m[13] = -(top + bottom) / (top - bottom);
-m[14] = -(far + near) / (far - near);
+m[0]  = 2.0f / dx;
+m[5]  = 2.0f / dy;
+m[10] = -2.0f / dz;
+m[12] = -(right + left) / dx;
+m[13] = -(top + bottom) / dy;
+m[14] = -(far + near) / dz;
 ```
 
 | Parâmetro | Significado |
@@ -267,10 +287,12 @@ m[14] = -(far + near) / (far - near);
 | `near` | Plano próximo (default `-1.0f`). |
 | `far` | Plano distante (default `1.0f`). |
 
-A profundidade mapeada é o intervalo `[-1, 1]` (o `-2/(far-near)` e o
-`-(far+near)/(far-near)` são a forma OpenGL-style). **Não há verificação de
-denominadores zero**: `left == right`, `bottom == top` ou `far == near` geram
-divisão por zero (inf/NaN).
+A profundidade mapeada é o intervalo `[-1, 1]` (o `-2/dz` e o `-(far+near)/dz`
+são a forma OpenGL-style). **Há guarda para volume degenerado**: se
+`dx`, `dy` ou `dz` for zero ou não finito (por exemplo `left == right`,
+`bottom == top`, `far == near`, ou um dos limites igual a NaN/∞), a função
+devolve `mat4_identity()` em vez de gerar inf/NaN. O mesmo vale indiretamente
+para `mat4_ortho2d(0, h)` ou `mat4_ortho2d(w, 0)`.
 
 ```cpp
 const Mat4 ortho = mat4_ortho(-2.0f, 2.0f, -1.5f, 1.5f, 0.1f, 100.0f);
@@ -301,6 +323,9 @@ const Mat4 proj2d = mat4_ortho2d(800.0f, 600.0f);
 ### `mat4_perspective(fovy_rad, aspect, near, far)` — Vulkan-style (0..1)
 
 ```cpp
+if (!detail::perspective_params_valid(fovy_rad, aspect, near, far)) {
+    return mat4_identity();
+}
 Mat4 m{};
 const float f = 1.0f / std::tan(fovy_rad / 2.0f);
 m[0]  = f / aspect;
@@ -324,6 +349,9 @@ O intervalo de profundidade em NDC é **0..1**, como esperado por Vulkan. O
 ### `mat4_perspective_gl(fovy_rad, aspect, near, far)` — OpenGL-style (-1..1)
 
 ```cpp
+if (!detail::perspective_params_valid(fovy_rad, aspect, near, far)) {
+    return mat4_identity();
+}
 Mat4 m{};
 const float f = 1.0f / std::tan(fovy_rad / 2.0f);
 m[0]  = f / aspect;
@@ -342,9 +370,19 @@ m[14] = (2.0f * far * near) / (near - far);
 
 Mesmos parâmetros e mesmas unidades, mas NDC de profundidade **-1..1**.
 
-Nenhuma das duas funções valida `fovy_rad`, `aspect`, `near` ou `far`; valores
-como `aspect == 0`, `near == far`, `fovy_rad == 0` ou `fovy_rad >= pi` podem
-gerar divisão por zero, `tan` zero/negativo ou uma projeção sem sentido.
+As duas funções usam o mesmo guarda,
+`detail::perspective_params_valid()`, que recusa (devolvendo `mat4_identity()`):
+
+- qualquer parâmetro não finito (NaN/∞);
+- `fovy_rad <= 0` ou `fovy_rad >= acos(-1)` (π);
+- `aspect <= 0`, `near <= 0` ou `far <= near`;
+- `tan(fovy_rad * 0.5f)` não finito ou `<= 0`, ou `near - far` não finito.
+
+Assim, `aspect == 0`, `near == far`, `fovy_rad == 0` e `fovy_rad >= pi` não
+geram mais divisão por zero nem projeção corrompida. **Observação:** o guarda
+não sabe se a matriz resultante é a que você queria — uma projeção identidade
+"aceitável" pode deixar a cena com aparência estranha; valide também os
+parâmetros na sua aplicação.
 
 ---
 
@@ -355,22 +393,27 @@ inline Mat4 mat4_look_at(const Vec3& eye, const Vec3& center, const Vec3& up)
 ```
 
 A implementação segue a construção de base ortonormal a partir da direção de
-visão:
+visão, com guards em cada ponto sensível:
 
-1. `z = normalize(eye - center)`. Se o módulo bruto `zl_raw` for `0`, usa
-   `zl = 1.0f` (fallback; o vetor z resultante fica zerado).
+0. Se `eye`, `center` ou `up` tiver qualquer componente não finito, devolve
+   `mat4_identity()` (`detail::all_finite()`).
+1. `z = normalize(eye - center)`. Se `zl_raw` não for finito ou for `<= 1e-6f`
+   (isto é, `eye == center`), **não há direção de visão**: devolve
+   `mat4_translate(-eye[0], -eye[1], -eye[2])` — orientação neutra, sem base
+   zerada e sem NaN.
 2. `x = normalize(up × z)`, com produto vetorial escrito diretamente nas
    variáveis `xx, xy, xz`.
-3. Se `xl_raw < 1e-6f` — isto é, `up` paralelo à direção de visão (ou `z`
-   degenerado) — escolhe um eixo alternativo:
+3. Se `xl_raw` não for finito ou for `< 1e-6f` — isto é, `up` paralelo à direção
+   de visão — escolhe um eixo alternativo:
 
    ```cpp
    const Vec3 alt = (std::fabs(z1) < 0.99f) ? Vec3{0,1,0} : Vec3{0,0,1};
    ```
 
    O critério usa `z1`, o **componente Y do vetor z**, comparado com `0.99`.
-   Depois recalcula `x = normalize(alt × z)`; se ainda assim o módulo for zero,
-   `xl = 1.0f` evita divisão por zero.
+   Depois recalcula `x = normalize(alt × z)`. Se ainda assim o módulo não for
+   finito ou for `<= 1e-6f`, cai novamente em
+   `mat4_translate(-eye[0], -eye[1], -eye[2])`.
 4. `y = z × x` (não é normalizado novamente).
 5. Preenche a matriz como base por colunas e translação negativa:
 
@@ -398,10 +441,12 @@ const Mat4 view = mat4_look_at(eye, center, up);
 const Mat4 view2 = mat4_look_at({0,0,5}, {0,0,0}, {0,0,1});
 ```
 
-**Caso degenerado extremo:** se `eye == center`, `z` fica zero, o fallback de
-`x` também gera um produto vetorial zero e a matriz resultante tem base com
-zeros — não há NaN por divisão zero, mas a câmera não é válida. Cabe ao chamador
-evitar `eye == center`.
+**Casos degenerados:** `eye == center` e `up` paralelo à visão (com eixo
+alternativo também degenerado) devolvem uma **translação neutra**
+(`mat4_translate(-eye...)`) em vez de uma matriz cheia de zeros/NaN. Vetores com
+NaN/∞ devolvem a identidade. Em nenhum desses casos a câmera resultante é útil
+para renderizar: os guards apenas evitam corromper o resto da cena. Cabe ao
+chamador fornecer `eye != center` e um `up` não paralelo.
 
 ---
 
@@ -500,12 +545,14 @@ a matriz.
 | Achar que índice 12 é "linha 3, coluna 0" | O armazenamento é column-major: índice = `col*4 + row`. 12 = coluna 3, linha 0. | Use o mapa da §1 e pense em colunas. |
 | Passar matriz para GLSL transposta | O código já envia column-major com `GL_FALSE`. | Não transponha novamente; use `.data()` direto. |
 | Graus em vez de radianos | `std::cos`/`std::sin` e `std::tan` recebem radianos; o header não converte. | Converta: `rad = graus * pi / 180`. |
+| `angle` NaN/∞ nas rotações | O guarda devolve `mat4_identity()` — a rotação "desaparece" silenciosamente. | Sanitize o ângulo antes de chamar; não confunda identidade com rotação de 0 radianos intencional. |
 | `fovy` em radianos confundido com ângulo horizontal | O parâmetro se chama `fovy_rad` (vertical); `aspect` ajusta a horizontal. | Calcule `aspect = largura / altura`. |
-| Denominadores zero em `mat4_ortho` | Não há validação de `right-left`, `top-bottom` ou `far-near`. | Garanta limites distintos. |
-| `near == far` ou `aspect == 0` na perspectiva | Não há validação; surgem inf/NaN. | Valide os parâmetros antes de chamar. |
+| Volume `mat4_ortho` degenerado | `dx`, `dy` ou `dz` zero/não finito ⇒ a função devolve identidade (não gera inf/NaN). | Garanta limites distintos e finitos; identidade aqui provavelmente não é a projeção desejada. |
+| `near == far` ou `aspect == 0` na perspectiva | `perspective_params_valid()` recusa os parâmetros e devolve identidade. | Valide os parâmetros antes de chamar e trate o retorno identidade como erro de configuração. |
 | `mat4_ortho2d` com Y "de cabeça para baixo" | A chamada é `mat4_ortho(0, width, height, 0, ...)`: `top = 0`, `bottom = height`. | Trate `y = 0` como topo e `y = height` como base, como faz `GLES2Scene`. |
-| `up` paralelo à visão | `up × z` fica zero. | `mat4_look_at` já troca para `{0,1,0}` ou `{0,0,1}` com base em `fabs(z1) < 0.99f`. |
-| `eye == center` | `z` fica zero e o fallback não recupera uma base válida. | Nunca use `eye == center`. |
+| `up` paralelo à visão | `up × z` fica ~0. | `mat4_look_at` já troca para `{0,1,0}` ou `{0,0,1}` com base em `fabs(z1) < 0.99f`. |
+| `eye == center` | `zl_raw <= 1e-6f`: sem direção de visão. | `mat4_look_at` devolve `mat4_translate(-eye...)`; ainda assim, nunca use `eye == center`. |
+| Vetores NaN/∞ em `look_at` | `all_finite()` falha ⇒ identidade. | Sanitize `eye`/`center`/`up` antes de chamar. |
 | Esperar `Mat4 * Mat4` ou transformar `Vec3` | O header só tem funções livres sobre arrays; não há operadores nem helper de transformação. | Use `mat4_multiply()` e faça a multiplicação vetor/matriz no shader (como faz o shader padrão de `gl.hpp`). |
 | Reutilizar referência a temporário | As funções retornam por valor, sem alias oculto; `Mat4 b = a` copia. | Guarde o resultado em variável (`const Mat4 m = ...`) antes de usar `.data()`. |
 

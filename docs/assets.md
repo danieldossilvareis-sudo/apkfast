@@ -68,9 +68,11 @@ para `AAssetManager_open`.
 
 ```cpp
 static Assets& instance(ANativeActivity* activity) {
-    static Assets* singleton = nullptr;
-    if (!singleton) singleton = new Assets(activity);
-    return *singleton;
+    // Inicialização local static é thread-safe em C++11+ e o objeto é
+    // destruído no shutdown (o ponteiro new vazava para sempre).
+    // Como antes, o activity só é usado na primeira chamada.
+    static Assets singleton(activity);
+    return singleton;
 }
 ```
 
@@ -78,11 +80,12 @@ Comportamento literal do código:
 
 | Aspecto | O que acontece |
 |---|---|
-| Primeira chamada | Cria `Assets(activity)` uma única vez (`new`). |
+| Primeira chamada | Constrói `Assets(activity)` uma única vez como **objeto local static** (sem `new`). |
+| Thread safety | A inicialização de um local static é **thread-safe em C++11+**; não há corrida na criação. |
 | Construtor | `manager_(activity ? activity->assetManager : nullptr)`. |
 | Chamadas seguintes | **Ignoram o argumento** e devolvem sempre o mesmo objeto. |
 | `activity == nullptr` na primeira chamada | Cria o singleton com `manager_ == nullptr`. |
-| Destruição | O header não define rotina de destruição do singleton. |
+| Destruição | O objeto é destruído automaticamente no shutdown do processo (não há vazamento). |
 
 Consequência importante: chamar `Assets::instance(nullptr)` é seguro **desde que
 o singleton já tenha sido criado antes** com um `activity` válido (ou com
@@ -150,7 +153,7 @@ void init(ANativeActivity* activity) {
 | `instance` | `static Assets& instance(ANativeActivity*)` | Referência ao singleton | Argumento ignorado após a primeira chamada |
 | `set_activity` | `void set_activity(ANativeActivity*)` | — | `nullptr` é ignorado; `manager_` não é alterado |
 | `exists` | `bool exists(const std::string&) const` | `true` se o arquivo abre | `false` sem manager ou se `AAssetManager_open` falha |
-| `read` | `std::vector<uint8_t> read(const std::string&) const` | Bytes do arquivo | Vetor vazio sem manager, se `open` falha, se tamanho < 0 ou se a leitura retorna ≤ 0 |
+| `read` | `std::vector<uint8_t> read(const std::string&) const` | Bytes do arquivo | Vetor vazio sem manager, se `open` falha, se tamanho < 0 ou `> SIZE_MAX`, se arquivo é vazio ou se alguma leitura retorna ≤ 0 (laço com `clear()`) |
 | `read_text` | `std::string read_text(const std::string&) const` | Conteúdo textual | String vazia se `read()` não trouxe bytes |
 | `write` | `bool write(const std::string&, const std::vector<uint8_t>&) const` | **Sempre `false`** | Stub: assets são somente leitura |
 | `manager` | `AAssetManager* manager() const` | Ponteiro bruto, pode ser nulo | — |
@@ -210,16 +213,30 @@ std::vector<uint8_t> read(const std::string& path) const {
     AAsset* asset = AAssetManager_open(manager_, path.c_str(), AASSET_MODE_BUFFER);
     if (!asset) return result;
     const int64_t length = AAsset_getLength64(asset);
-    if (length < 0) { AAsset_close(asset); return result; }
+    if (length < 0 ||
+        static_cast<uint64_t>(length) >
+            static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        AAsset_close(asset);
+        return result;
+    }
     const size_t size = static_cast<size_t>(length);
+    if (size == 0) {
+        AAsset_close(asset);
+        return result;
+    }
     result.resize(size);
-    if (size > 0) {
-        const int bytes = AAsset_read(asset, result.data(), size);
-        if (bytes > 0) {
-            result.resize(static_cast<size_t>(bytes));
-        } else {
+    // AAsset_read pode devolver menos bytes que o pedido; completa o
+    // buffer em vez de devolver um arquivo truncado. Qualquer falha
+    // ainda resulta em vetor vazio (comportamento histórico).
+    size_t total = 0;
+    while (total < size) {
+        const int bytes = AAsset_read(asset, result.data() + total,
+                                      size - total);
+        if (bytes <= 0) {
             result.clear();
+            break;
         }
+        total += static_cast<size_t>(bytes);
     }
     AAsset_close(asset);
     return result;
@@ -232,19 +249,19 @@ Fluxo passo a passo:
 |---|---|---|
 | 1 | `if (!manager_) return result;` | Sem gerenciador, devolve vetor vazio imediatamente. |
 | 2 | `AAssetManager_open(..., AASSET_MODE_BUFFER)` | Abre o arquivo; falha ⇒ vetor vazio. |
-| 3 | `AAsset_getLength64(asset)` | Tamanho em `int64_t`. Negativo ⇒ fecha e devolve vazio. |
-| 4 | `result.resize(size)` | Aloca exatamente o tamanho informado. |
-| 5 | `AAsset_read(asset, result.data(), size)` | **Uma única chamada** de leitura. |
-| 6 | `bytes > 0` | Ajusta o vetor para `bytes` (trata leitura curta). |
-| 7 | `bytes <= 0` | Descarta tudo: `result.clear()`. |
+| 3 | `AAsset_getLength64(asset)` + checagem | Tamanho em `int64_t`; negativo **ou maior que `SIZE_MAX`** (comparado como `uint64_t`, para evitar wrap) ⇒ fecha e devolve vazio. |
+| 4 | `if (size == 0)` | Fecha e devolve vetor vazio sem chamar `AAsset_read`. |
+| 5 | `result.resize(size)` | Aloca exatamente o tamanho informado. |
+| 6 | `while (total < size)` | **Laço de leitura**: `AAsset_read(asset, result.data() + total, size - total)` completa o buffer após leituras curtas. |
+| 7 | `bytes <= 0` | Descarta tudo (`result.clear()`) e sai do laço — comportamento histórico de falha. |
 | 8 | `AAsset_close(asset)` | Sempre fecha quando o arquivo foi aberto. |
 
 Sobre a **leitura curta**: o código não assume que `AAsset_read` devolve todos
-os bytes pedidos. Ele usa o valor de retorno `int bytes` e redimensiona o
-vetor para esse valor. Isso evita deixar zeros no fim do buffer. Note que
-também **não há laço de repetição** — se a primeira leitura devolver menos que
-`size`, o resultado é o que veio nessa primeira chamada. O modo
-`AASSET_MODE_BUFFER` é o usado na abertura.
+os bytes pedidos. Ele usa o retorno `int bytes`, avança `total` e pede o
+restante no próximo ciclo do laço, gravando em `result.data() + total`. O
+resultado, quando não há falha, tem **exatamente** `size` bytes — não é
+redimensionado para a primeira leitura. O modo `AASSET_MODE_BUFFER` é o usado na
+abertura; isso não elimina a possibilidade de retornos parciais.
 
 Sobre o **arquivo vazio**: quando `size == 0`, `AAsset_read` nem é chamado e o
 vetor já retorna vazio. Na prática, `read()` de um arquivo vazio e `read()` de
@@ -499,8 +516,9 @@ diretório; o código C++ continua usando caminhos relativos a essa raiz.
 | Caminho com prefixo `assets/` | `exists()` retorna `false`, `read()` devolve vazio | O caminho já é relativo à raiz do diretório passado ao `aapt2` com `-A`. Use `"textures/x.png"`, não `"assets/textures/x.png"`. |
 | Esperar que `write()` salve algo | Sempre `false`, nenhum arquivo criado | É um stub explícito: `// assets são somente leitura`. |
 | Arquivo vazio vs. arquivo ausente | Ambos dão vetor vazio / string vazia | `read()` não distingue as situações; use `exists()` antes se precisar diferenciar. |
-| Confiar que `read()` preenche todo o buffer | Resultado menor que o tamanho informado | O código redimensiona para `bytes` (leitura curta). Use sempre `result.size()`, não o tamanho esperado. |
-| Ler `bytes <= 0` | Vetor inteiro descartado (`clear()`) | Qualquer retorno não positivo de `AAsset_read` zera o resultado. |
+| Confiar que `AAsset_read` devolve tudo de uma vez | (Antes: arquivo truncado; agora:) o laço completa o buffer | `read()` repete a leitura em `result.data() + total` até `total == size`; use sempre `result.size()` de todo modo. |
+| Ler `bytes <= 0` em qualquer iteração | Vetor inteiro descartado (`clear()`) | Qualquer retorno não positivo de `AAsset_read` zera o resultado, mesmo após leituras parciais anteriores. |
+| `AAsset_getLength64()` maior que `SIZE_MAX` | Vetor vazio, sem alocação | A checagem compara como `uint64_t` contra `numeric_limits<size_t>::max()` (importante em builds 32-bit). |
 | Usar `read_text()` em binário com encoding desconhecido | Texto com bytes estranhos | Não há conversão de encoding nem validação; é só `reinterpret_cast` + tamanho. |
 | `exists()` usado como verificação de integridade | Arquivos existentes podem falhar na leitura | `exists()` só verifica abertura; `read()` tem verificações próprias. |
 
@@ -520,6 +538,7 @@ Checklist rápido de diagnóstico:
 #include <nativeapp/assets.hpp>
 
 // 1) Na primeira chamada, passe um activity válido (ou chame set_activity).
+//    O singleton é um local static (thread-safe, destruído no shutdown).
 auto& assets = nativeapp::Assets::instance(activity);
 assets.set_activity(activity);              // idempotente; ignora nullptr
 

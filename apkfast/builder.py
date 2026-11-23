@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -14,6 +16,14 @@ from .toolchain import NDK_ARCH_DIR, Toolchain, detect
 
 DEFAULT_IGNORED_DIRS = {".git", "build", "obj", ".apkfast", "gradle", ".gradle"}
 ALL_ABIS = ("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
+CPP_SUFFIXES = (".cpp", ".cc", ".cxx", ".c++", ".C")
+# zipalign antigos rejeitam -P com uma destas mensagens; qualquer outra falha
+# deve abortar o build em vez de ser confundida com "sem suporte a 16 KB".
+_ZIPALIGN_NO_P = re.compile(
+    r"invalid option|invalid flag|unknown option|unknown flag|"
+    r"unrecognized option|illegal option",
+    re.IGNORECASE,
+)
 
 
 class BuildError(RuntimeError):
@@ -92,20 +102,134 @@ class BuildOptions:
         return [self.abi]
 
 
-def _run(cmd: list[str], log: Logger, *, cwd: Path | None = None) -> subprocess.CompletedProcess:
+def _tail(text: str, limit: int = 40) -> str:
+    """Limita o trecho de saída anexado a mensagens de erro em --quiet."""
+    lines = text.rstrip().splitlines()
+    if len(lines) <= limit:
+        return "\n".join(lines)
+    omitted = len(lines) - limit
+    return f"... ({omitted} linha(s) omitida(s))\n" + "\n".join(lines[-limit:])
+
+
+def _execute(
+    cmd: list[str],
+    log: Logger,
+    *,
+    cwd: Path | None = None,
+    capture: bool = False,
+) -> subprocess.CompletedProcess:
+    """Executa um comando, transformando falhas de execução em BuildError."""
     log.command(cmd)
-    result = subprocess.run([str(c) for c in cmd], cwd=cwd)
+    argv = [str(c) for c in cmd]
+    try:
+        return subprocess.run(
+            argv,
+            cwd=cwd,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.STDOUT if capture else None,
+            text=capture,
+        )
+    except OSError as exc:
+        raise BuildError(f"Não foi possível executar '{argv[0]}': {exc}") from exc
+
+
+def _run(cmd: list[str], log: Logger, *, cwd: Path | None = None) -> subprocess.CompletedProcess:
+    # Em --quiet a saída dos subprocessos precisa ser capturada: sem isso
+    # avisos de clang/aapt2/keytool vazam mesmo com o logger silenciado.
+    capture = log.quiet
+    result = _execute(cmd, log, cwd=cwd, capture=capture)
     if result.returncode != 0:
+        output = _tail(result.stdout or "") if capture else ""
         raise BuildError(
             f"Comando falhou ({result.returncode}): {' '.join(str(c) for c in cmd)}"
+            + (f"\n{output}" if output else "")
         )
     return result
 
 
 def _clean(path: Path) -> None:
+    if path.is_symlink():
+        raise BuildError(f"Diretório de build não pode ser symlink: {path}")
     if path.exists():
-        shutil.rmtree(path)
-    path.mkdir(parents=True, exist_ok=True)
+        if not path.is_dir():
+            raise BuildError(f"--build-dir aponta para um arquivo, não diretório: {path}")
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            raise BuildError(f"Falha ao limpar {path}: {exc}") from exc
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise BuildError(f"Falha ao criar {path}: {exc}") from exc
+
+
+def _strip_c_comments(text: str) -> str:
+    """Apaga comentários e literais para detectar features sem falsos positivos.
+
+    Mantém o tamanho aproximado do texto (comentários viram espaços) para que
+    detecções como `#include <vulkan/vulkan.h>` continuem funcionando, enquanto
+    `// #include <vulkan/vulkan.h>` e strings de log não ativam a feature.
+    """
+    out: list[str] = []
+    state = "code"
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        following = text[index + 1] if index + 1 < length else ""
+        if state == "code":
+            if char == "/" and following == "/":
+                state, index = "line", index + 2
+                out.append("  ")
+            elif char == "/" and following == "*":
+                state, index = "block", index + 2
+                out.append("  ")
+            elif char in ('"', "'"):
+                state = "string" if char == '"' else "char"
+                out.append(" ")
+                index += 1
+            else:
+                out.append(char)
+                index += 1
+        elif state == "line":
+            if char == "\n":
+                state = "code"
+                out.append("\n")
+            else:
+                out.append(" ")
+            index += 1
+        elif state == "block":
+            if char == "*" and following == "/":
+                state, index = "code", index + 2
+                out.append("  ")
+            else:
+                out.append("\n" if char == "\n" else " ")
+                index += 1
+        else:  # string / char literal
+            if char == "\\":
+                out.append(" ")
+                index += 2
+            elif (state == "string" and char == '"') or (state == "char" and char == "'"):
+                state = "code"
+                out.append(" ")
+                index += 1
+            else:
+                out.append("\n" if char == "\n" else " ")
+                index += 1
+    return "".join(out)
+
+
+def _read_sources(sources: list[Path]) -> str:
+    """Concatena o código relevante (sem comentários) para detecção."""
+    chunks: list[str] = []
+    for source in sources:
+        if not source.is_file():
+            continue
+        try:
+            chunks.append(_strip_c_comments(source.read_text(errors="ignore")))
+        except OSError as exc:
+            raise BuildError(f"Não foi possível ler {source}: {exc}") from exc
+    return "\n".join(chunks)
 
 
 def _iter_files(root: Path, pattern: str, ignored: set[str]) -> list[Path]:
@@ -216,9 +340,7 @@ def _native_build(
     # stb_truetype, stb_vorbis, dr_mp3) exatamente uma vez por build.
     if options.use_nativeapp:
         # Detecta raylib antes da injeção (ela já define os símbolos stbi_*).
-        uses_raylib_here = any(
-            "raylib.h" in s.read_text(errors="ignore") for s in sources if s.is_file()
-        )
+        uses_raylib_here = "raylib.h" in _read_sources(sources)
         impl_name = (
             "nativeapp_impl_no_image.cpp" if uses_raylib_here else "nativeapp_impl.cpp"
         )
@@ -246,9 +368,7 @@ def _native_build(
         "-fdata-sections",
         "-fstack-protector-strong",
     ]
-    source_text = "\n".join(
-        s.read_text(errors="ignore") for s in sources if s.is_file()
-    )
+    source_text = _read_sources(sources)
     uses_vulkan = options.vulkan or any(
         token in source_text
         for token in ("nativeapp/vk.hpp", "nativeapp/nativeapp.hpp",
@@ -277,7 +397,9 @@ def _native_build(
         base_flags.append("-fvisibility-inlines-hidden")
 
     def compiler_flags(compiler: Path) -> list[str]:
-        return tc.clang_target_flags(explicit_target=compiler.name in ("clang", "clang++"))
+        # Wrappers versionados (ex.: aarch64-linux-android36-clang) já embutem
+        # o target. clang-18 e outros nomes genéricos precisam de --target.
+        return tc.clang_target_flags(explicit_target=compiler.name.startswith("clang"))
 
     # Diretório da API nativeapp (headers ficam em <raiz do apkfast>/include).
     root = Path(__file__).resolve().parent.parent
@@ -303,7 +425,7 @@ def _native_build(
 
     log.info(f"[*] Compilando {len(sources)} arquivo(s) nativo(s) para {tc.abi}")
     for index, source in enumerate(sources):
-        is_cpp = source.suffix in (".cpp", ".cc", ".cxx", ".cxx")
+        is_cpp = source.suffix in CPP_SUFFIXES
         compiler = tc.clang(cpp=is_cpp)
         obj = native_dir / f"obj_{index}_{source.stem}.o"
         cmd = [compiler, "-c", str(source), "-o", str(obj)]
@@ -337,7 +459,7 @@ def _native_build(
         log.warn("[!] Aviso: NativeActivity declarada mas native_app_glue não foi compilado.")
 
     output = native_dir / f"lib{_native_lib_name(manifest, project)}.so"
-    has_cpp = any(s.suffix in (".cpp", ".cc", ".cxx") for s in sources)
+    has_cpp = any(s.suffix in CPP_SUFFIXES for s in sources)
     linker = tc.clang(cpp=has_cpp)
     cmd = [linker, "-shared", "-o", str(output)]
     cmd += compiler_flags(linker)
@@ -445,11 +567,17 @@ def _native_lib_name(manifest: ManifestInfo, project: Path) -> str:
 
         try:
             data = json.loads(config.read_text())
-            name = data.get("nativeLibraryName")
-            if name:
-                return str(name)
-        except Exception:
-            pass
+        except (OSError, ValueError) as exc:
+            raise BuildError(f"apkfast.json inválido em {config}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise BuildError(f"apkfast.json em {config} deve conter um objeto JSON.")
+        name = data.get("nativeLibraryName")
+        if name is not None:
+            if not isinstance(name, str) or not name.strip():
+                raise BuildError(
+                    f"nativeLibraryName em {config} deve ser um texto não vazio."
+                )
+            return name.strip()
     return "main"
 
 
@@ -460,6 +588,18 @@ def _stage_native_lib(
         return None
     target = work / "apk" / "lib" / abi
     target.mkdir(parents=True, exist_ok=True)
+    if not lib.is_file():
+        raise BuildError(f"Biblioteca nativa não encontrada: {lib}")
+    names = {lib.name}
+    for extra in extra_libs:
+        if not extra.is_file():
+            raise BuildError(f"Biblioteca compartilhada não encontrada: {extra}")
+        if extra.name in names:
+            raise BuildError(
+                f"Biblioteca duplicada para {abi}: {extra.name} "
+                "(verifique libc++_shared.so e o nome da lib principal)."
+            )
+        names.add(extra.name)
     shutil.copy2(lib, target / lib.name)
     for extra in extra_libs:
         shutil.copy2(extra, target / extra.name)
@@ -468,8 +608,6 @@ def _stage_native_lib(
 
 def _find_tool(tc: Toolchain, name: str) -> Path | None:
     """Procura uma ferramenta no SDK (cmdline-tools/bin, build-tools) ou PATH."""
-    import shutil
-
     candidates = [
         tc.sdk_dir / "cmdline-tools" / "bin" / name,
         tc.build_tools_dir / name,
@@ -594,29 +732,45 @@ def _add_extra_files_with_zip(apk: Path, extra_root: Path) -> None:
     Evita depender de um binário `zip` externo e preserva manifesto e recursos
     gerados pelo aapt2.
     """
-    import zipfile
-
     extra_files = sorted(extra_root.rglob("*.so")) + sorted(extra_root.rglob("*.dex"))
     if not extra_files:
         return
+    staged: list[tuple[Path, str]] = []
+    seen: set[str] = set()
+    for extra in extra_files:
+        if not extra.is_file():
+            raise BuildError(f"Arquivo para empacotar não encontrado: {extra}")
+        arcname = str(extra.relative_to(extra_root)).replace(os.sep, "/")
+        if arcname in seen:
+            raise BuildError(f"Arquivo duplicado no APK: {arcname}")
+        seen.add(arcname)
+        staged.append((extra, arcname))
+
     tmp = apk.with_suffix(".withextra.apk")
-    with zipfile.ZipFile(apk, "r") as src, zipfile.ZipFile(
-        tmp, "w", compression=zipfile.ZIP_DEFLATED
-    ) as dst:
-        for info in src.infolist():
-            dst.writestr(info, src.read(info.filename))
-        for extra in extra_files:
-            arcname = str(extra.relative_to(extra_root))
-            # dex e .so precisam ser STORED: dex é mapeado pela ART e .so
-            # precisa ser page-aligned/comprimido pelo instalador em Android
-            # 15+ (16 KB pages). Comprimidos, o dlopen falha.
-            method = (
-                zipfile.ZIP_STORED
-                if extra.suffix in (".dex", ".so")
-                else zipfile.ZIP_DEFLATED
-            )
-            dst.write(extra, arcname, compress_type=method)
-    tmp.replace(apk)
+    try:
+        with zipfile.ZipFile(apk, "r") as src:
+            existing = {info.filename for info in src.infolist()}
+            for _, arcname in staged:
+                if arcname in existing:
+                    raise BuildError(
+                        f"Conflito no APK: {arcname} já foi gerado pelo aapt2."
+                    )
+            with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as dst:
+                for info in src.infolist():
+                    dst.writestr(info, src.read(info.filename))
+                for extra, arcname in staged:
+                    # dex e .so precisam ser STORED: dex é mapeado pela ART e .so
+                    # precisa ser page-aligned/comprimido pelo instalador em Android
+                    # 15+ (16 KB pages). Comprimidos, o dlopen falha.
+                    method = (
+                        zipfile.ZIP_STORED
+                        if extra.suffix in (".dex", ".so")
+                        else zipfile.ZIP_DEFLATED
+                    )
+                    dst.write(extra, arcname, compress_type=method)
+        tmp.replace(apk)
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise BuildError(f"Falha ao empacotar arquivos extras no APK: {exc}") from exc
 
 
 def _align_and_sign(
@@ -631,9 +785,17 @@ def _align_and_sign(
     # -P 16 alinha para páginas de 16 KB (Android 15+). Versões antigas do
     # zipalign aceitam -P; se não aceitar, tenta sem.
     align_cmd = [tc.zipalign, "-f", "-P", "16", "4", str(unsigned), str(aligned)]
-    try:
-        _run(align_cmd, log)
-    except BuildError:
+    attempt = _execute(align_cmd, log, capture=True)
+    if attempt.stdout and not log.quiet:
+        log.info(attempt.stdout.rstrip())
+    if attempt.returncode != 0:
+        output = attempt.stdout or ""
+        if not _ZIPALIGN_NO_P.search(output):
+            raise BuildError(
+                f"zipalign falhou ({attempt.returncode}): "
+                f"{' '.join(str(c) for c in align_cmd)}"
+                + (f"\n{_tail(output)}" if output else "")
+            )
         log.warn("[!] zipalign sem suporte a -P 16; usando alinhamento 4.")
         _run([tc.zipalign, "-f", "4", str(unsigned), str(aligned)], log)
 
@@ -673,16 +835,58 @@ def _align_and_sign(
     ]
     _run(cmd, log)
 
-    verify = subprocess.run(
-        [str(tc.apksigner), "verify", "--print-certs", str(signed)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
+    verify = _execute(
+        [tc.apksigner, "verify", "--print-certs", signed], log, capture=True
     )
     if verify.returncode != 0:
-        raise BuildError(f"Falha ao verificar assinatura:\n{verify.stdout}")
-    log.detail(verify.stdout)
+        raise BuildError(
+            f"Falha ao verificar assinatura ({verify.returncode}):"
+            f"\n{_tail(verify.stdout or '')}"
+        )
+    log.detail(verify.stdout or "")
     return signed
+
+
+def _acquire_build_lock(work: Path) -> Path:
+    """Evita que dois builds limpem o mesmo work dir ao mesmo tempo."""
+    try:
+        work.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise BuildError(f"Falha ao criar {work.parent}: {exc}") from exc
+    lock = work.parent / f".{work.name}.apkfast.lock"
+    for _ in range(2):
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            try:
+                pid = int(lock.read_text().strip())
+                os.kill(pid, 0)
+            except (OSError, ValueError):
+                # Lock órfão (processo morto ou arquivo corrompido).
+                try:
+                    lock.unlink()
+                except OSError:
+                    pass
+                continue
+            raise BuildError(
+                f"Já existe um build em andamento em {work} (PID {pid}). "
+                f"Se o processo terminou, remova {lock}."
+            )
+        except OSError as exc:
+            raise BuildError(f"Falha ao criar lock de build {lock}: {exc}") from exc
+        with os.fdopen(fd, "w") as stream:
+            stream.write(str(os.getpid()))
+        return lock
+    raise BuildError(f"Não foi possível obter o lock de build {lock}.")
+
+
+def _release_build_lock(lock: Path) -> None:
+    # Melhor esforço: nunca remove o lock de outro processo.
+    try:
+        if lock.read_text().strip() == str(os.getpid()):
+            lock.unlink()
+    except OSError:
+        pass
 
 
 def build(options: BuildOptions) -> Path:
@@ -706,6 +910,9 @@ def build(options: BuildOptions) -> Path:
             f"ABI(s) inválida(s): {', '.join(invalid)}. "
             f"Use: {', '.join(ALL_ABIS)}"
         )
+    duplicates = sorted({abi for abi in abis if abis.count(abi) > 1})
+    if duplicates:
+        raise BuildError(f"ABI(s) repetida(s): {', '.join(duplicates)}.")
 
     tc = detect(
         abi=abis[0],
@@ -721,35 +928,45 @@ def build(options: BuildOptions) -> Path:
         raise BuildError(
             f"--build-dir não pode ser o projeto nem um ancestral dele: {work}"
         )
-    _clean(work)
-    (work / "apk").mkdir(parents=True, exist_ok=True)
+    # Validações e detecção da toolchain terminaram antes de qualquer limpeza.
+    lock = _acquire_build_lock(work)
+    try:
+        _clean(work)
+        (work / "apk").mkdir(parents=True, exist_ok=True)
 
-    log.info("[*] Toolchain:")
-    for line in tc.summary().splitlines():
-        log.detail(f"    {line}")
+        log.info("[*] Toolchain:")
+        for line in tc.summary().splitlines():
+            log.detail(f"    {line}")
 
-    flats = _compile_resources(tc, project, work / "res", work, log)
-    dex = _compile_java(tc, options, work, log)
+        flats = _compile_resources(tc, project, work / "res", work, log)
+        dex = _compile_java(tc, options, work, log)
 
-    for abi in abis:
-        abi_tc = tc.for_abi(abi)
-        lib, extra_libs = _native_build(abi_tc, options, project, work, manifest)
-        _stage_native_lib(work, abi, lib, extra_libs)
+        for abi in abis:
+            abi_tc = tc.for_abi(abi)
+            lib, extra_libs = _native_build(abi_tc, options, project, work, manifest)
+            _stage_native_lib(work, abi, lib, extra_libs)
 
-    log.info("[*] Empacotando APK...")
-    unsigned = _link_apk(tc, options, work, manifest_path, manifest, flats, dex)
-    _add_extra_files_with_zip(unsigned, work / "apk")
+        log.info("[*] Empacotando APK...")
+        unsigned = _link_apk(tc, options, work, manifest_path, manifest, flats, dex)
+        _add_extra_files_with_zip(unsigned, work / "apk")
 
-    log.info("[*] Alinhando e assinando...")
-    signed = _align_and_sign(tc, options, work, unsigned)
+        log.info("[*] Alinhando e assinando...")
+        signed = _align_and_sign(tc, options, work, unsigned)
 
-    suffix = "all" if len(abis) > 1 else abis[0]
-    if options.release:
-        suffix += "-release"
-    output = options.output or (project / "dist" / f"{manifest.package.split('.')[-1]}-{suffix}.apk")
-    output = output.expanduser().resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(signed, output)
-    size = output.stat().st_size / 1024
-    log.info(f"[✓] APK final: {output} ({size:.1f} KiB)")
-    return output
+        suffix = "all" if len(abis) > 1 else abis[0]
+        if options.release:
+            suffix += "-release"
+        output = options.output or (project / "dist" / f"{manifest.package.split('.')[-1]}-{suffix}.apk")
+        output = output.expanduser().resolve()
+        if output == project or output in project.parents:
+            raise BuildError(f"--output não pode ser o projeto nem um ancestral dele: {output}")
+        try:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(signed, output)
+        except OSError as exc:
+            raise BuildError(f"Falha ao gravar APK final {output}: {exc}") from exc
+        size = output.stat().st_size / 1024
+        log.info(f"[✓] APK final: {output} ({size:.1f} KiB)")
+        return output
+    finally:
+        _release_build_lock(lock)

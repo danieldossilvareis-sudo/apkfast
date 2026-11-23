@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -91,16 +92,66 @@ def _ask_permissions() -> list[str]:
 _PACKAGE_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+")
 
 
-def _ask_int(prompt: str, default: int) -> int:
+def _normalize_abis(raw: str) -> str | None:
+    """Valida a lista de ABIs cedo, antes de escrever qualquer arquivo."""
+    value = (raw or "").strip()
+    if not value:
+        return None
+    if value.lower() == "all":
+        return "all"
+    selected: list[str] = []
+    for token in value.split(","):
+        abi = token.strip()
+        if abi not in ALL_ABIS:
+            return None
+        if abi not in selected:
+            selected.append(abi)
+    return ",".join(selected) if selected else None
+
+
+def _validate_numbers(api: int, min_sdk: int, target_sdk: int) -> str | None:
+    if api < 21:
+        return "API do NDK/clang deve ser >= 21"
+    if min_sdk < 1:
+        return "minSdkVersion deve ser >= 1"
+    if target_sdk < 1:
+        return "targetSdkVersion deve ser >= 1"
+    if min_sdk > target_sdk:
+        return "minSdkVersion não pode ser maior que targetSdkVersion"
+    return None
+
+
+def _ask_int(prompt: str, default: int, *, minimum: int = 1) -> int:
     while True:
         raw = _ask(prompt, str(default))
         try:
-            return int(raw)
+            value = int(raw)
         except ValueError:
             print("  [!] Digite um número inteiro.")
+            continue
+        if value < minimum:
+            print(f"  [!] Digite um número inteiro >= {minimum}.")
+            continue
+        return value
 
 
 def interactive_config(args, target: Path) -> ProjectConfig | None:
+    raw_abis = getattr(args, "abis", "arm64-v8a") or "arm64-v8a"
+    default_api = getattr(args, "api", 36)
+    default_min = getattr(args, "min_sdk", 21)
+    default_target = getattr(args, "target_sdk", 36)
+    abis = _normalize_abis(raw_abis)
+    if abis is None:
+        print(
+            f"[✗] ABIs inválidas: {raw_abis!r}. Use 'all' ou: {', '.join(ALL_ABIS)}",
+            file=sys.stderr,
+        )
+        return None
+    number_error = _validate_numbers(default_api, default_min, default_target)
+    if number_error:
+        print(f"[✗] {number_error}", file=sys.stderr)
+        return None
+
     if args.yes:
         package = f"com.example.{_slug(target.name)}"
         # _slug pode começar com dígito (ex.: "3d-game" -> "com.example.3dgame")
@@ -114,10 +165,10 @@ def interactive_config(args, target: Path) -> ProjectConfig | None:
             name=target.name,
             package=package,
             template=args.template or "nativeapp-gl",
-            abis=args.abis,
-            api=args.api,
-            min_sdk=args.min_sdk,
-            target_sdk=args.target_sdk,
+            abis=abis,
+            api=default_api,
+            min_sdk=default_min,
+            target_sdk=default_target,
         )
 
     print("\n=== apkfast init ===")
@@ -133,14 +184,27 @@ def interactive_config(args, target: Path) -> ProjectConfig | None:
     template = args.template or _ask_choice(
         "Template de projeto:", TEMPLATES, "nativeapp-gl"
     )
-    abis = _ask_choice("ABIs alvo:", ("arm64-v8a", "all", "custom"), "arm64-v8a")
-    if abis == "custom":
+    abis_choice = _ask_choice("ABIs alvo:", ("arm64-v8a", "all", "custom"), "arm64-v8a")
+    if abis_choice == "custom":
         print("  ABIs disponíveis: " + ", ".join(ALL_ABIS))
-        abis = _ask("Lista separada por vírgula", "arm64-v8a,armeabi-v7a")
+        raw_abis = _ask("Lista separada por vírgula", "arm64-v8a,armeabi-v7a")
+        abis = _normalize_abis(raw_abis)
+        if abis is None:
+            print(
+                f"[✗] ABIs inválidas: {raw_abis!r}. Use: {', '.join(ALL_ABIS)}",
+                file=sys.stderr,
+            )
+            return None
+    else:
+        abis = "all" if abis_choice == "all" else abis_choice
 
-    api = _ask_int("API do NDK/clang", args.api)
-    min_sdk = _ask_int("minSdkVersion", args.min_sdk)
-    target_sdk = _ask_int("targetSdkVersion", args.target_sdk)
+    api = _ask_int("API do NDK/clang", default_api, minimum=21)
+    min_sdk = _ask_int("minSdkVersion", default_min)
+    target_sdk = _ask_int("targetSdkVersion", default_target)
+    number_error = _validate_numbers(api, min_sdk, target_sdk)
+    if number_error:
+        print(f"[✗] {number_error}", file=sys.stderr)
+        return None
     optimize = _ask_choice(
         "Otimização:", ("release", "size", "none"), "release"
     )
@@ -200,7 +264,7 @@ def render_manifest(config: ProjectConfig) -> str:
     if config.fullscreen:
         theme = ' android:theme="@android:style/Theme.NoTitleBar.Fullscreen"'
     orientation = (
-        f' android:screenOrientation="{config.orientation}"'
+        f" android:screenOrientation={quoteattr(str(config.orientation))}"
         if config.orientation != "unspecified"
         else ""
     )
@@ -215,8 +279,8 @@ def render_manifest(config: ProjectConfig) -> str:
     uses_sdk = ""
     if config.min_sdk != 21 or config.target_sdk != 36:
         uses_sdk = (
-            f'    <uses-sdk android:minSdkVersion="{config.min_sdk}" '
-            f'android:targetSdkVersion="{config.target_sdk}" />\n'
+            f'    <uses-sdk android:minSdkVersion="{int(config.min_sdk)}" '
+            f'android:targetSdkVersion="{int(config.target_sdk)}" />\n'
         )
 
     return f"""<?xml version="1.0" encoding="utf-8"?>
@@ -309,23 +373,23 @@ int main(void) {
 }
 """
     if config.template in ("sdl2", "sdl3"):
-        include = "<SDL.h>" if config.template == "sdl2" else "<SDL3/SDL.h>"
-        main_inc = "<SDL_main.h>" if config.template == "sdl2" else "<SDL3/SDL_main.h>"
+        is_sdl2 = config.template == "sdl2"
+        include = "<SDL.h>" if is_sdl2 else "<SDL3/SDL.h>"
+        main_inc = "<SDL_main.h>" if is_sdl2 else "<SDL3/SDL_main.h>"
         init = (
-            'SDL_Init(SDL_INIT_VIDEO) < 0'
-            if config.template == "sdl2"
-            else '!SDL_Init(SDL_INIT_VIDEO)'
+            "SDL_Init(SDL_INIT_VIDEO) < 0"
+            if is_sdl2
+            else "!SDL_Init(SDL_INIT_VIDEO)"
         )
         create = (
-            'SDL_CreateWindow("SDL", 0, 0, 0, 0, SDL_WINDOW_SHOWN)'
-            if config.template == "sdl2"
-            else 'SDL_CreateWindow("SDL", 0, 0, 0)'
+            'SDL_CreateWindow("SDL", 0, 0, 0, 0, SDL_WINDOW_SHOWN | SDL_WINDOW_FULLSCREEN)'
+            if is_sdl2
+            else 'SDL_CreateWindow("SDL", 0, 0, SDL_WINDOW_FULLSCREEN)'
         )
-        quit_event = "SDL_QUIT" if config.template == "sdl2" else "SDL_EVENT_QUIT"
-        color = "SDL_SetRenderDrawColor(renderer, 0, 82, 172, 255);"
+        quit_event = "SDL_QUIT" if is_sdl2 else "SDL_EVENT_QUIT"
         create_renderer = (
-            "SDL_CreateRenderer(window, -1, 0)"
-            if config.template == "sdl2"
+            "SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED)"
+            if is_sdl2
             else "SDL_CreateRenderer(window, nullptr)"
         )
         return f"""#include {include}
@@ -334,18 +398,31 @@ int main(void) {
 // SDLActivity (Java) chama SDL_main diretamente; não precisa de android_main.
 int main(int argc, char* argv[]) {{
     (void)argc; (void)argv;
-    if ({init}) return 1;
+    if ({init}) {{
+        SDL_Log("SDL_Init falhou: %s", SDL_GetError());
+        return 1;
+    }}
     SDL_Window* window = {create};
+    if (!window) {{
+        SDL_Log("SDL_CreateWindow falhou: %s", SDL_GetError());
+        return 1;
+    }}
     SDL_Renderer* renderer = {create_renderer};
+    if (!renderer) {{
+        SDL_Log("SDL_CreateRenderer falhou: %s", SDL_GetError());
+        SDL_DestroyWindow(window);
+        return 1;
+    }}
     bool running = true;
     SDL_Event event;
     while (running) {{
         while (SDL_PollEvent(&event)) {{
             if (event.type == {quit_event}) running = false;
         }}
-        {color}
+        SDL_SetRenderDrawColor(renderer, 0, 82, 172, 255);
         SDL_RenderClear(renderer);
         SDL_RenderPresent(renderer);
+        SDL_Delay(16);
     }}
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
@@ -357,11 +434,11 @@ int main(int argc, char* argv[]) {{
 
 
 def render_sdl_activity(config: ProjectConfig) -> str:
-    java_dir = _slug(config.package.split(".")[-1])
     return f"""package {config.package};
 
 import org.libsdl.app.SDLActivity;
 
+// A SDL é linkada estaticamente em libmain.so; não existe libSDL.so separada.
 public class MainActivity extends SDLActivity {{
     @Override
     protected String[] getLibraries() {{
@@ -371,7 +448,36 @@ public class MainActivity extends SDLActivity {{
 """
 
 
+def _sdl_java_dir(template: str) -> Path | None:
+    if template not in ("sdl2", "sdl3"):
+        return None
+    version = 2 if template == "sdl2" else 3
+    return (
+        Path(__file__).resolve().parent.parent
+        / "vendor"
+        / f"sdl{version}"
+        / "src"
+        / "android-project"
+        / "app"
+        / "src"
+        / "main"
+        / "java"
+        / "org"
+        / "libsdl"
+        / "app"
+    )
+
+
 def create_project(target: Path, config: ProjectConfig) -> None:
+    # Falha antes de criar qualquer arquivo se as classes Java não estiverem
+    # disponíveis: sem elas o javac do build falharia com erro críptico.
+    sdl_java = _sdl_java_dir(config.template)
+    if sdl_java is not None and not (sdl_java / "SDLActivity.java").is_file():
+        raise FileNotFoundError(
+            f"Classes Java do SDL não encontradas em {sdl_java}. "
+            "Rode: python3 apkfast.py setup-libs"
+        )
+
     (target / "jni").mkdir(parents=True, exist_ok=True)
     (target / "assets").mkdir(parents=True, exist_ok=True)
     (target / "src" / "main" / "cpp").mkdir(parents=True, exist_ok=True)
@@ -405,7 +511,7 @@ def create_project(target: Path, config: ProjectConfig) -> None:
         encoding="utf-8",
     )
 
-    if config.template in ("sdl2", "sdl3"):
+    if sdl_java is not None:
         java_root = target / "java" / Path(*config.package.split("."))
         java_root.mkdir(parents=True, exist_ok=True)
         (java_root / "MainActivity.java").write_text(
@@ -415,29 +521,10 @@ def create_project(target: Path, config: ProjectConfig) -> None:
         # SDLActivity e derivadas vivem no sdk do SDL e são necessárias para
         # compilar o MainActivity. Copia-las para o projeto (nos exemplos isso
         # era feito manualmente).
-        sdl_version = 2 if config.template == "sdl2" else 3
-        sdl_java = (
-            Path(__file__).resolve().parent.parent
-            / "vendor"
-            / f"sdl{sdl_version}"
-            / "src"
-            / "android-project"
-            / "app"
-            / "src"
-            / "main"
-            / "java"
-            / "org"
-            / "libsdl"
-            / "app"
-        )
-        if sdl_java.is_dir():
-            dest = target / "java" / "org" / "libsdl" / "app"
-            dest.mkdir(parents=True, exist_ok=True)
-            for source in sorted(sdl_java.glob("*.java")):
-                (dest / source.name).write_text(
-                    source.read_text(encoding="utf-8", errors="ignore"),
-                    encoding="utf-8",
-                )
+        dest = target / "java" / "org" / "libsdl" / "app"
+        dest.mkdir(parents=True, exist_ok=True)
+        for source in sorted(sdl_java.glob("*.java")):
+            shutil.copy2(source, dest / source.name)
 
     if config.template == "raylib" and config.abis == "all":
         (target / "NOTES.md").write_text(

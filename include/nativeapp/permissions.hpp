@@ -22,6 +22,7 @@
 #include "permission_types.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -44,16 +45,19 @@ public:
 
     /// Atualiza a referência de Activity após recriação (rotação, etc.).
     void reattach(ANativeActivity* activity) {
+        if (!activity) return;
+        // A Activity antiga pode já estar morta: tenta o VM nova antes de
+        // liberar a global ref.
         JNIEnv* jenv = env();
-        if (jenv) {
-            release_global_refs(jenv);
-        }
+        if (!jenv) jenv = env_for(activity);
+        if (jenv) release_global_refs(jenv);
         activity_ = activity;
         jenv = env();
         if (jenv) cache_global_refs(jenv);
         pending_.clear();
         callback_ = nullptr;
         response_received_ = false;
+        awaiting_response_ = false;
         snapshot_.clear();
     }
 
@@ -61,10 +65,15 @@ public:
     bool runtime_permissions_available() const {
         JNIEnv* jenv = env();
         if (!jenv) return false;
-        jclass build = find_class(jenv, "android/os/Build$VERSION");
-        if (!build) return false;
+        jclass build = jenv->FindClass("android/os/Build$VERSION");
+        if (!build) { clear_exception(jenv); return false; }
         jfieldID field = jenv->GetStaticFieldID(build, "SDK_INT", "I");
         const int sdk = field ? jenv->GetStaticIntField(build, field) : 0;
+        if (jenv->ExceptionCheck()) {
+            clear_exception(jenv);
+            jenv->DeleteLocalRef(build);
+            return false;
+        }
         jenv->DeleteLocalRef(build);
         return sdk >= 23;
     }
@@ -72,16 +81,20 @@ public:
     /// Retorna o estado detalhado de uma permissão.
     PermissionState state_of(std::string_view permission) const {
         JNIEnv* jenv = env();
-        if (!jenv) return PermissionState::Unknown;
+        if (!jenv || !activity_ || !activity_->clazz || !activity_class_) {
+            return PermissionState::Unknown;
+        }
         if (!runtime_permissions_available()) return PermissionState::Granted;
 
+        jmethodID check_method = method(jenv, "checkSelfPermission", "(Ljava/lang/String;)I");
+        if (!check_method) { clear_exception(jenv); return PermissionState::Denied; }
         const std::string perm_str(permission);
         jstring jperm = jenv->NewStringUTF(perm_str.c_str());
-        const jint check = jenv->CallIntMethod(
-            activity_->clazz,
-            method(jenv, "checkSelfPermission", "(Ljava/lang/String;)I"),
-            jperm);
+        if (!jperm) { clear_exception(jenv); return PermissionState::Denied; }
+        const jint check = jenv->CallIntMethod(activity_->clazz, check_method, jperm);
+        const bool failed = jenv->ExceptionCheck();
         jenv->DeleteLocalRef(jperm);
+        if (failed) { clear_exception(jenv); return PermissionState::Denied; }
         if (check == 0) return PermissionState::Granted;
 
         // Depois da primeira negação, rationale=true significa que ainda pode
@@ -90,13 +103,17 @@ public:
         // solicitação é o comportamento normal do Android.
         if (!was_requested(permission)) return PermissionState::Denied;
 
+        jmethodID rationale_method = method(
+            jenv, "shouldShowRequestPermissionRationale", "(Ljava/lang/String;)Z");
+        if (!rationale_method) { clear_exception(jenv); return PermissionState::Denied; }
         const std::string rationale_str(permission);
         jstring jrationale = jenv->NewStringUTF(rationale_str.c_str());
+        if (!jrationale) { clear_exception(jenv); return PermissionState::Denied; }
         const jboolean rationale = jenv->CallBooleanMethod(
-            activity_->clazz,
-            method(jenv, "shouldShowRequestPermissionRationale", "(Ljava/lang/String;)Z"),
-            jrationale);
+            activity_->clazz, rationale_method, jrationale);
+        const bool rationale_failed = jenv->ExceptionCheck();
         jenv->DeleteLocalRef(jrationale);
+        if (rationale_failed) { clear_exception(jenv); return PermissionState::Denied; }
 
         // rationale=true -> pode perguntar de novo.
         // rationale=false SÓ é permanente se já houve uma negação registrada
@@ -124,7 +141,7 @@ public:
         }
 
         JNIEnv* jenv = env();
-        if (!jenv) {
+        if (!jenv || !activity_ || !activity_->clazz || !activity_class_) {
             result.denied = permissions;
             return result;
         }
@@ -145,24 +162,39 @@ public:
         }
 
         jclass string_class = find_class(jenv, "java/lang/String");
+        if (!string_class) { clear_exception(jenv); result.denied = pending; return result; }
         jobjectArray array = jenv->NewObjectArray(
             static_cast<jsize>(pending.size()), string_class, nullptr);
         jenv->DeleteLocalRef(string_class);
+        if (!array) { clear_exception(jenv); result.denied = pending; return result; }
 
         for (size_t i = 0; i < pending.size(); ++i) {
             jstring item = jenv->NewStringUTF(pending[i].c_str());
+            if (!item) {
+                clear_exception(jenv);
+                jenv->DeleteLocalRef(array);
+                result.denied = pending;
+                return result;
+            }
             jenv->SetObjectArrayElement(array, static_cast<jsize>(i), item);
             jenv->DeleteLocalRef(item);
         }
 
-        jenv->CallVoidMethod(
-            activity_->clazz,
-            method(jenv, "requestPermissions", "([Ljava/lang/String;I)V"),
-            array, kRequestCode);
+        jmethodID request_method = method(jenv, "requestPermissions", "([Ljava/lang/String;I)V");
+        bool sent = false;
+        if (request_method) {
+            jenv->CallVoidMethod(activity_->clazz, request_method, array, kRequestCode);
+            if (jenv->ExceptionCheck()) clear_exception(jenv);
+            else sent = true;
+        } else {
+            clear_exception(jenv);
+        }
         jenv->DeleteLocalRef(array);
 
         // Marca como pedidas ANTES de consultar o rationale.
-        for (const auto& permission : pending) requested_.insert(permission);
+        if (sent) {
+            for (const auto& permission : pending) requested_.insert(permission);
+        }
 
         // Guarda o estado atual para detectar mudanças no update().
         snapshot_.clear();
@@ -242,50 +274,73 @@ public:
 
     void openAppSettings() const {
         JNIEnv* jenv = env();
-        if (!jenv) return;
+        if (!jenv || !activity_ || !activity_->clazz) return;
 
         jclass intent_class = find_class(jenv, "android/content/Intent");
+        if (!intent_class) { clear_exception(jenv); return; }
+        jclass uri_class = find_class(jenv, "android/net/Uri");
+        if (!uri_class) {
+            clear_exception(jenv);
+            jenv->DeleteLocalRef(intent_class);
+            return;
+        }
+
+        jmethodID intent_ctor = jenv->GetMethodID(intent_class, "<init>", "(Ljava/lang/String;)V");
+        jmethodID set_data = jenv->GetMethodID(
+            intent_class, "setData", "(Landroid/net/Uri;)Landroid/content/Intent;");
+        jmethodID parse = jenv->GetStaticMethodID(
+            uri_class, "parse", "(Ljava/lang/String;)Landroid/net/Uri;");
+        jmethodID start = method(jenv, "startActivity", "(Landroid/content/Intent;)V");
+        if (!intent_ctor || !set_data || !parse || !start) {
+            clear_exception(jenv);
+            jenv->DeleteLocalRef(uri_class);
+            jenv->DeleteLocalRef(intent_class);
+            return;
+        }
+
         jstring action = jenv->NewStringUTF("android.settings.APPLICATION_DETAILS_SETTINGS");
-        jobject intent = jenv->NewObject(
-            intent_class,
-            jenv->GetMethodID(intent_class, "<init>", "(Ljava/lang/String;)V"),
-            action);
+        if (!action) {
+            clear_exception(jenv);
+            jenv->DeleteLocalRef(uri_class);
+            jenv->DeleteLocalRef(intent_class);
+            return;
+        }
+        jobject intent = jenv->NewObject(intent_class, intent_ctor, action);
         jenv->DeleteLocalRef(action);
 
-        jclass uri_class = find_class(jenv, "android/net/Uri");
-        std::string uri = "package:" + package_name();
+        const std::string uri = "package:" + package_name();
         jstring juri = jenv->NewStringUTF(uri.c_str());
-        jobject parsed = jenv->CallStaticObjectMethod(
-            uri_class,
-            jenv->GetStaticMethodID(uri_class, "parse", "(Ljava/lang/String;)Landroid/net/Uri;"),
-            juri);
-        jenv->DeleteLocalRef(juri);
+        jobject parsed = nullptr;
+        if (intent && juri) {
+            parsed = jenv->CallStaticObjectMethod(uri_class, parse, juri);
+        }
+        if (juri) jenv->DeleteLocalRef(juri);
+        if (intent && parsed) {
+            jobject result = jenv->CallObjectMethod(intent, set_data, parsed);
+            if (result) jenv->DeleteLocalRef(result);  // setData devolve o Intent
+            jenv->CallVoidMethod(activity_->clazz, start, intent);
+        }
+        if (jenv->ExceptionCheck()) clear_exception(jenv);
 
-        jenv->CallObjectMethod(
-            intent,
-            jenv->GetMethodID(intent_class, "setData", "(Landroid/net/Uri;)Landroid/content/Intent;"),
-            parsed);
-        jenv->CallVoidMethod(
-            activity_->clazz,
-            method(jenv, "startActivity", "(Landroid/content/Intent;)V"),
-            intent);
-
-        jenv->DeleteLocalRef(parsed);
-        jenv->DeleteLocalRef(intent);
+        if (parsed) jenv->DeleteLocalRef(parsed);
+        if (intent) jenv->DeleteLocalRef(intent);
         jenv->DeleteLocalRef(uri_class);
         jenv->DeleteLocalRef(intent_class);
     }
 
     std::string package_name() const {
         JNIEnv* jenv = env();
-        if (!jenv) return {};
-        jstring name = static_cast<jstring>(jenv->CallObjectMethod(
-            activity_->clazz, method(jenv, "getPackageName", "()Ljava/lang/String;")));
-        if (!name) return {};
+        if (!jenv || !activity_ || !activity_->clazz || !activity_class_) return {};
+        jmethodID get_name = method(jenv, "getPackageName", "()Ljava/lang/String;");
+        if (!get_name) { clear_exception(jenv); return {}; }
+        jstring name = static_cast<jstring>(
+            jenv->CallObjectMethod(activity_->clazz, get_name));
+        if (!name) { clear_exception(jenv); return {}; }
         const char* chars = jenv->GetStringUTFChars(name, nullptr);
         std::string result = chars ? chars : "";
         if (chars) jenv->ReleaseStringUTFChars(name, chars);
         jenv->DeleteLocalRef(name);
+        if (jenv->ExceptionCheck()) clear_exception(jenv);
         return result;
     }
 
@@ -297,18 +352,20 @@ private:
         if (jenv) cache_global_refs(jenv);
     }
 
-    JNIEnv* env() const {
-        if (!activity_ || !activity_->vm) return nullptr;
+    static JNIEnv* env_for(ANativeActivity* activity) {
+        if (!activity || !activity->vm) return nullptr;
         JNIEnv* jenv = nullptr;
-        const jint status = activity_->vm->GetEnv(
+        const jint status = activity->vm->GetEnv(
             reinterpret_cast<void**>(&jenv), JNI_VERSION_1_6);
         if (status == JNI_EDETACHED) {
-            if (activity_->vm->AttachCurrentThread(&jenv, nullptr) != JNI_OK) return nullptr;
+            if (activity->vm->AttachCurrentThread(&jenv, nullptr) != JNI_OK) return nullptr;
         } else if (status != JNI_OK) {
             return nullptr;
         }
         return jenv;
     }
+
+    JNIEnv* env() const { return env_for(activity_); }
 
     jclass activity_class() const { return activity_class_; }
 
@@ -317,22 +374,24 @@ private:
     }
 
     jmethodID method(JNIEnv* jenv, const char* name, const char* signature) const {
-        if (!activity_class_) return nullptr;
+        if (!jenv || !activity_class_) return nullptr;
         return jenv->GetMethodID(activity_class_, name, signature);
     }
 
     static jclass find_class(JNIEnv* jenv, const char* name) {
-        jclass local = jenv->FindClass(name);
-        return local;  // chamador deve DeleteLocalRef
+        return jenv->FindClass(name);  // chamador deve DeleteLocalRef
+    }
+
+    static void clear_exception(JNIEnv* jenv) {
+        if (jenv && jenv->ExceptionCheck()) jenv->ExceptionClear();
     }
 
     void cache_global_refs(JNIEnv* jenv) {
-        if (!activity_ || !activity_->clazz) return;
+        if (!activity_ || !activity_->clazz || activity_class_) return;
         jclass local = jenv->GetObjectClass(activity_->clazz);
-        if (local) {
-            activity_class_ = static_cast<jclass>(jenv->NewGlobalRef(local));
-            jenv->DeleteLocalRef(local);
-        }
+        if (!local) { clear_exception(jenv); return; }
+        activity_class_ = static_cast<jclass>(jenv->NewGlobalRef(local));
+        jenv->DeleteLocalRef(local);
     }
 
 public:
@@ -344,6 +403,9 @@ public:
         callback_ = nullptr;
         activity_class_ = nullptr;
         activity_ = nullptr;
+        response_received_ = false;
+        awaiting_response_ = false;
+        snapshot_.clear();
     }
 
 private:

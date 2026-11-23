@@ -91,15 +91,15 @@ steady_clock::now()` e processa os comandos recebidos pelo `onAppCmd`:
 
 | Comando Android | Ação interna do `App` | Callbacks disparados |
 |---|---|---|
-| `APP_CMD_INIT_WINDOW` | `activate_surface()`: exige `app_->window != nullptr` e largura/altura > 0; guarda `native_window_`, `width_`, `height_`. Na primeira vez, injeta `Assets`, inicializa `TextInput`, chama `on_ready()` e muda para `Ready`. Se a surface é nova, marca `surface_active_ = true` e notifica dimensões. | `on_ready()` (uma vez), `on_surface_created()`, `on_surface_changed(w, h)` |
-| `APP_CMD_TERM_WINDOW` | `deactivate_surface()` zera `native_window_` **antes** do callback; se `state_ == Ready`, passa para `Paused`. | `on_surface_destroyed()` (se `surface_active_`) |
-| `APP_CMD_WINDOW_RESIZED` | Atualiza `native_window_` e, se `w`/`h` > 0 e diferentes dos atuais, atualiza `width_`/`height_`. | `on_surface_changed(w, h)` |
+| `APP_CMD_INIT_WINDOW` | `activate_surface()`: exige `app_->window != nullptr` e largura/altura > 0; guarda `native_window_`, `width_`, `height_`. Na primeira vez, injeta `Assets`, inicializa `TextInput`, chama `on_ready()` e muda para `Ready`. Se a surface é nova, marca `surface_active_ = true` e notifica dimensões; o cache `last_notified_width_/_height_` é atualizado no fim. | `on_ready()` (uma vez), `on_surface_created()`, `on_surface_changed(w, h)` |
+| `APP_CMD_TERM_WINDOW` | `deactivate_surface()` zera `native_window_` **antes** do callback; chama `reset_input()` (limpa `keys_down_`, `touches_down_` e `last_touches_`); se `state_ == Ready`, passa para `Paused`. | `on_surface_destroyed()` (se `surface_active_`) |
+| `APP_CMD_WINDOW_RESIZED` | Atualiza `native_window_` e, se `w`/`h` > 0 e diferentes dos atuais, atualiza `width_`/`height_` **e o cache `last_notified_*`** antes de notificar. | `on_surface_changed(w, h)` |
 | `APP_CMD_WINDOW_REDRAW_NEEDED` | Mesmo tratamento de redimensionamento acima. | `on_surface_changed(w, h)` se as dimensões mudaram |
-| `APP_CMD_PAUSE` | `paused_ = true`. | `on_pause()` |
+| `APP_CMD_PAUSE` | `paused_ = true`; chama `reset_input()`. | `on_pause()` |
 | `APP_CMD_RESUME` | `paused_ = false`; reinicia `last_frame_`; avisa o subsistema de permissões; se estava `Paused`, volta para `Ready`; chama `activate_surface()` de novo, porque a janela pode ser nova. | `Permissions::notify_activity_result()`, `on_resume()`, depois `on_surface_created()` / `on_surface_changed()` se a janela voltou |
 | `APP_CMD_GAINED_FOCUS` | `focused_ = true`; se houver janela válida, chama `activate_surface()`. | `on_surface_created()` / `on_surface_changed()` se a surface for nova |
 | `APP_CMD_LOST_FOCUS` | `focused_ = false`. | nenhum |
-| `APP_CMD_DESTROY` | `deactivate_surface()` e `state_ = Lifecycle::Destroyed`. O loop de `run()` sai e chama `finish()`. | `on_surface_destroyed()` (se ativa), depois `on_destroy()` |
+| `APP_CMD_DESTROY` | `deactivate_surface()`, `reset_input()` e `state_ = Lifecycle::Destroyed`. O loop de `run()` sai e chama `finish()`. | `on_surface_destroyed()` (se ativa), depois `on_destroy()` |
 
 Comandos não listados caem no `default: break;` — são ignorados.
 
@@ -120,6 +120,11 @@ Dois detalhes importantes do código:
 2. `deactivate_surface()` zera `native_window_` antes de chamar
    `on_surface_destroyed()`, justamente para que `window()` não devolva um
    ponteiro inválido durante a destruição.
+3. `activate_surface()` usa `last_notified_width_/_height_` (iniciados em `-1`)
+   como cache do último tamanho notificado. Um `resize`/`redraw` atualiza esse
+   cache junto com `width_`/`height_`; sem isso, um `activate_surface()` seguinte
+   notificaria o **mesmo** tamanho duas vezes. O cache também é atualizado
+   sempre que `activate_surface()` termina.
 
 ### 2.3 Quando um frame acontece
 
@@ -146,9 +151,9 @@ cabeçalho; nomes de parâmetros omitidos no `app.hpp` foram mantidos omitidos):
 | Assinatura real | Categoria | Descrição |
 |---|---|---|
 | `explicit App(android_app* app)` | Construção | Guarda o `android_app*` em `app_`. É o único construtor; a macro `APP_MAIN` passa o `app` recebido pelo `android_main`. |
-| `virtual ~App() = default;` | Construção | Destrutor virtual padrão. |
-| `int run()` | Execução | Instala os thunks de comando/input, inicializa o estado e o relógio, roda o looper e o loop de frames. Retorna `0` ao sair (tanto no caminho `destroyRequested` quanto no fim do loop). |
-| `void finish()` | Execução | Desliga `Permissions` e `JniPermissions` (com argumentos `nullptr`) e **depois** chama `on_destroy()`. É chamado pelo próprio `run()` na saída. |
+| `virtual ~App()` | Construção | Destrutor virtual: se `app_ && app_->userData == this`, zera `userData`, `onAppCmd` e `onInputEvent` para que nenhum evento tardio do glue chegue a uma instância já destruída (limpeza dos thunks). |
+| `int run()` | Execução | Retorna `0` imediatamente se `app_ == nullptr`; senão instala os thunks de comando/input, inicializa o estado e o relógio, roda o looper e o loop de frames. Retorna `0` ao sair (tanto no caminho `destroyRequested` quanto no fim do loop). |
+| `void finish()` | Execução | **Idempotente** (`if (finished_) return;`): desliga `Permissions` e `JniPermissions` (com argumentos `nullptr`) e **depois** chama `on_destroy()` uma única vez. É chamado pelo próprio `run()` na saída. |
 | `Lifecycle lifecycle() const` | Estado | Devolve o estado atual da máquina (`Created`, `Ready`, `Paused`, `Destroyed`). |
 | `bool is_ready() const` | Estado | `true` se `state_ == Lifecycle::Ready && !paused_`. |
 | `ANativeActivity* activity() const` | Estado | Devolve `app_->activity` (útil para `Permissions::instance(activity())`). |
@@ -157,7 +162,7 @@ cabeçalho; nomes de parâmetros omitidos no `app.hpp` foram mantidos omitidos):
 | `int width() const` | Estado | Largura atual da janela, lida com `ANativeWindow_getWidth`. |
 | `int height() const` | Estado | Altura atual da janela, lida com `ANativeWindow_getHeight`. |
 | `uint64_t frames() const` | Métricas | Número de frames renderizados (incrementado ao final do gate de frame, após o `present()` quando há cena). |
-| `float delta_time() const` | Métricas | Delta do frame atual em segundos, **já com clamp de 0.25 s**. |
+| `float delta_time() const` | Métricas | Delta do frame atual em segundos: NaN/negativo viram `0`, valores acima de `0.25 s` são clampados. |
 | `float fps() const` | Métricas | `1.0f / delta_time_` se `delta_time_ > 0`, senão `0.0f`. É FPS instantâneo derivado do último `dt`, não uma média. |
 | `bool paused() const` | Estado | Valor de `paused_` (controlado por `APP_CMD_PAUSE` / `APP_CMD_RESUME`). |
 | `bool focused() const` | Estado | Valor de `focused_` (controlado por `APP_CMD_GAINED_FOCUS` / `APP_CMD_LOST_FOCUS`). |
@@ -168,7 +173,7 @@ cabeçalho; nomes de parâmetros omitidos no `app.hpp` foram mantidos omitidos):
 | `TouchPoint last_touch(int32_t pointer_id = 0) const` | Input | Última posição conhecida daquele ponteiro; se não houver registro, devolve `TouchPoint{pointer_id, 0, 0}`. |
 | `void request_exit()` | Execução | Chama `ANativeActivity_finish(app_->activity)` para pedir o encerramento da Activity. |
 | `virtual void on_ready()` | Callback | Chamado uma vez, na primeira janela válida, antes de `on_surface_created()`. |
-| `virtual void on_destroy()` | Callback | Chamado uma vez por `finish()`, depois do shutdown das refs JNI de permissões. |
+| `virtual void on_destroy()` | Callback | Chamado exatamente uma vez, por `finish()` (idempotente), depois do shutdown das refs JNI de permissões. |
 | `virtual void on_surface_created()` | Callback | Janela criada ou recriada; é aqui que se inicializa GL/Vulkan. |
 | `virtual void on_surface_destroyed()` | Callback | Janela destruída; é aqui que se invalida/destrói a swapchain. |
 | `virtual void on_surface_changed(int, int)` | Callback | Resize/rotação (parâmetros são largura e altura). Também disparado na criação da surface. |
@@ -191,9 +196,12 @@ O cabeçalho deixa claro: "O estado agora é gerenciado pelo ciclo de vida;
 chamar isto não é necessário mas é inofensivo."
 
 **Métodos privados** (não fazem parte da API): os thunks estáticos
-`on_app_command_thunk` / `on_input_thunk`, `has_valid_window()`,
-`activate_surface()`, `deactivate_surface()`, `on_app_command(int32_t)` e
-`on_input(AInputEvent*)`.
+`on_app_command_thunk` / `on_input_thunk` (ambos com guarda
+`if (!app || !app->userData) return;`), `has_valid_window()`,
+`activate_surface()`, `deactivate_surface()`, `reset_input()` (zera
+`keys_down_`, `touches_down_` e `last_touches_`), `on_app_command(int32_t)` (com
+guarda `if (!app_) return;`) e `on_input(AInputEvent*)` (com guarda
+`if (!event) return 0;`).
 
 ### Tipos de dados usados na API
 
@@ -215,8 +223,11 @@ O cálculo do tempo está literalmente assim em `run()`:
 
 ```cpp
 const auto now = std::chrono::steady_clock::now();
-const float dt = std::chrono::duration<float>(now - last_frame_).count();
+float dt = std::chrono::duration<float>(now - last_frame_).count();
 last_frame_ = now;
+// NaN/negativo (relógio ajustado/resume fora de ordem) vira zero para não
+// contaminar a lógica do jogo nem fps().
+if (!std::isfinite(dt) || dt < 0.0f) dt = 0.0f;
 delta_time_ = dt > 0.25f ? 0.25f : dt;  // clamp após background
 
 on_tick();
@@ -234,8 +245,10 @@ Pontos importantes:
   `APP_CMD_RESUME`**, exatamente para não gerar um `dt` enorme ao voltar de
   background.
 - `on_update(float)` recebe o mesmo valor exposto por `delta_time()`: o `dt`
-  **já limitado** a 0.25 s. O clamp existe para que uma pausa longa não faça
-  personagens "teleportarem" no primeiro frame após o resume.
+  **já limitado** a 0.25 s e **já saneado** (NaN/negativo ⇒ `0`). O clamp existe
+  para que uma pausa longa não faça personagens "teleportarem" no primeiro
+  frame após o resume; o guarda de NaN/negativo evita que um `dt` inválido
+  contamine posições e `fps()`.
 - `fps()` é `1.0f / delta_time_` (ou `0.0f` se `dt <= 0`). É uma leitura
   instantânea do último frame, não uma média móvel. **Observação:** como o
   denominador é o valor já clampado, `fps()` não reporta menos que
@@ -355,12 +368,20 @@ O vetor passado para `on_touch` **sempre contém todos os ponteiros** do evento
 (`AMotionEvent_getPointerCount`), com `id`, `x` e `y` lidos de
 `AMotionEvent_getPointerId/getX/getY` por índice.
 
-Para `POINTER_DOWN` / `POINTER_UP`, o código extrai o `changed_id` a partir do
-`AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT` e atualiza o estado
-(`touches_down_` / `last_touches_`) **apenas do ponteiro que mudou**. Para
-`DOWN`, `MOVE`, `UP` e `CANCEL` normais, o estado de todos os pontos do vetor é
-atualizado: inserido em `touches_down_` para `Down`/`Move`, removido para
-`Up`/`Cancel`.
+O controle de estado (`single_pointer_change`) vale para
+`POINTER_DOWN` / `POINTER_UP` **e `UP`**:
+
+| Action | `changed_id` | Efeito em `touches_down_` |
+|---|---|---|
+| `POINTER_DOWN` / `POINTER_UP` | índice vem de `AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT` / `_MASK` extraído de `action_raw` | só o ponteiro que mudou |
+| `UP` | índice `0` **por contrato do Android** (não é lido o shift) | só o ponteiro 0 do evento — os demais dedos continuam abaixados |
+| `DOWN` / `MOVE` | — (todos os pontos) | insere todos |
+| `CANCEL` | — (todos os pontos) | remove todos **e** chama `touches_down_.clear()` no fim |
+
+Para índice de ponteiro fora da faixa, o código usa `points.front().id` como
+fallback para não deixar o dedo "preso". `last_touches_[id] = point` é escrito
+para **todos** os pontos em todas as actions (a última posição conhecida
+sobrevive ao `UP`, comportamento histórico).
 
 Depois disso, `on_touch(ta, points)` é chamado e `on_input` retorna `1`
 (evento consumido).
@@ -723,11 +744,14 @@ on_destroy();
 ```
 
 Ou seja, as referências globais JNI de permissões já foram liberadas quando
-seu `on_destroy()` roda. Use-o para liberar seus próprios recursos; **não
-chame `finish()` manualmente para sair** — ele não altera `state_` nem interrompe
-o looper, e pode fazer `on_destroy()` rodar duas vezes (uma na sua chamada e
-outra na saída do `run()`). Para encerrar, use `request_exit()`, que chama
-`ANativeActivity_finish()` e leva ao `APP_CMD_DESTROY`.
+seu `on_destroy()` roda. `finish()` começa com `if (finished_) return;` e marca
+`finished_ = true` antes de qualquer limpeza: chamar duas vezes (manualmente e
+na saída do `run()`) **não** roda `on_destroy()` duas vezes. Ainda assim, ele
+não altera `state_` nem interrompe o looper: para encerrar de verdade use
+`request_exit()`, que chama `ANativeActivity_finish()` e leva ao
+`APP_CMD_DESTROY`. `run()` também zera `finished_ = false` no início, então uma
+segunda chamada de `run()` (se o objeto for reutilizado) permite um novo
+`on_destroy()`.
 
 **Observação:** no caminho `APP_CMD_DESTROY`, `deactivate_surface()` roda
 antes de `state_ = Destroyed`, então `window()` já é `nullptr` dentro de
@@ -749,6 +773,27 @@ antes de `state_ = Destroyed`, então `window()` já é `nullptr` dentro de
   automático vem do `TextInput` quando o teclado virtual está aberto.
 - **Usar `set_ready()`**: é um `no-op` legado; o estado já é gerenciado pelo
   ciclo de vida.
+- **Contar que `UP` levanta todos os dedos**: `ACTION_UP` só altera o ponteiro
+  `0`; use `CANCEL` (que limpa `touches_down_`) quando a sequência de toque for
+  abortada. Em `POINTER_UP`, o índice vem do bits de índice da action (§6.1).
+
+### 9.6 Guards de nulo e limpeza dos thunks
+
+| Ponto | Guarda no código | Consequência |
+|---|---|---|
+| `run()` | `if (!app_) return 0;` | Sem `android_app`, nada é registrado e nenhum callback é chamado |
+| `on_app_command_thunk` / `on_input_thunk` | `if (!app \|\| !app->userData) return;` (o de input retorna `0`) | Eventos que chegam antes de `run()` ou depois da limpeza são descartados |
+| `on_app_command()` | `if (!app_) return;` | Comando órfão não chega ao `switch` |
+| `on_input()` | `if (!event) return 0;` | `AInputEvent` nulo não é repassado ao `InputHelpers` |
+| `has_valid_window()` | `if (!app_ \|\| !app_->window) return false;` e exige largura/altura `> 0` | Janela em destruição/dimensão zero nunca ativa a surface |
+| `request_exit()` | `if (app_ && app_->activity)` | Pedido de encerramento sem Activity vira no-op |
+| `on_tick()` | `if (app_) Permissions::instance(app_->activity).update();` | Sobrescrever sem chamar a base ainda perde o pump (§9.2) |
+| `~App()` | se `app_ && app_->userData == this`: zera `userData`, `onAppCmd` e `onInputEvent` | Nenhum thunk aponta para memória já destruída |
+
+A limpeza do destrutor é condicional ao `userData`: se outra instância já
+substituiu o ponteiro, o destrutor atual não mexe nos callbacks. Isso
+complementa os guards dos thunks — um evento tardio não chama método de objeto
+morto.
 
 ---
 
@@ -830,10 +875,13 @@ InputHelpers::instance().on_event(event);
 ```
 
 Isso vale para **key e motion events**. O `InputHelpers` atualiza seu conjunto
-de teclas, posição/botões de mouse, scroll e eixos de gamepad. O `App` não chama
-`reset()`; ele apenas alimenta o singleton. Para consultar, use
-`InputHelpers::instance()` diretamente de qualquer callback (veja a lista de
-métodos no § 6.4).
+de teclas, posição/botões de mouse, scroll e eixos de gamepad; um key event de
+gamepad também liga `gamepad_connected_`. O `App` não chama
+`InputHelpers::reset()` — ele apenas alimenta o singleton. O `reset_input()`
+privado do `App` é outro estado: limpa `keys_down_`, `touches_down_` e
+`last_touches_` em `TERM_WINDOW`/`PAUSE`/`DESTROY`. Para consultar ou limpar o
+helper, use `InputHelpers::instance()` diretamente de qualquer callback (veja a
+lista de métodos no § 6.4).
 
 ---
 

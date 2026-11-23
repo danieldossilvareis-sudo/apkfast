@@ -10,6 +10,7 @@
 #include <nativeapp/third_party/stb_truetype.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -30,6 +31,10 @@ public:
 
     FontAtlas() = default;
     ~FontAtlas() = default;
+    FontAtlas(const FontAtlas&) = delete;
+    FontAtlas& operator=(const FontAtlas&) = delete;
+    FontAtlas(FontAtlas&&) noexcept = default;
+    FontAtlas& operator=(FontAtlas&&) noexcept = default;
 
     /// Carrega TTF/OTF de assets/ e monta o atlas com `pixel_size`.
     bool load(const std::string& path, int pixel_size = 24, int atlas_size = kDefaultSize) {
@@ -43,27 +48,40 @@ public:
     /// Monta o atlas a partir de bytes já em memória.
     bool build(const uint8_t* ttf, int ttf_size, int pixel_size = 24,
                int atlas_size = kDefaultSize) {
-        if (!ttf || ttf_size <= 0) return false;
+        reset();
+        if (!ttf || ttf_size <= 0 || pixel_size <= 0 || atlas_size <= 0) return false;
         atlas_size_ = atlas_size;
         atlas_.assign(static_cast<size_t>(atlas_size_) * atlas_size_, 0);
         chars_.assign(kCharCount, stbtt_packedchar{});
 
         stbtt_pack_context pack{};
         if (!stbtt_PackBegin(&pack, atlas_.data(), atlas_size_, atlas_size_,
-                            0, 1, nullptr)) return false;
+                            0, 1, nullptr)) {
+            reset();  // PackBegin falhou: não deixa um atlas "válido" vazio.
+            return false;
+        }
         stbtt_PackSetOversampling(&pack, 2, 2);
-        const int ok = stbtt_PackFontRange(&pack, const_cast<uint8_t*>(ttf), 0,
+        // stb_truetype declara fontdata como const: não precisa de const_cast.
+        const int ok = stbtt_PackFontRange(&pack, ttf, 0,
                                            static_cast<float>(pixel_size),
                                            kFirstChar, kCharCount, chars_.data());
         stbtt_PackEnd(&pack);
-        return ok != 0;
+        if (ok == 0) {
+            reset();
+            return false;
+        }
+        valid_ = true;
+        return true;
     }
 
     /// Retorna o quad de um caractere ASCII, avançando `x`.
     GlyphQuad quad(char c, float& x, float y, float scale = 1.0f) const {
         stbtt_aligned_quad q{};
         const int index = static_cast<int>(static_cast<uint8_t>(c)) - kFirstChar;
-        if (index < 0 || index >= kCharCount) {
+        // Atlas inválido (build falhou) ou caractere fora do charset não deve
+        // chegar ao stbtt: chars_.data() pode ser nullptr e ler fora do array.
+        if (!valid_ || index < 0 || index >= kCharCount ||
+            static_cast<std::size_t>(index) >= chars_.size() || atlas_size_ <= 0) {
             return GlyphQuad{x, y, x, y, 0, 0, 0, 0};
         }
         stbtt_GetPackedQuad(chars_.data(), atlas_size_, atlas_size_, index,
@@ -83,12 +101,20 @@ public:
 
     const uint8_t* atlas() const { return atlas_.data(); }
     int atlas_size() const { return atlas_size_; }
-    bool valid() const { return !atlas_.empty(); }
+    bool valid() const { return valid_; }
 
 private:
+    void reset() {
+        valid_ = false;
+        atlas_.clear();
+        chars_.clear();
+        atlas_size_ = 0;
+    }
+
     std::vector<uint8_t> atlas_;
     std::vector<stbtt_packedchar> chars_;
     int atlas_size_ = 0;
+    bool valid_ = false;
 };
 
 }  // namespace nativeapp

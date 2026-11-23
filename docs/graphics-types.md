@@ -186,6 +186,9 @@ isso é responsabilidade de quem monta a malha e do backend.
 
 ```cpp
 struct MeshData {
+    /// Último índice uint16_t é 65535; 65536 é a contagem máxima de vértices.
+    static constexpr std::size_t max_vertices = 65536;
+
     std::vector<Vertex> vertices;
     std::vector<uint16_t> indices;
     Topology topology = Topology::Triangles;
@@ -197,6 +200,7 @@ struct MeshData {
 
 | Campo | Tipo | Padrão | Papel |
 |---|---|---|---|
+| `max_vertices` | `static constexpr std::size_t` | `65536` | Limite de vértices por malha (maior índice `uint16_t` = 65535). |
 | `vertices` | `std::vector<Vertex>` | vazio | Lista de vértices; a posição na lista é o índice do vértice. |
 | `indices` | `std::vector<uint16_t>` | vazio | Lista de índices (16 bits) que referenciam `vertices`. |
 | `topology` | `Topology` | `Topology::Triangles` | Como os índices devem ser interpretados. |
@@ -208,6 +212,9 @@ A struct é um agregado simples: você também pode preencher `vertices`,
 
 ```cpp
 void add_triangle(const Vertex& a, const Vertex& b, const Vertex& c) {
+    if (vertices.size() > max_vertices - 3) {
+        throw std::runtime_error("Mesh excede 65536 vertices (limite uint16)");
+    }
     const uint16_t base = static_cast<uint16_t>(vertices.size());
     vertices.push_back(a);
     vertices.push_back(b);
@@ -223,37 +230,44 @@ void add_triangle(const Vertex& a, const Vertex& b, const Vertex& c) {
 | Vértices adicionados | 3 (`a`, `b`, `c`), nessa ordem, no fim de `vertices`. |
 | Índices adicionados | 3: `base`, `base+1`, `base+2`. |
 | `base` | Capturado **antes** dos `push_back`, como `uint16_t`. |
+| Capacidade | Verificada **antes** de qualquer `push_back`: `vertices.size() > max_vertices - 3` lança `std::runtime_error`. |
 | Topologia | Não é alterada; permanece o valor atual. |
 | Junção com malha existente | Funciona por append: novos índices apontam para os novos vértices. |
 
-**Sobre o limite de 16 bits (65535):** o "guard" aqui é o próprio tipo dos
-índices — `uint16_t` — e o `static_cast<uint16_t>` aplicado a
-`vertices.size()`. **Não há verificação explícita de overflow no código.**
-Se `vertices.size()` sair da faixa representável (ou se `base+2` passar de
-65535), os índices são truncados/`base+1` e `base+2` podem voltar a zero,
-apontando para os primeiros vértices da malha. Na prática, mantenha malhas com
-menos de 65536 vértices e deixe margem para os três índices do último
-triângulo.
+**Sobre o limite de 16 bits (65536):** `max_vertices = 65536` porque o maior
+índice `uint16_t` é 65535. O guarda explícito impede estouro e indexação
+circular: uma malha com até 65533 vértices aceita um triângulo (chega a 65536);
+com 65534 ou mais, `add_triangle()` lança `std::runtime_error` **sem alterar
+`vertices` nem `indices`** (a checagem vem antes de todo `push_back`). Para
+`add_quad()` o limite de entrada é 65530, pois ele adiciona 6 de uma vez.
 
 ### `add_quad(tl, tr, br, bl)`
 
 ```cpp
 void add_quad(const Vertex& tl, const Vertex& tr,
               const Vertex& br, const Vertex& bl) {
+    if (vertices.size() > max_vertices - 6) {
+        throw std::runtime_error("Mesh excede 65536 vertices (limite uint16)");
+    }
     add_triangle(tl, tr, br);
     add_triangle(tl, br, bl);
 }
 ```
 
 Espera os quatro cantos na ordem **top-left, top-right, bottom-right,
-bottom-left**. Produz 4 vértices e 6 índices:
+bottom-left**. Cada triângulo tem três vértices próprios (não há compartilhamento
+de vértice entre eles), então o quad produz **6 vértices e 6 índices**:
 
 ```
-triângulo 1: tl, tr, br  →  base+0, base+1, base+2
-triângulo 2: tl, br, bl  →  base+0, base+2, base+3
+triângulo 1: tl, tr, br  →  vértices base+0, base+1, base+2; índices base+0, base+1, base+2
+triângulo 2: tl, br, bl  →  vértices base+3, base+4, base+5; índices base+3, base+4, base+5
 ```
 
-A diagonal compartilhada é `tl → br`.
+A diagonal compartilhada é `tl → br` (os cantos aparecem duplicados, mas os
+índices dos dois triângulos são disjuntos). A capacidade é checada **antes** de
+qualquer `push_back`: um quad que não cabe lança `std::runtime_error` e deixa a
+malha **exatamente como estava** — nunca uma mutação parcial (um triângulo
+dentro e outro fora).
 
 ### `static MeshData quad(float w = 1.0f, float h = 1.0f)`
 
@@ -265,9 +279,11 @@ Retorna uma malha nova (por valor) com um retângulo centrado na origem,
 | 0 (tl) | `(-hw,  hh, 0)` | `(0, 0)` | `(1,1,1,1)` |
 | 1 (tr) | `( hw,  hh, 0)` | `(1, 0)` | `(1,1,1,1)` |
 | 2 (br) | `( hw, -hh, 0)` | `(1, 1)` | `(1,1,1,1)` |
-| 3 (bl) | `(-hw, -hh, 0)` | `(0, 1)` | `(1,1,1,1)` |
+| 3 (tl) | `(-hw,  hh, 0)` | `(0, 0)` | `(1,1,1,1)` |
+| 4 (br) | `( hw, -hh, 0)` | `(1, 1)` | `(1,1,1,1)` |
+| 5 (bl) | `(-hw, -hh, 0)` | `(0, 1)` | `(1,1,1,1)` |
 
-Índices: `{0, 1, 2, 0, 2, 3}`.
+Índices: `{0, 1, 2, 3, 4, 5}`.
 
 ```cpp
 auto q = nativeapp::MeshData::quad();          // 1×1, de -0.5 a 0.5
@@ -305,7 +321,7 @@ v.x =  0.5f; v.y =  0.5f; v.u = 1.0f; v.v = 0.0f; const Vertex tr = v;
 v.x =  0.5f; v.y = -0.5f; v.u = 1.0f; v.v = 1.0f; const Vertex br = v;
 v.x = -0.5f; v.y = -0.5f; v.u = 0.0f; v.v = 1.0f; const Vertex bl = v;
 
-m.add_quad(tl, tr, br, bl);  // 4 vértices, 6 índices
+m.add_quad(tl, tr, br, bl);  // 6 vértices (tl,tr,br,tl,br,bl), 6 índices
 ```
 
 ---
@@ -480,7 +496,8 @@ scene.present();
 |---|---|---|
 | Inicializar `Vertex` na ordem errada | É agregado: `Vertex{x, y}` preenche x e y; `nz` e a cor já vêm com `1`. | Use a ordem `pos → normal → UV → cor` ou atribua campos pelo nome. |
 | Achar que `SpriteVertex` funciona com `MeshData` | `MeshData::vertices` é `std::vector<Vertex>`; não existe conversão no header. | Monte `Vertex` (com `z = 0`) para desenhar via `Scene::draw`. |
-| Ultrapassar 65535 vértices | Índices são `uint16_t`; `base` é `static_cast<uint16_t>(vertices.size())` e não há checagem de overflow. | Divida a malha ou mantenha o total abaixo do limite, com margem. |
+| Ultrapassar `max_vertices` (65536) | `add_triangle()`/`add_quad()` checam a capacidade **antes** de qualquer `push_back` e lançam `std::runtime_error` sem mutar a malha. | Trate a exceção ou divida a malha; o limite é 65536 vértices (índice máximo 65535). |
+| Achar que `add_quad` gera 4 vértices | Cada triângulo tem 3 vértices próprios: o quad gera **6 vértices** e 6 índices, com `tl`/`br` duplicados. | Conte com 6 vértices por quad ao calcular capacidade; `MeshData::quad()` segue o mesmo padrão. |
 | Passar cantos em ordem errada para `add_quad` | A função espera `tl, tr, br, bl` e monta `(tl,tr,br)` + `(tl,br,bl)`. | Respeite a ordem; a diagonal é `tl → br`. |
 | Esperar que `quad()` comece em `(0,0)` | É centrado na origem: de `-w/2` a `w/2` e `-h/2` a `h/2`. | Some com `mat4_translate` via parâmetro `model`. |
 | Topologia incompatível com os índices | `topology` é livre, e o header não valida a combinação. | Ajuste `topology` junto com a forma como você preenche `indices`. |
@@ -501,7 +518,7 @@ scene.present();
 using namespace nativeapp;
 
 // 1) Geometra pronta
-MeshData mesh = MeshData::quad(64.0f, 64.0f);   // 4 vértices, 6 índices
+MeshData mesh = MeshData::quad(64.0f, 64.0f);   // 6 vértices, 6 índices
 // ... ou: MeshData mesh2 = MeshData::triangle();
 // ... ou: mesh.topology = Topology::TriangleStrip; (com índices adequados)
 
@@ -525,7 +542,8 @@ scene.present();
 | `SpriteVertex` | Vértice 2D simples: x, y, UV, cor (32 bytes). |
 | `Topology` | `Triangles`, `TriangleStrip`, `TriangleFan`, `Lines`, `LineStrip`, `Points`. |
 | `MeshData::vertices` / `indices` / `topology` | Dados CPU-side da malha. |
-| `add_triangle` / `add_quad` | Montam malha por append (índices `uint16_t`). |
+| `MeshData::max_vertices` | `65536` (maior índice `uint16_t`: 65535). |
+| `add_triangle` / `add_quad` | Append com checagem de capacidade; 3 / 6 vértices por chamada. |
 | `MeshData::quad(w,h)` / `MeshData::triangle()` | Malhas prontas. |
 | `Material` | `color[4]`, `texture`, `depth_test`, `blend`. |
 | `Scene` | `resize`, `begin_frame`, `present`, `set_clear_color`, `draw`. |

@@ -1,9 +1,9 @@
 // nativeapp/text_input.hpp — Teclado virtual sem EditText e sem Java custom.
 //
-// Estratégia (funciona em QUALQUER dispositivo Android, API 1+):
+// Estratégia (API 21+):
 //   1. InputMethodManager.toggleSoftInput(SHOW_FORCED) — NÃO precisa de View.
 //   2. O IME envia eventos de tecla (AINPUT_EVENT_TYPE_KEY) para a Activity.
-//   3. Usamos AKeyEvent_getUnicodeChar() para obter o caractere real
+//   3. AKeyEvent_getUnicodeChar/unicode_from_event() obtém o caractere real
 //      (inclui acentos, símbolos e caracteres de IMEs internacionais).
 //   4. Backspace/ENTER são tratados explicitamente.
 //
@@ -11,7 +11,7 @@
 //   auto& input = nativeapp::TextInput::instance(env, activity);
 //   input.show();                                  // abre o teclado
 //   // no seu on_key(code, down, event):
-//   input.on_key(code, down, AKeyEvent_getUnicodeChar(event));
+//   input.on_key(code, down, input.unicode_from_event(event));
 //   std::string typed = input.text();
 //   input.hide();                                  // fecha o teclado
 
@@ -19,6 +19,7 @@
 
 #include <android/log.h>
 #include <android/input.h>
+#include <android/keycodes.h>
 #include <jni.h>
 
 #include <functional>
@@ -33,30 +34,42 @@ public:
     static TextInput& instance(JNIEnv* env, jobject activity) {
         static TextInput* singleton = nullptr;
         if (!singleton) singleton = new TextInput(env, activity);
-        if (env && activity && singleton->activity_ != activity) {
+        if (activity && singleton->activity_ != activity) {
             singleton->activity_ = activity;
+            if (env) singleton->env_ = env;
+        } else if (env) {
+            // JNIEnv é por thread: atualiza mesmo sem trocar de Activity.
             singleton->env_ = env;
         }
         return *singleton;
     }
 
-    /// Abre o teclado virtual.Não precisa de View/EditText.
+    /// Abre o teclado virtual. Não precisa de View/EditText.
     void show() {
         JNIEnv* env = env_;
         if (!env || !activity_) return;
+        clear_exception(env);
 
         jclass imm_class = find_class(env, "android/view/inputmethod/InputMethodManager");
         if (!imm_class) {
             log("InputMethodManager nao encontrado");
+            clear_exception(env);
             return;
         }
 
         jclass context_class = find_class(env, "android/content/Context");
+        if (!context_class) {
+            log("Context nao encontrado");
+            clear_exception(env);
+            env->DeleteLocalRef(imm_class);
+            return;
+        }
         jmethodID get_service = env->GetMethodID(
             context_class, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
-        jstring name = env->NewStringUTF("input_method");
-        jobject service = env->CallObjectMethod(activity_, get_service, name);
-        env->DeleteLocalRef(name);
+        jstring name = get_service ? env->NewStringUTF("input_method") : nullptr;
+        jobject service = name ? env->CallObjectMethod(activity_, get_service, name) : nullptr;
+        if (name) env->DeleteLocalRef(name);
+        env->DeleteLocalRef(context_class);
 
         if (service) {
             // INPUT_METHOD_SERVICE.showSoftInput(view, flags) exige view;
@@ -73,36 +86,42 @@ public:
         } else {
             log("servico input_method nao obtido");
         }
+        clear_exception(env);
         env->DeleteLocalRef(imm_class);
-        env->DeleteLocalRef(context_class);
     }
 
     /// Fecha o teclado virtual.
     void hide() {
         JNIEnv* env = env_;
         if (!env || !activity_) return;
+        clear_exception(env);
 
         jclass imm_class = find_class(env, "android/view/inputmethod/InputMethodManager");
-        if (!imm_class) return;
+        if (!imm_class) { clear_exception(env); return; }
         jclass context_class = find_class(env, "android/content/Context");
+        if (!context_class) {
+            clear_exception(env);
+            env->DeleteLocalRef(imm_class);
+            return;
+        }
         jmethodID get_service = env->GetMethodID(
             context_class, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
-        jstring name = env->NewStringUTF("input_method");
-        jobject service = env->CallObjectMethod(activity_, get_service, name);
-        env->DeleteLocalRef(name);
+        jstring name = get_service ? env->NewStringUTF("input_method") : nullptr;
+        jobject service = name ? env->CallObjectMethod(activity_, get_service, name) : nullptr;
+        if (name) env->DeleteLocalRef(name);
+        env->DeleteLocalRef(context_class);
 
         if (service) {
             jmethodID toggle = env->GetMethodID(imm_class, "toggleSoftInput", "(II)V");
             if (toggle) {
-                // SHOW_IMPLICIT = 1? Usamos HIDE_IMPLICIT_ONLY=1 via hideSoftInputFromWindow
-                // alternativa: toggleSoftInput(0, HIDE_IMPLICIT_ONLY=1) esconde.
+                // toggleSoftInput(0, HIDE_IMPLICIT_ONLY=1) esconde o teclado.
                 env->CallVoidMethod(service, toggle, 0, 1);
             }
             env->DeleteLocalRef(service);
         }
+        clear_exception(env);
         shown_ = false;
         env->DeleteLocalRef(imm_class);
-        env->DeleteLocalRef(context_class);
     }
 
     /// Repasse eventos de tecla do App::on_key. Retorna true se consumiu.
@@ -111,21 +130,21 @@ public:
         if (!down || !shown_) return false;
 
         // BACK: fecha o teclado
-        if (keycode == 4 /* AKEYCODE_BACK */) {
+        if (keycode == AKEYCODE_BACK) {
             hide();
             return true;
         }
 
         // ENTER / DPAD_CENTER / NUM_ENTER: confirma
-        if (keycode == 66 /* ENTER */ || keycode == 23 /* DPAD_CENTER */ ||
-            keycode == 160 /* NUMPAD_ENTER */) {
+        if (keycode == AKEYCODE_ENTER || keycode == AKEYCODE_DPAD_CENTER ||
+            keycode == AKEYCODE_NUMPAD_ENTER) {
             if (callback_) callback_(text_, true);
             hide();
             return true;
         }
 
         // BACKSPACE / DEL
-        if (keycode == 67 /* DEL */ || keycode == 112 /* FORWARD_DEL */) {
+        if (keycode == AKEYCODE_DEL || keycode == AKEYCODE_FORWARD_DEL) {
             if (!text_.empty()) {
                 // remove último codepoint UTF-8
                 size_t pos = text_.size() - 1;
@@ -139,7 +158,7 @@ public:
         }
 
         // Caractere imprimível (unicode fornecido pelo chamador, quando disponível)
-        if (unicode > 0 && unicode != 10 && unicode != 13) {
+        if (unicode > 0 && unicode != '\n' && unicode != '\r') {
             append_utf8(static_cast<uint32_t>(unicode));
             if (callback_) callback_(text_, false);
             return true;
@@ -171,29 +190,31 @@ public:
         if (!event || AInputEvent_getType(event) != AINPUT_EVENT_TYPE_KEY) return 0;
         JNIEnv* env = env_;
         if (!env) return 0;
+        clear_exception(env);
 
 #if __ANDROID_API__ >= 35 && !defined(APKFAST_TEST_LEGACY_IME)
         jobject java_event = AInputEvent_toJava(env, event);
         if (java_event) {
             jclass clazz = env->GetObjectClass(java_event);
-            jmethodID get_unicode = env->GetMethodID(clazz, "getUnicodeChar", "()I");
-            const int32_t unicode = get_unicode
+            jmethodID get_unicode = clazz
+                ? env->GetMethodID(clazz, "getUnicodeChar", "()I") : nullptr;
+            const int32_t unicode = (clazz && get_unicode)
                 ? env->CallIntMethod(java_event, get_unicode) : 0;
-            env->DeleteLocalRef(clazz);
+            if (clazz) env->DeleteLocalRef(clazz);
             env->DeleteLocalRef(java_event);
             if (unicode != 0) return unicode;
         }
-        if (env->ExceptionCheck()) env->ExceptionClear();
+        clear_exception(env);
 #endif
 
         // Fallback universal: monta KeyEvent com a assinatura de 8 argumentos
         // existente desde API 1. getUnicodeChar(meta) resolve acentos e IMEs.
         jclass key_class = env->FindClass("android/view/KeyEvent");
-        if (!key_class) { if (env->ExceptionCheck()) env->ExceptionClear(); return 0; }
+        if (!key_class) { clear_exception(env); return 0; }
 
         jmethodID ctor = env->GetMethodID(
             key_class, "<init>", "(JJIIIIII)V");
-        if (!ctor) { env->DeleteLocalRef(key_class); return 0; }
+        if (!ctor) { clear_exception(env); env->DeleteLocalRef(key_class); return 0; }
 
         const jlong down_time = static_cast<jlong>(AKeyEvent_getDownTime(event));
         const jlong event_time = static_cast<jlong>(AKeyEvent_getEventTime(event));
@@ -234,11 +255,16 @@ private:
     explicit TextInput(JNIEnv* env, jobject activity) : env_(env), activity_(activity) {}
 
     static jclass find_class(JNIEnv* env, const char* name) {
-        jclass local = env->FindClass(name);
-        return local; // chamador faz DeleteLocalRef
+        return env->FindClass(name);  // chamador faz DeleteLocalRef
+    }
+
+    static void clear_exception(JNIEnv* env) {
+        if (env && env->ExceptionCheck()) env->ExceptionClear();
     }
 
     static void append_utf8(std::string& out, uint32_t codepoint) {
+        // Surrogates e valores acima de U+10FFFF não são Unicode válido.
+        if (codepoint > 0x10FFFF || (codepoint >= 0xD800 && codepoint <= 0xDFFF)) return;
         if (codepoint <= 0x7F) {
             out += static_cast<char>(codepoint);
         } else if (codepoint <= 0x7FF) {
@@ -260,20 +286,24 @@ private:
 
     static char ascii_from_keycode(int32_t code) {
         // Android KeyEvent.KEYCODE_A..Z = 29..54, 0..9 = 7..16
-        if (code >= 29 && code <= 54) return static_cast<char>('a' + (code - 29));
-        if (code >= 7 && code <= 16) return static_cast<char>('0' + (code - 7));
+        if (code >= AKEYCODE_A && code <= AKEYCODE_Z) {
+            return static_cast<char>('a' + (code - AKEYCODE_A));
+        }
+        if (code >= AKEYCODE_0 && code <= AKEYCODE_9) {
+            return static_cast<char>('0' + (code - AKEYCODE_0));
+        }
         switch (code) {
-            case 62: return ' ';   // SPACE
-            case 55: return ',';   // COMMA
-            case 56: return '.';   // PERIOD
-            case 57: return '-';   // MINUS
-            case 58: return ';';   // SEMICOLON
-            case 59: return '/';   // SLASH
-            case 60: return '`';   // GRAVE
-            case 68: return '\'';  // QUOTE
-            case 69: return '[';   // LEFT_BRACKET
-            case 70: return ']';   // RIGHT_BRACKET
-            case 71: return '\\';  // BACKSLASH
+            case AKEYCODE_SPACE: return ' ';
+            case AKEYCODE_COMMA: return ',';
+            case AKEYCODE_PERIOD: return '.';
+            case AKEYCODE_MINUS: return '-';
+            case AKEYCODE_SEMICOLON: return ';';
+            case AKEYCODE_SLASH: return '/';
+            case AKEYCODE_GRAVE: return '`';
+            case AKEYCODE_APOSTROPHE: return '\'';  // KEYCODE_QUOTE no Java
+            case AKEYCODE_LEFT_BRACKET: return '[';
+            case AKEYCODE_RIGHT_BRACKET: return ']';
+            case AKEYCODE_BACKSLASH: return '\\';
             default: return 0;
         }
     }

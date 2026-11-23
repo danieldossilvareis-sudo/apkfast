@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -28,9 +29,28 @@ def _add_quiet(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _quiet(args: argparse.Namespace) -> bool:
+    """Única fonte de verdade para o modo silencioso.
+
+    Os subcomandos usam ``cmd_quiet`` para não sobrescrever a flag global
+    durante o parse; ``build_quiet`` é aceito apenas por compatibilidade com
+    Namespace construído por código externo.
+    """
+    return bool(
+        getattr(args, "quiet", False)
+        or getattr(args, "cmd_quiet", False)
+        or getattr(args, "build_quiet", False)
+    )
+
+
 def _say(args: argparse.Namespace, message: str) -> None:
-    if not getattr(args, "quiet", False):
+    if not _quiet(args):
         print(message)
+
+
+def _fail(message: str) -> int:
+    print(f"[✗] {message}", file=sys.stderr)
+    return 1
 
 
 def _add_build_args(parser: argparse.ArgumentParser) -> None:
@@ -84,14 +104,14 @@ def _add_build_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--assets", help="diretório de assets (default: <projeto>/assets)")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument(
-        "-q", "--quiet", dest="build_quiet", action="store_true", help="silencioso: mostra só erros"
+        "-q", "--quiet", dest="cmd_quiet", action="store_true", help="silencioso: mostra só erros"
     )
 
 
 def _cmd_build(args: argparse.Namespace) -> int:
     from .builder import Logger
 
-    log = Logger(quiet=args.quiet or args.build_quiet, verbose=args.verbose)
+    log = Logger(quiet=_quiet(args), verbose=args.verbose)
     options = BuildOptions(
         project=Path(args.project),
         output=Path(args.output) if args.output else None,
@@ -115,12 +135,12 @@ def _cmd_build(args: argparse.Namespace) -> int:
         sources=args.src,
         assets_dir=Path(args.assets) if args.assets else None,
         verbose=args.verbose,
-        quiet=args.quiet or args.build_quiet,
+        quiet=_quiet(args),
         log=log,
     )
     try:
         apk = build(options)
-    except (BuildError, RuntimeError) as exc:
+    except (BuildError, RuntimeError, OSError) as exc:
         log.error(f"[✗] {exc}")
         return 1
     log.info(f"[✓] Build concluído: {apk}")
@@ -131,21 +151,25 @@ def _cmd_init(args: argparse.Namespace) -> int:
     from .scaffold import create_project, interactive_config
 
     target = Path(args.name).expanduser().resolve()
+    if target.exists() and not target.is_dir():
+        return _fail(f"Caminho não é um diretório: {target}")
     if target.exists() and any(target.iterdir()) and not args.force:
-        print(f"[✗] Diretório não vazio: {target} (use --force)", file=sys.stderr)
-        return 1
+        return _fail(f"Diretório não vazio: {target} (use --force)")
 
-    config = interactive_config(args, target)
-    if config is None:
-        return 1
+    try:
+        config = interactive_config(args, target)
+        if config is None:
+            return 1
+        create_project(target, config)
+    except (OSError, ValueError) as exc:
+        return _fail(f"Falha ao criar projeto: {exc}")
 
-    create_project(target, config)
     _say(args, f"[✓] Projeto criado em {target}")
     _say(args, f"    template: {config.template} | package: {config.package}")
     cli_relative = os.path.relpath(Path(__file__).resolve().parent.parent, target)
     _say(args, f"    cd {target} && python3 {cli_relative}/apkfast.py build")
     if config.template in ("raylib", "sdl2", "sdl3"):
-        _say(args, "    (instale as libs: python3 ../../apkfast.py setup-libs)")
+        _say(args, f"    (instale as libs: python3 {cli_relative}/apkfast.py setup-libs)")
     return 0
 
 
@@ -153,9 +177,8 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     _say(args, BANNER)
     try:
         tc = detect(abi=args.abi, api=args.api)
-    except RuntimeError as exc:
-        print(f"[✗] {exc}", file=sys.stderr)
-        return 1
+    except (RuntimeError, OSError) as exc:
+        return _fail(str(exc))
     _say(args, tc.summary())
     _say(args, "\nVerificando ferramentas:")
     for name, path in [
@@ -187,38 +210,55 @@ def _cmd_install(args: argparse.Namespace) -> int:
             allow_downgrade=args.debug,
             grant_permissions=args.grant_permissions,
         )
-    except DeviceError as exc:
-        print(f"[✗] {exc}", file=sys.stderr)
-        return 1
+    except (DeviceError, OSError) as exc:
+        return _fail(str(exc))
     _say(args, f"[✓] Instalado em {args.device or 'dispositivo'}: {output}")
     return 0
 
 
+def _setup_platform_api(args: argparse.Namespace) -> int:
+    """API da platform: explícita, ou derivada de --sdk-version (37.0.0 -> 37)."""
+    explicit = getattr(args, "platform_api", None)
+    if explicit is not None:
+        return int(explicit)
+    version = str(getattr(args, "sdk_version", "") or "").strip()
+    match = re.match(r"(\d+)", version)
+    return int(match.group(1)) if match else 36
+
+
 def _cmd_setup_sdk(args: argparse.Namespace) -> int:
-    from .sdk_setup import SetupError, install_sdk, list_versions
+    from .sdk_setup import SDK_REPO, NDK_REPO, SetupError, install_sdk, list_versions
 
     if args.list_versions:
-        print("SDK (android-sdk-custom):")
-        for version in list_versions("HomuHomu833/android-sdk-custom"):
-            print(f"  {version}")
-        print("NDK (android-ndk-custom):")
-        for version in list_versions("HomuHomu833/android-ndk-custom"):
-            print(f"  {version}")
+        try:
+            for label, repo in (("SDK", SDK_REPO), ("NDK", NDK_REPO)):
+                print(f"{label} ({repo.split('/')[-1]}):")
+                for version in list_versions(repo):
+                    print(f"  {version}")
+        except (SetupError, OSError) as exc:
+            return _fail(str(exc))
         return 0
+
+    platform_api = _setup_platform_api(args)
+    if platform_api < 1:
+        return _fail(f"API da platform inválida: {platform_api}")
 
     try:
         paths = install_sdk(
             target=Path(args.target) if args.target else None,
             sdk_version=args.sdk_version,
             ndk_version=args.ndk_version,
-            platform_api=args.platform_api,
+            platform_api=platform_api,
             force=args.force,
-            quiet=args.quiet,
+            quiet=_quiet(args),
             assume_yes=args.yes,
         )
     except SetupError as exc:
-        print(f"[✗] {exc}", file=sys.stderr)
-        return 1
+        return _fail(str(exc))
+    except OSError as exc:
+        return _fail(f"Falha de filesystem ao instalar SDK/NDK: {exc}")
+    except EOFError:
+        return _fail("Confirmação não recebida; use -y/--yes para instalar sem perguntar.")
     _say(args, f"[✓] SDK: {paths['sdk']}")
     _say(args, f"[✓] NDK: {paths['ndk']}")
     _say(args, "Rode: python3 apkfast.py doctor")
@@ -238,15 +278,14 @@ def _cmd_setup_libs(args: argparse.Namespace) -> int:
         abis = [a.strip() for a in args.abis.split(",") if a.strip()] or ["arm64-v8a"]
     for abi in abis:
         for name, fn in (
-            ("raylib", lambda: raylib_install(abi, api=36, quiet=args.quiet)),
-            ("SDL2", lambda: sdl_install(2, abi, api=21, quiet=args.quiet)),
-            ("SDL3", lambda: sdl_install(3, abi, api=21, quiet=args.quiet)),
+            ("raylib", lambda: raylib_install(abi, api=36, quiet=_quiet(args))),
+            ("SDL2", lambda: sdl_install(2, abi, api=21, quiet=_quiet(args))),
+            ("SDL3", lambda: sdl_install(3, abi, api=21, quiet=_quiet(args))),
         ):
             try:
                 fn()
-            except (RaylibError, SDLError) as exc:
-                print(f"[✗] {name} ({abi}): {exc}", file=sys.stderr)
-                return 1
+            except (RaylibError, SDLError, RuntimeError, OSError) as exc:
+                return _fail(f"{name} ({abi}): {exc}")
     _say(args, "[✓] Bibliotecas prontas.")
     return 0
 
@@ -255,10 +294,9 @@ def _cmd_sdl_install(args: argparse.Namespace) -> int:
     from .sdl import SDLError, install
 
     try:
-        install(args.version, abi=args.abi, api=args.api, quiet=args.quiet)
-    except SDLError as exc:
-        print(f"[✗] {exc}", file=sys.stderr)
-        return 1
+        install(args.version, abi=args.abi, api=args.api, quiet=_quiet(args))
+    except (SDLError, RuntimeError, OSError) as exc:
+        return _fail(str(exc))
     return 0
 
 
@@ -266,10 +304,9 @@ def _cmd_raylib_install(args: argparse.Namespace) -> int:
     from .raylib import RaylibError, install
 
     try:
-        install(abi=args.abi, api=args.api, quiet=args.quiet)
-    except RaylibError as exc:
-        print(f"[✗] {exc}", file=sys.stderr)
-        return 1
+        install(abi=args.abi, api=args.api, quiet=_quiet(args))
+    except (RaylibError, RuntimeError, OSError) as exc:
+        return _fail(str(exc))
     return 0
 
 
@@ -288,9 +325,8 @@ def _cmd_logs(args: argparse.Namespace) -> int:
         cmd += ["-d", "-t", str(args.lines)]
         result = subprocess.run(cmd)
         return result.returncode
-    except DeviceError as exc:
-        print(f"[✗] {exc}", file=sys.stderr)
-        return 1
+    except (DeviceError, OSError) as exc:
+        return _fail(str(exc))
 
 
 def _cmd_devices(args: argparse.Namespace) -> int:
@@ -302,9 +338,8 @@ def _cmd_devices(args: argparse.Namespace) -> int:
         if not devices and args.restart:
             restart_server(adb)
             devices = list_devices(adb)
-    except DeviceError as exc:
-        print(f"[✗] {exc}", file=sys.stderr)
-        return 1
+    except (DeviceError, OSError) as exc:
+        return _fail(str(exc))
 
     if not devices:
         _say(args, "Nenhum dispositivo conectado.")
@@ -318,17 +353,25 @@ def _cmd_devices(args: argparse.Namespace) -> int:
 def _cmd_info(args: argparse.Namespace) -> int:
     path = Path(args.apk).expanduser().resolve()
     if not path.is_file():
-        print(f"[✗] APK não encontrado: {path}", file=sys.stderr)
-        return 1
-    tc = detect()
-    result = subprocess.run(
-        [str(tc.aapt2), "dump", "badging", str(path)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    print(result.stdout or result.stderr)
-    return result.returncode
+        return _fail(f"APK não encontrado: {path}")
+    try:
+        tc = detect()
+    except (RuntimeError, OSError) as exc:
+        return _fail(str(exc))
+    try:
+        result = subprocess.run(
+            [str(tc.aapt2), "dump", "badging", str(path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        return _fail(f"Falha ao executar aapt2: {exc}")
+    print(result.stdout or "")
+    if result.returncode != 0:
+        return _fail(f"aapt2 dump badging falhou ({result.returncode})")
+    return 0
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -397,8 +440,8 @@ def create_parser() -> argparse.ArgumentParser:
     p_setup_sdk.add_argument("--sdk-version", help="versão do SDK (ex: 37.0.0)")
     p_setup_sdk.add_argument("--ndk-version", help="versão do NDK (ex: r30)")
     p_setup_sdk.add_argument(
-        "--platform-api", type=int, default=36,
-        help="API da platform a instalar via sdkmanager (default: 36)",
+        "--platform-api", type=int, default=None,
+        help="API da platform via sdkmanager (default: 36, ou a API de --sdk-version)",
     )
     p_setup_sdk.add_argument("--force", action="store_true", help="reinstala se já existir")
     p_setup_sdk.add_argument("--list-versions", action="store_true", help="lista releases")
@@ -447,10 +490,7 @@ def create_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = create_parser()
     args = parser.parse_args(argv)
-    if getattr(args, "cmd_quiet", False):
-        args.quiet = True
-    if getattr(args, "build_quiet", False):
-        args.quiet = True
+    args.quiet = _quiet(args)
     if args.command == "build" and args.verbose and not args.quiet:
         print(BANNER)
     return int(args.func(args))

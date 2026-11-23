@@ -27,6 +27,7 @@
 #include "text_input.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <unordered_map>
 #include <unordered_set>
@@ -53,14 +54,24 @@ enum class Lifecycle {
 class App {
 public:
     explicit App(android_app* app) : app_(app) {}
-    virtual ~App() = default;
+    virtual ~App() {
+        // Evita que um evento tardio do glue chegue a uma instância já morta.
+        if (app_ && app_->userData == this) {
+            app_->userData = nullptr;
+            app_->onAppCmd = nullptr;
+            app_->onInputEvent = nullptr;
+        }
+    }
 
     int run() {
+        if (!app_) return 0;
         app_->userData = this;
         app_->onAppCmd = &App::on_app_command_thunk;
         app_->onInputEvent = &App::on_input_thunk;
         state_ = Lifecycle::Created;
+        finished_ = false;
         last_frame_ = std::chrono::steady_clock::now();
+        reset_input();
 
         while (state_ != Lifecycle::Destroyed) {
             int events = 0;
@@ -80,9 +91,13 @@ public:
             }
             if (state_ == Lifecycle::Ready && native_window_ && !paused_) {
                 const auto now = std::chrono::steady_clock::now();
-                const float dt = std::chrono::duration<float>(now - last_frame_).count();
+                float dt = std::chrono::duration<float>(now - last_frame_).count();
                 last_frame_ = now;
-                delta_time_ = dt > 0.25f ? 0.25f : dt;  // clamp após background
+                // Clamp superior após background; NaN/negativo (relógio
+                // ajustado/resume fora de ordem) vira zero para não
+                // contaminar a lógica do jogo nem fps().
+                if (!std::isfinite(dt) || dt < 0.0f) dt = 0.0f;
+                delta_time_ = dt > 0.25f ? 0.25f : dt;
 
                 on_tick();
                 on_update(delta_time_);
@@ -97,6 +112,10 @@ public:
     }
 
     void finish() {
+        // run() pode chamar finish() de dois caminhos diferentes (e o usuário
+        // pode chamar manualmente): shutdown/on_destroy devem rodar uma vez.
+        if (finished_) return;
+        finished_ = true;
         // Cleanup de refs JNI globais antes de notificar a subclasse.
         Permissions::instance(nullptr).shutdown();
         JniPermissions::instance(nullptr, nullptr).shutdown();
@@ -106,7 +125,7 @@ public:
     // ----- Consulta de estado ----------------------------------------------
     Lifecycle lifecycle() const { return state_; }
     bool is_ready() const { return state_ == Lifecycle::Ready && !paused_; }
-    ANativeActivity* activity() const { return app_->activity; }
+    ANativeActivity* activity() const { return app_ ? app_->activity : nullptr; }
     android_app* native_app() const { return app_; }
     ANativeWindow* window() const { return native_window_; }
     int width() const { return width_; }
@@ -133,7 +152,9 @@ public:
         return it != last_touches_.end() ? it->second : TouchPoint{pointer_id, 0, 0};
     }
 
-    void request_exit() { ANativeActivity_finish(app_->activity); }
+    void request_exit() {
+        if (app_ && app_->activity) ANativeActivity_finish(app_->activity);
+    }
 
     // ----- Eventos de ciclo de vida ----------------------------------------
     virtual void on_ready() {}          ///< uma vez, após primeira janela
@@ -154,7 +175,7 @@ public:
 
     /// Chamado a cada frame antes de on_draw().
     virtual void on_tick() {
-        Permissions::instance(app_->activity).update();
+        if (app_) Permissions::instance(app_->activity).update();
     }
 
 protected:
@@ -164,15 +185,24 @@ protected:
 
 private:
     static void on_app_command_thunk(android_app* app, int32_t cmd) {
+        if (!app || !app->userData) return;
         static_cast<App*>(app->userData)->on_app_command(cmd);
     }
 
     static int32_t on_input_thunk(android_app* app, AInputEvent* event) {
+        if (!app || !app->userData) return 0;
         return static_cast<App*>(app->userData)->on_input(event);
     }
 
+    /// Zera o estado de polling (não há UP depois de pause/destroy).
+    void reset_input() {
+        keys_down_.clear();
+        touches_down_.clear();
+        last_touches_.clear();
+    }
+
     bool has_valid_window() const {
-        if (!app_->window) return false;
+        if (!app_ || !app_->window) return false;
         return ANativeWindow_getWidth(app_->window) > 0 &&
                ANativeWindow_getHeight(app_->window) > 0;
     }
@@ -182,6 +212,9 @@ private:
         if (!has_valid_window()) return;
 
         const bool is_new = (native_window_ != app_->window) || !surface_active_;
+        // Uma surface recriada sem passar pelo RESUME não deve herdar o dt da
+        // surface anterior (janela destruída em background/rotação).
+        if (is_new) last_frame_ = std::chrono::steady_clock::now();
         native_window_ = app_->window;
         width_ = ANativeWindow_getWidth(native_window_);
         height_ = ANativeWindow_getHeight(native_window_);
@@ -229,6 +262,7 @@ private:
     }
 
     void on_app_command(int32_t cmd) {
+        if (!app_) return;
         switch (cmd) {
             case APP_CMD_INIT_WINDOW:
                 activate_surface();
@@ -236,6 +270,7 @@ private:
 
             case APP_CMD_TERM_WINDOW:
                 deactivate_surface();
+                reset_input();
                 if (state_ == Lifecycle::Ready) state_ = Lifecycle::Paused;
                 break;
 
@@ -248,6 +283,10 @@ private:
                     if (w > 0 && h > 0 && (w != width_ || h != height_)) {
                         width_ = w;
                         height_ = h;
+                        // Mantém o cache coerente: sem isso um activate_surface()
+                        // seguinte notificaria o mesmo tamanho duas vezes.
+                        last_notified_width_ = w;
+                        last_notified_height_ = h;
                         on_surface_changed(w, h);
                     }
                 }
@@ -255,6 +294,7 @@ private:
 
             case APP_CMD_PAUSE:
                 paused_ = true;
+                reset_input();
                 on_pause();
                 break;
 
@@ -279,6 +319,7 @@ private:
 
             case APP_CMD_DESTROY:
                 deactivate_surface();
+                reset_input();
                 state_ = Lifecycle::Destroyed;
                 break;
 
@@ -288,24 +329,30 @@ private:
     }
 
     int32_t on_input(AInputEvent* event) {
+        if (!event) return 0;
         InputHelpers::instance().on_event(event);
         const int32_t type = AInputEvent_getType(event);
         if (type == AINPUT_EVENT_TYPE_KEY) {
             const int32_t action = AKeyEvent_getAction(event);
             const int32_t code = AKeyEvent_getKeyCode(event);
-            const bool down = action == AKEY_EVENT_ACTION_DOWN ||
-                              action == AKEY_EVENT_ACTION_MULTIPLE;
+            // AKEY_EVENT_FLAG_CANCELED (ex.: troca de IME) não é um UP, mas
+            // também não pode deixar a tecla "presa" no polling.
+            const bool canceled =
+                (AKeyEvent_getFlags(event) & AKEY_EVENT_FLAG_CANCELED) != 0;
+            const bool down = !canceled &&
+                              (action == AKEY_EVENT_ACTION_DOWN ||
+                               action == AKEY_EVENT_ACTION_MULTIPLE);
             if (down) keys_down_.insert(code);
-            else if (action == AKEY_EVENT_ACTION_UP) keys_down_.erase(code);
+            else keys_down_.erase(code);
 
             // Repassa ao teclado virtual (se estiver aberto). O unicode vem
             // do IME e inclui acentos/símbolos de teclados internacionais.
-            if (TextInput::instance(nullptr, nullptr).is_shown()) {
+            auto& text_input = TextInput::instance(nullptr, nullptr);
+            if (text_input.is_shown()) {
                 // Unicode real do IME (API 21+ via fallback JNI), com
                 // mapeamento ASCII como último recurso.
-                const int32_t unicode =
-                    TextInput::instance(nullptr, nullptr).unicode_from_event(event);
-                if (TextInput::instance(nullptr, nullptr).on_key(code, down, unicode)) {
+                const int32_t unicode = text_input.unicode_from_event(event);
+                if (text_input.on_key(code, down, unicode)) {
                     return 1;
                 }
             }
@@ -338,27 +385,41 @@ private:
                 AMotionEvent_getY(event, i),
             });
         }
-        const bool pointer_specific =
+        // POINTER_DOWN/POINTER_UP alteram só o dedo cujo índice vem na ação.
+        // ACTION_UP usa o índice 0 por contrato; tratá-lo como "todos os
+        // ponteiros" apagaria dedos que ainda estão no ar em alguns devices.
+        const bool single_pointer_change =
             action == AMOTION_EVENT_ACTION_POINTER_DOWN ||
-            action == AMOTION_EVENT_ACTION_POINTER_UP;
+            action == AMOTION_EVENT_ACTION_POINTER_UP ||
+            action == AMOTION_EVENT_ACTION_UP;
         int32_t changed_id = -1;
-        if (pointer_specific) {
-            const int32_t index =
-                (action_raw >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT) &
-                AMOTION_EVENT_ACTION_POINTER_INDEX_MASK;
-            if (index < static_cast<int32_t>(points.size())) {
+        if (single_pointer_change) {
+            int32_t index = 0;
+            if (action != AMOTION_EVENT_ACTION_UP) {
+                index = (action_raw >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT) &
+                        AMOTION_EVENT_ACTION_POINTER_INDEX_MASK;
+            }
+            if (index >= 0 && static_cast<size_t>(index) < points.size()) {
                 changed_id = points[static_cast<size_t>(index)].id;
+            } else if (!points.empty()) {
+                // Evento com índice fora da faixa: não deixa o dedo "preso".
+                changed_id = points.front().id;
             }
         }
 
         for (const auto& point : points) {
-            if (pointer_specific && point.id != changed_id) continue;
+            const bool changed = !single_pointer_change || point.id == changed_id;
             if (ta == TouchAction::Down || ta == TouchAction::Move) {
                 touches_down_.insert(point.id);
-                last_touches_[point.id] = point;
-            } else {
+            } else if (changed) {
                 touches_down_.erase(point.id);
             }
+            // last_touch() continua devolvendo a última posição conhecida
+            // mesmo depois do dedo sair (comportamento histórico preservado).
+            last_touches_[point.id] = point;
+        }
+        if (ta == TouchAction::Cancel) {
+            touches_down_.clear();
         }
         on_touch(ta, points);
         return 1;
@@ -372,6 +433,7 @@ private:
     int last_notified_width_ = -1;
     int last_notified_height_ = -1;
     bool initialized_ = false;  // on_ready já foi chamado
+    bool finished_ = false;     // finish() já rodou (shutdown é idempotente)
     bool surface_active_ = false;
     bool paused_ = false;
     bool focused_ = false;

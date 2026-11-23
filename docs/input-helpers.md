@@ -143,6 +143,8 @@ if (type == AINPUT_EVENT_TYPE_KEY) {
     if (down) keys_.insert(code);
     else if (action == AKEY_EVENT_ACTION_UP) keys_.erase(code);
     last_key_ = code;
+    // Botões de gamepad também chegam como KEY events (DPAD, A/B…).
+    mark_gamepad_source(AInputEvent_getSource(event));
     return;
 }
 ```
@@ -158,6 +160,11 @@ if (type == AINPUT_EVENT_TYPE_KEY) {
 inclusive no `UP`. Ele é "o último código de tecla visto", não "a última tecla
 atualmente pressionada".
 
+**Observação:** a source também é examinada em eventos **key**. Um key event com
+source `GAMEPAD`/`JOYSTICK` (por exemplo `AKEYCODE_BUTTON_A` ou DPAD) liga
+`gamepad_connected_` mesmo que nenhum motion event desse controle tenha chegado.
+Os eixos (sticks/triggers) continuam sendo lidos só de motion events.
+
 ### 3.2 Eventos de motion (`AINPUT_EVENT_TYPE_MOTION`)
 
 ```cpp
@@ -165,8 +172,9 @@ if (type != AINPUT_EVENT_TYPE_MOTION) return;
 
 const int32_t source = AInputEvent_getSource(event);
 const bool is_mouse = (source & AINPUT_SOURCE_MOUSE) == AINPUT_SOURCE_MOUSE;
-const bool is_gamepad = (source & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD ||
-                        (source & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK;
+const bool is_gamepad = mark_gamepad_source(source);
+// Eventos de hover/exit podem não ter nenhum ponteiro.
+const bool has_pointer = AMotionEvent_getPointerCount(event) > 0;
 
 const int32_t action = AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK;
 const int32_t buttons = AMotionEvent_getButtonState(event);
@@ -174,14 +182,23 @@ const int32_t buttons = AMotionEvent_getButtonState(event);
 
 | Source (`AInputEvent_getSource`) | `is_mouse` | `is_gamepad` | Campos atualizados |
 |---|---|---|---|
-| `AINPUT_SOURCE_MOUSE` | `true` | `false` | `mouse_x_`, `mouse_y_`, `mouse_buttons_`; `scroll_x_`/`scroll_y_` se `action == AMOTION_EVENT_ACTION_SCROLL` |
-| `AINPUT_SOURCE_GAMEPAD` | `false` | `true` | sticks, triggers, `gamepad_connected_ = true` |
-| `AINPUT_SOURCE_JOYSTICK` | `false` | `true` | sticks, triggers, `gamepad_connected_ = true` |
+| `AINPUT_SOURCE_MOUSE` | `true` | `false` | `mouse_buttons_`; `mouse_x_`/`mouse_y_` **se houver ponteiro**; `scroll_x_`/`scroll_y_` **se** `action == AMOTION_EVENT_ACTION_SCROLL` |
+| `AINPUT_SOURCE_GAMEPAD` | `false` | `true` | `gamepad_connected_ = true` sempre; sticks/triggers **se houver ponteiro** |
+| `AINPUT_SOURCE_JOYSTICK` | `false` | `true` | `gamepad_connected_ = true` sempre; sticks/triggers **se houver ponteiro** |
 | Combinação com `MOUSE` **e** `GAMEPAD`/`JOYSTICK` | `true` | `true` | **os dois blocos** rodam no mesmo evento |
 | `AINPUT_SOURCE_TOUCHSCREEN` (ou qualquer outra source) | `false` | `false` | nenhum campo do helper é alterado |
 
-**Observação:** `is_gamepad` usa **OU** entre `GAMEPAD` e `JOYSTICK` — um
-joystick sem o bit de gamepad já habilita leitura de sticks/triggers.
+**Observação:** `mark_gamepad_source()` usa **OU** entre `GAMEPAD` e `JOYSTICK`
+— um joystick sem o bit de gamepad já habilita leitura de sticks/triggers e
+também é chamado no ramo de key events.
+
+**Observação:** `gamepad_connected_` também pode ser ligado por um **key event**
+de gamepad (§3.1). A tabela acima descreve somente o que o ramo de motion
+atualiza; a detecção de source é compartilhada pelos dois ramos.
+
+**Observação:** `has_pointer` protege as leituras de coordenadas/eixos: um
+evento de hover/exit sem ponteiro atualiza apenas `mouse_buttons_` (mouse) e/ou
+a flag de gamepad, sem chamar `AMotionEvent_getX/Y/AxisValue` com índice 0.
 
 **Observação:** a action é mascarada com `AMOTION_EVENT_ACTION_MASK`, então o
 índice do ponteiro (usado pelo `App` para `POINTER_DOWN`/`POINTER_UP`) é
@@ -270,10 +287,10 @@ o helper **não** aplica deadzone, normalização, inversão de Y nem clamp.
 bool gamepad_connected() const { return gamepad_connected_; }
 ```
 
-Ela vira `true` quando chega **qualquer** motion event com source
-`GAMEPAD` ou `JOYSTICK`. O `on_event()` **nunca** a coloca como `false`: a
-única forma de voltar a `false` é `reset()`. Veja a armadilha em
-[§10.1](#101-gamepad_connected_-só-vira-true).
+Ela vira `true` quando chega um **key event** ou um **motion event** com source
+`GAMEPAD` ou `JOYSTICK` (detecção via `mark_gamepad_source()`). O `on_event()`
+**nunca** a coloca como `false`: a única forma de voltar a `false` é `reset()`.
+Veja a armadilha em [§10.1](#101-gamepad_connected-só-vira-true).
 
 ### 5.3 Botões: são eventos de teclado
 
@@ -316,38 +333,42 @@ São **cinco** valores, nessa ordem. Não há outros.
 
 ```cpp
 if (is_mouse) {
-    mouse_x_ = AMotionEvent_getX(event, 0);
-    mouse_y_ = AMotionEvent_getY(event, 0);
     mouse_buttons_ = buttons;
+    if (has_pointer) {
+        mouse_x_ = AMotionEvent_getX(event, 0);
+        mouse_y_ = AMotionEvent_getY(event, 0);
+    }
     if (action == AMOTION_EVENT_ACTION_SCROLL) {
-        scroll_x_ = AMotionEvent_getXOffset(event);
-        scroll_y_ = AMotionEvent_getYOffset(event);
+        // Soma os deltas até consume_scroll() (vários eventos/frame).
+        scroll_x_ += AMotionEvent_getXOffset(event);
+        scroll_y_ += AMotionEvent_getYOffset(event);
     }
 }
 ```
 
 - `mouse_x()` / `mouse_y()`: coordenadas do ponteiro 0 do último motion event
-  de mouse; ambas começam em `0`.
-- `mouse_down(MouseButton)`: testa bits do `AMotionEvent_getButtonState(event)`
-  guardado em `mouse_buttons_`.
+  de mouse **com ponteiro**; ambas começam em `0`.
+- `mouse_down(MouseButton)`: testa as constantes `AMOTION_EVENT_BUTTON_*` do
+  `AMotionEvent_getButtonState(event)` guardado em `mouse_buttons_`.
 
 ```cpp
 bool mouse_down(MouseButton button) const {
-    const int32_t bit = button == MouseButton::Left ? 1 :
-                        button == MouseButton::Right ? 2 :
-                        button == MouseButton::Middle ? 4 :
-                        button == MouseButton::Back ? 8 : 16;
+    const int32_t bit = button == MouseButton::Left ? AMOTION_EVENT_BUTTON_PRIMARY :
+                        button == MouseButton::Right ? AMOTION_EVENT_BUTTON_SECONDARY :
+                        button == MouseButton::Middle ? AMOTION_EVENT_BUTTON_TERTIARY :
+                        button == MouseButton::Back ? AMOTION_EVENT_BUTTON_BACK
+                                                    : AMOTION_EVENT_BUTTON_FORWARD;
     return (mouse_buttons_ & bit) != 0;
 }
 ```
 
-| `MouseButton` | Bit testado |
-|---|---|
-| `Left` | `1` |
-| `Right` | `2` |
-| `Middle` | `4` |
-| `Back` | `8` |
-| `Forward` | `16` (ramo final da cadeia de ternários) |
+| `MouseButton` | Constante NDK testada | Bit |
+|---|---|---|
+| `Left` | `AMOTION_EVENT_BUTTON_PRIMARY` | `1` |
+| `Right` | `AMOTION_EVENT_BUTTON_SECONDARY` | `2` |
+| `Middle` | `AMOTION_EVENT_BUTTON_TERTIARY` | `4` |
+| `Back` | `AMOTION_EVENT_BUTTON_BACK` | `8` |
+| `Forward` | `AMOTION_EVENT_BUTTON_FORWARD` (ramo final) | `16` |
 
 **Observação:** o estado dos botões é o **estado atual do evento**; o helper
 não guarda bordas de pressão/release para o mouse (ao contrário do que
@@ -369,21 +390,21 @@ void consume_scroll(float& x, float& y) {
 
 - `scroll_x_`/`scroll_y_` só são escritos em
   `action == AMOTION_EVENT_ACTION_SCROLL`, via `AMotionEvent_getXOffset()` /
-  `AMotionEvent_getYOffset()`.
+  `AMotionEvent_getYOffset()`, e cada evento **soma** (`+=`) ao acumulado.
 - `consume_scroll(x, y)` **copia** os dois valores para as referências e
   **zera** o acumulado.
 - `reset()` também zera o scroll.
 
-**Observação:** um novo `ACTION_SCROLL` **substitui** os valores anteriores
-(atribuição, não soma). O que "fica acumulado" é o delta pendente entre
-eventos de scroll e a leitura: motion events de mouse que não são scroll não
-apagam esse valor.
+**Observação:** um novo `ACTION_SCROLL` **acumula** com os deltas ainda não
+consumidos (vários eventos podem chegar no mesmo frame). Motion events de mouse
+que não são scroll não apagam esse valor. Se você nunca chama
+`consume_scroll()` nem `reset()`, o acumulado cresce indefinidamente.
 
 ```cpp
 auto& in = nativeapp::InputHelpers::instance();
 
 float sx = 0.0f, sy = 0.0f;
-in.consume_scroll(sx, sy);  // sx/sy = últimos offsets; helper volta a 0
+in.consume_scroll(sx, sy);  // sx/sy = soma dos deltas; helper volta a 0
 ```
 
 ---
@@ -393,6 +414,7 @@ in.consume_scroll(sx, sy);  // sx/sy = últimos offsets; helper volta a 0
 ```cpp
 void reset() {
     keys_.clear();
+    mouse_x_ = mouse_y_ = 0;
     mouse_buttons_ = 0;
     scroll_x_ = scroll_y_ = 0;
     last_key_ = 0;
@@ -406,19 +428,23 @@ void reset() {
 |---|---|
 | `keys_` | vazio (`clear()`) |
 | `last_key_` | `0` |
+| `mouse_x_`, `mouse_y_` | `0`, `0` |
 | `mouse_buttons_` | `0` |
 | `scroll_x_`, `scroll_y_` | `0`, `0` |
 | `stick_left_`, `stick_right_` | `{}` → `{x=0, y=0}` |
 | `triggers_` | `{}` → `{0, 0}` |
 | `gamepad_connected_` | `false` |
-| `mouse_x_`, `mouse_y_` | `0`, `0` |
 
 **Observação:** `reset()` é público e **não é chamado automaticamente** pelo
-`App` em nenhum ponto de `app.hpp`. Cabe ao seu código decidir quando chamá-lo
+`App` em nenhum ponto de `app.hpp`. O `App` limpa somente o **seu próprio**
+estado (`reset_input()`: `keys_down_`, `touches_down_` e `last_touches_`) em
+`TERM_WINDOW`/`PAUSE`/`DESTROY` — isso **não** afeta o `InputHelpers`. Cabe ao
+seu código chamar `InputHelpers::instance().reset()` quando quiser estado limpo
 (por exemplo, ao trocar de cena ou ao voltar de `on_pause()`).
 
-**Observação:** `reset()` também zera `mouse_x_`/`mouse_y_` — após o reset,
-`mouse_x()`/`mouse_y()` devolvem `0` até um novo evento de mouse chegar.
+**Observação:** o `reset()` agora é **completo**: zera também
+`mouse_x_`/`mouse_y_` — após o reset, `mouse_x()`/`mouse_y()` devolvem `0` até
+um novo evento de mouse chegar.
 
 ---
 
@@ -432,7 +458,7 @@ Todos os métodos públicos de `InputHelpers` (o construtor é privado):
 | 2 | `on_event(AInputEvent* event)` | `void` | Atualiza o estado a partir de um evento key/motion |
 | 3 | `is_down(int32_t keycode) const` | `bool` | `keys_.count(keycode) > 0` |
 | 4 | `last_key() const` | `int32_t` | Último keycode visto (inclusive em `UP`); começa em `0` |
-| 5 | `gamepad_connected() const` | `bool` | Já houve motion de `GAMEPAD`/`JOYSTICK` desde o último `reset()` |
+| 5 | `gamepad_connected() const` | `bool` | Já houve key **ou** motion de `GAMEPAD`/`JOYSTICK` desde o último `reset()` |
 | 6 | `left_stick() const` | `Stick` | Eixos `X`/`Y` |
 | 7 | `right_stick() const` | `Stick` | Eixos `Z`/`RZ` |
 | 8 | `left_trigger() const` | `float` | Eixo `LTRIGGER` |
@@ -444,9 +470,9 @@ Todos os métodos públicos de `InputHelpers` (o construtor é privado):
 | 14 | `button_start() const` | `bool` | `is_down(AKEYCODE_BUTTON_START)` |
 | 15 | `mouse_x() const` | `float` | X do ponteiro 0 do último motion de mouse |
 | 16 | `mouse_y() const` | `float` | Y do ponteiro 0 do último motion de mouse |
-| 17 | `mouse_down(MouseButton button) const` | `bool` | Testa o bit do botão no estado do evento |
-| 18 | `scroll_x() const` | `float` | Offset X pendente (não consome) |
-| 19 | `scroll_y() const` | `float` | Offset Y pendente (não consome) |
+| 17 | `mouse_down(MouseButton button) const` | `bool` | Testa `AMOTION_EVENT_BUTTON_*` no estado do evento |
+| 18 | `scroll_x() const` | `float` | Soma dos offsets X pendentes (não consome) |
+| 19 | `scroll_y() const` | `float` | Soma dos offsets Y pendentes (não consome) |
 | 20 | `consume_scroll(float& x, float& y)` | `void` | Copia para `x`/`y` e zera `scroll_x_`/`scroll_y_` |
 | 21 | `reset()` | `void` | Limpa o estado conforme a tabela da [§7](#7-reset-e-consume_scroll) |
 
@@ -577,22 +603,26 @@ vem limitado a `0.25f` após um retorno do background.
 
 ### 10.1 `gamepad_connected()` só vira `true`
 
-O `on_event()` faz `gamepad_connected_ = true` e nunca escreve `false`. Se o
-controle é desligado, o helper continua reportando `true` até você chamar
-`reset()`. Não existe callback de "desconectou" neste helper.
+O `on_event()` marca `gamepad_connected_ = true` via `mark_gamepad_source()` em
+eventos **key e motion** e nunca escreve `false`. Se o controle é desligado, o
+helper continua reportando `true` até você chamar `reset()`. Não existe callback
+de "desconectou" neste helper. Um key event de botão/DPAD já basta para ligar a
+flag, mesmo sem eixos no motion event.
 
 ### 10.2 `reset()` limpa o estado — e não é automático
 
-`reset()` zera teclas, posição e botões do mouse, scroll, `last_key`, sticks,
-triggers e `gamepad_connected_` (ver [§7](#7-reset-e-consume_scroll)).
-O `App` não chama `reset()` sozinho: faça isso explicitamente se precisar de
-um estado limpo.
+`reset()` zera teclas, **posição e botões do mouse**, scroll, `last_key`, sticks,
+triggers e `gamepad_connected_` (ver [§7](#7-reset-e-consume_scroll)). O `App`
+não chama `InputHelpers::reset()` sozinho: o `reset_input()` dele limpa apenas
+`keys_down_`/`touches_down_`/`last_touches_` em `TERM_WINDOW`/`PAUSE`/`DESTROY`.
+Faça a limpeza do helper explicitamente se precisar de um estado limpo.
 
 ### 10.3 Scroll é pendente até `consume_scroll()`
 
-`scroll_x()`/`scroll_y()` apenas leem; não zeram. Um novo `ACTION_SCROLL`
-substitui os offsets anteriores. Se você usar `scroll_x()` direto sem
-`consume_scroll()`, o mesmo delta aparece em vários frames. Use
+`scroll_x()`/`scroll_y()` apenas leem; não zeram. Cada `ACTION_SCROLL` **soma**
+(`+=`) os offsets ao acumulado, então vários eventos no mesmo frame se juntam.
+Se você usar `scroll_x()` direto sem `consume_scroll()`, o mesmo acumulado
+aparece em vários frames (e cresce com novos eventos). Use
 `consume_scroll(sx, sy)` uma vez por frame (ou `reset()`).
 
 ### 10.4 Eventos de teclado do sistema NÃO são consumidos pelo `App`
@@ -636,9 +666,11 @@ como no exemplo da [§9](#9-exemplo-completo-quadrado-que-segue-o-stick).
 ### 10.7 Botões de gamepad são keycodes, não bits de motion
 
 `button_a()`/`button_b()`/`button_x()`/`button_y()`/`button_start()` usam
-`is_down(AKEYCODE_BUTTON_*)`. Se um dispositivo/reportar botões apenas no
-`button state` de um motion event, o helper **não** os verá como botões (o
-`mouse_buttons_` só é preenchido para source de mouse). Na prática, gamepads
+`is_down(AKEYCODE_BUTTON_*)`: os botões do gamepad chegam como **key events** e,
+além de preencher `keys_`, esse ramo também liga `gamepad_connected_`. O bitmask
+`AMOTION_EVENT_BUTTON_*` lido de motion events é **só do mouse**
+(`mouse_down()`); se um dispositivo reportar botões de gamepad apenas nesse
+bitmask, o helper não os verá como botões de gamepad. Na prática, gamepads
 Android enviam `AKEYCODE_BUTTON_*` como eventos de teclado.
 
 ### 10.8 `last_key()` não é "tecla pressionada"
@@ -674,11 +706,12 @@ bool clique = in.mouse_down(nativeapp::MouseButton::Left);
 float sx, sy;
 in.consume_scroll(sx, sy);  // zera o acumulado
 
-// Estado limpo (exceto mouse_x_/mouse_y_)
+// Estado limpo (inclusive mouse_x_/mouse_y_)
 in.reset();
 ```
 
 **Frases-chave para lembrar:** o `App` alimenta o helper
-(`on_event()` é a primeira linha de `on_input()`); `gamepad_connected` só liga;
-`reset()` limpa; scroll precisa ser consumido; teclado do sistema não é
-consumido; hover não vira toque; analógico vem cru.
+(`on_event()` é a primeira linha de `on_input()`); `gamepad_connected` só liga
+(key ou motion de gamepad); `reset()` limpa tudo; scroll soma deltas até ser
+consumido; teclado do sistema não é consumido; hover não vira toque; analógico
+vem cru; botões de mouse usam `AMOTION_EVENT_BUTTON_*`.

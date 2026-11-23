@@ -1,5 +1,40 @@
 # Changelog
 
+## [2.0.2] - 2026-11-23 — Auditoria completa (6 equipes paralelas)
+
+Seis equipes independentes auditaram e corrigiram todo o código-fonte em
+escopos exclusivos: build pipeline, CLI/setup, device/manifest, headers core,
+gráficos e subsistemas. Documentação sincronizada com o código resultante.
+
+### Correções de maior impacto
+- **Build**: `-q` agora é realmente silencioso (captura stdout/stderr de todos
+  os subprocessos), lock de build contra corrida, detecção de features ignora
+  comentários/strings, `--output`/`--build-dir` não podem apagar o projeto,
+  `_version_sort_key` ordena `r30 > r9` e `android-36 > android-9`, host-tag
+  não escolhe mais toolchain darwin por acidente
+- **CLI/setup**: exceções tratadas sem traceback, ABIs/inteiros validados no
+  wizard, templates SDL2/SDL3 corrigidos, `setup-sdk` com normalização de
+  versões, licenças, rollback com backup e NDK dir derivado da release
+- **Gráficos**: `GLContext` idempotente/transacional, geração de contexto
+  evita reutilizar nomes GL de contexto morto, `draw_text()` com VBO
+  persistente (antes alocava por frame), pipeline Vulkan transacional com
+  dynamic viewport, deadlock de fence corrigido, `GpuBuffer` Checado
+- **Áudio/mídia**: `set_volume()` efetivo, resample mono/22050→44100/estéreo,
+  `Codecs` com `unique_ptr`/overflow guards, `Music` thread-safe com
+  resample clientside e loop iterativo
+- **Ciclo de vida**: `finish()` idempotente, reset de input em
+  TERM_WINDOW/PAUSE/DESTROY, multi-toque POINTER_UP/CANCEL correto,
+  guards de NaN/inf em matrizes, `AAsset` com leitura em laço
+- **Raylib local**: `vendor/raylib/include/raylib.h` e a `.a` arm64 estavam
+  corrompidos por builds concorrentes — restaurados
+
+### Validação
+- 13 exemplos compilam
+- 6 apps rodando no dispositivo (GL, Vulkan, permissões, teclado, device,
+  media) com 0 crash
+- 124 links de docs verificados, nenhum quebrado
+- CI verde
+
 ## [2.0.1] - 2026-11-23 — Correção de renderização de texto
 
 ### Corrigido

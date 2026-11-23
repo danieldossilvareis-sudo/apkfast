@@ -7,6 +7,7 @@ cannot be executed. Every candidate is probed before being selected.
 from __future__ import annotations
 
 import os
+import platform
 import shutil
 import subprocess
 import re
@@ -24,12 +25,8 @@ ABI_TRIPLES: dict[str, str] = {
     "x86_64": "x86_64-linux-android",
 }
 
-ABI_CLANG_PREFIX: dict[str, str] = {
-    "arm64-v8a": "aarch64-linux-android",
-    "armeabi-v7a": "armv7a-linux-androideabi",
-    "x86": "i686-linux-android",
-    "x86_64": "x86_64-linux-android",
-}
+# Mesmo valor de ABI_TRIPLES: manter um único dict evita divergência futura.
+ABI_CLANG_PREFIX: dict[str, str] = ABI_TRIPLES
 
 NDK_ARCH_DIR: dict[str, str] = {
     "arm64-v8a": "arm64-v8a",
@@ -57,7 +54,8 @@ def _runnable(path: Path) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     # Most tools exit non-zero with no args, but that still means they ran.
-    return True
+    # Um sinal (returncode negativo) indica binário incompatível/crash.
+    return result.returncode >= 0
 
 
 def _first_runnable(candidates: Iterable[Path]) -> Path | None:
@@ -68,11 +66,13 @@ def _first_runnable(candidates: Iterable[Path]) -> Path | None:
 
 
 def _version_sort_key(name: str) -> tuple[int, ...]:
-    parts = []
-    for piece in name.split("."):
-        match = re.search(r"(\d+)$", piece)
-        parts.append(int(match.group(1)) if match else 0)
-    return tuple(parts)
+    """Comparação numérica: android-36 > android-9 e r30 > r9/r30c.
+
+    Também lida com nomes como 'android-ndk-25.2.9519653'. O padding evita
+    que um prefixo curto (36,) seja considerado menor que (36, 0, 0).
+    """
+    numbers = [int(piece) for piece in re.findall(r"\d+", name)][:8]
+    return tuple(numbers) + (0,) * (8 - len(numbers))
 
 
 @dataclass(frozen=True)
@@ -138,6 +138,8 @@ class Toolchain:
         Procura em <triple>/<name> e em <triple>/<api>/<name> (stubs de API,
         como libvulkan.so no NDK r30).
         """
+        if abi not in ABI_TRIPLES:
+            raise RuntimeError(f"ABI não suportada: {abi}")
         base = self.sysroot / "usr" / "lib" / ABI_TRIPLES[abi]
         candidates = [base / name]
         candidates += [base / str(api) / name for api in range(self.api, 20, -1)]
@@ -161,22 +163,39 @@ class Toolchain:
 
 
 def _host_tag(ndk_dir: Path) -> str:
-    uname = os.uname().machine
+    prebuilt = ndk_dir / "toolchains" / "llvm" / "prebuilt"
+    if not prebuilt.is_dir():
+        raise RuntimeError(f"NDK prebuilt toolchain não encontrado em {prebuilt}")
+
+    uname = getattr(os, "uname", None)
+    machine = (uname().machine if uname else platform.machine()).lower()
     mapping = {
         "aarch64": "linux-arm64",
         "arm64": "linux-arm64",
+        "armv8l": "linux-arm64",
         "x86_64": "linux-x86_64",
+        "amd64": "linux-x86_64",
         "i686": "linux-x86",
+        "x86": "linux-x86",
     }
-    tag = mapping.get(uname)
-    if tag and (ndk_dir / "toolchains" / "llvm" / "prebuilt" / tag).is_dir():
-        return tag
-    prebuilt = ndk_dir / "toolchains" / "llvm" / "prebuilt"
-    if prebuilt.is_dir():
-        found = sorted(p for p in prebuilt.iterdir() if p.is_dir())
-        if found:
-            return found[0].name
-    raise RuntimeError(f"NDK prebuilt toolchain não encontrado em {prebuilt}")
+    # Ordem explícita: um sorted() alphabetical escolheria darwin-* antes de
+    # linux-* em NDKs multiplataforma.
+    preferred = [mapping.get(machine), "linux-arm64", "linux-x86_64", "linux-x86"]
+    candidates: list[str] = []
+    for tag in preferred:
+        if tag and tag not in candidates and (prebuilt / tag).is_dir():
+            candidates.append(tag)
+    candidates += sorted(
+        p.name for p in prebuilt.iterdir()
+        if p.is_dir() and p.name not in candidates
+    )
+    for tag in candidates:
+        if _executable(prebuilt / tag / "bin" / "clang"):
+            return tag
+    raise RuntimeError(
+        f"NDK prebuilt com bin/clang executável não encontrado em {prebuilt}; "
+        f"candidatos: {', '.join(candidates) or 'nenhum'}"
+    )
 
 
 def _find_android_root() -> Path:
@@ -205,9 +224,11 @@ def _find_ndk(android_root: Path, explicit: str | None) -> Path:
         if not path.is_dir():
             raise RuntimeError(f"NDK não encontrado: {path}")
         return path
+    if not android_root.is_dir():
+        raise RuntimeError(f"Diretório Android não encontrado: {android_root}")
     candidates = sorted(
         (p for p in android_root.iterdir() if p.name.startswith("android-ndk") and p.is_dir()),
-        key=lambda p: p.name,
+        key=lambda p: (_version_sort_key(p.name), p.name),
         reverse=True,
     )
     if candidates:
@@ -222,17 +243,35 @@ def _find_build_tools(sdk_dir: Path, explicit: str | None) -> Path:
         if not path.is_dir():
             raise RuntimeError(f"build-tools não encontrado: {path}")
         return path
+    if not base.is_dir():
+        raise RuntimeError(f"Diretório build-tools não encontrado: {base}")
+    required = ("aapt2", "zipalign", "apksigner")
     candidates = sorted(
         (p for p in base.iterdir() if p.is_dir()),
-        key=lambda p: _version_sort_key(p.name),
+        key=lambda p: (_version_sort_key(p.name), p.name),
         reverse=True,
     )
+    scored: list[tuple[int, Path]] = []
     for path in candidates:
-        if all(_runnable(path / tool) for tool in ("aapt2", "zipalign", "apksigner")):
+        working = sum(_runnable(path / tool) for tool in required)
+        if working == len(required):
             return path
-    if candidates:
-        return candidates[0]
-    raise RuntimeError(f"Nenhum build-tools instalado em {base}")
+        scored.append((working, path))
+    if not candidates:
+        raise RuntimeError(f"Nenhum build-tools instalado em {base}")
+    # Nenhum diretório é totalmente executável (comum em Termux: binários
+    # x86_64 no SDK). Mantém o fallback via PATH, mas escolhe o diretório com
+    # mais ferramentas utilizáveis em vez de simplesmente o mais novo.
+    best_count, best = max(
+        scored, key=lambda item: (item[0], _version_sort_key(item[1].name))
+    )
+    if best_count == 0 and not any(shutil.which(tool) for tool in required):
+        raise RuntimeError(
+            f"build-tools sem ferramentas executáveis em {base}: "
+            f"{', '.join(p.name for p in candidates)} "
+            "(verifique a arquitetura dos binários ou instale aapt2/zipalign/apksigner no PATH)"
+        )
+    return best
 
 
 def _find_platform(sdk_dir: Path, api: int) -> Path:
@@ -245,9 +284,11 @@ def _find_platform(sdk_dir: Path, api: int) -> Path:
         if (path / "android.jar").is_file():
             return path
     # Fall back to highest API available with an android.jar.
+    if not base.is_dir():
+        raise RuntimeError(f"Diretório platforms não encontrado: {base}")
     available = sorted(
         (p for p in base.iterdir() if p.is_dir() and (p / "android.jar").is_file()),
-        key=lambda p: _version_sort_key(p.name),
+        key=lambda p: (_version_sort_key(p.name), p.name),
         reverse=True,
     )
     if available:
@@ -256,7 +297,10 @@ def _find_platform(sdk_dir: Path, api: int) -> Path:
 
 
 def _find_tool(name: str, extra: Iterable[Path] = ()) -> Path:
-    candidates = list(extra) + [Path(p) for p in (shutil.which(name) or "").split() if p]
+    candidates = list(extra)
+    found = shutil.which(name)
+    if found:
+        candidates.append(Path(found))
     path = _first_runnable(candidates)
     if path is None:
         raise RuntimeError(f"Ferramenta executável não encontrada: {name}")
@@ -275,6 +319,8 @@ def detect(
         raise RuntimeError(
             f"ABI não suportada: {abi}. Use uma de: {', '.join(ABI_TRIPLES)}"
         )
+    if not isinstance(api, int) or api <= 0:
+        raise RuntimeError(f"API Android inválida: {api!r}")
     android_root = _find_android_root()
     sdk = _find_sdk(android_root, sdk_dir)
     ndk = _find_ndk(android_root, ndk_dir)

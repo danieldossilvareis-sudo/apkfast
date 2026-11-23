@@ -35,8 +35,9 @@
 
 `nativeapp::Audio` é um helper **pequeno e direto**: ele inicializa um backend de
 saída, lê um arquivo **WAV PCM 16-bit** de `assets/` e envia as amostras para o
-dispositivo uma vez. Não há motor de áudio, mixer, fila de eventos nem decodificação
-de formatos comprimidos.
+dispositivo uma vez. Não há motor de áudio, mixer nem fila de eventos. A
+decodificação de formatos comprimidos vive em `Audio::load()` (`codecs.hpp`,
+§8) — `load_wav()` continua sendo só PCM.
 
 ```
                        ┌──────────────────────────────────────┐
@@ -68,6 +69,10 @@ Pontos importantes já de partida:
 - A escolha do backend é **compile-time** (`#if __ANDROID_API__ >= 26`), com uma
   tentativa de AAudio em runtime apenas quando esse bloco foi compilado.
 - `play()` reproduz **um buffer por chamada**, sem loop e sem callback de fim.
+- O ganho final de cada reprodução é
+  `clamp01(volume passado a play()) × clamp01(volume() guardado)`:
+  **`set_volume()` tem efeito real** no código dos dois backends (na prática,
+  apenas no caminho AAudio, que é o que toca — §6.3 e §7).
 - O comentário de abertura do header menciona "controle de volume/loop", mas
   **não existe nenhuma API de loop** no código (§11).
 
@@ -145,7 +150,7 @@ Inclua o helper com o header agregador ou direto:
 
 ## 3. `AudioBuffer`: o dado que você toca
 
-Definição literal (`audio.hpp:22-28`):
+Definição literal (`audio.hpp:24-30`):
 
 ```cpp
 struct AudioBuffer {
@@ -160,9 +165,9 @@ struct AudioBuffer {
 | Campo | Tipo | Default | Significado no código |
 |---|---|---|---|
 | `samples` | `std::vector<int16_t>` | vazio | Amostras PCM 16-bit **interleaved** (L, R, L, R…) quando `channels == 2` |
-| `sample_rate` | `int32_t` | `44100` | Taxa em Hz. Usada no formato OpenSLES (`sample_rate * 1000`, miliHz). **Ignorada no AAudio**, que usa 44100 fixo |
-| `channels` | `int` | `1` | `1` = mono, `2` = estéreo. Usado para calcular frames e máscara de speakers |
-| `empty()` | `bool` | — | Retorna `samples.empty()`; é a única validação feita por `play()` |
+| `sample_rate` | `int32_t` | `44100` | Taxa em Hz. Usada no formato OpenSLES (`sample_rate * 1000`, miliHz) e como **origem do resample no AAudio** (`sample_rate → 44100`) |
+| `channels` | `int` | `1` | `1` = mono, `2` = estéreo. Usado para calcular frames, duplicar mono em L/R e montar a máscara de speakers |
+| `empty()` | `bool` | — | Retorna `samples.empty()`; faz parte da validação de `play()` (§6) |
 
 Montando um buffer manualmente:
 
@@ -173,9 +178,10 @@ buf.channels = 1;       // use 1 ou 2
 buf.samples.assign(4410, 0);  // 0,1 s de silêncio
 ```
 
-> `AudioBuffer` **não valida** nada por conta própria. `channels == 0` com
-> amostras causa divisão por zero em `play_aaudio()`; `load_wav()` garante 1–2,
-> mas um buffer construído à mão, não.
+> `AudioBuffer` **não valida** nada por conta própria, mas `play()` valida o
+> buffer antes de despachar (canais 1–2, `sample_rate > 0` e número de amostras
+> múltiplo de `channels`). Um buffer inválido é silenciosamente ignorado;
+> `load_wav()` já garante 1–2 canais.
 
 ---
 
@@ -193,7 +199,7 @@ static Audio& instance() {
 Há uma única instância por processo. O construtor é privado; o destrutor chama
 `destroy()` (§7).
 
-### Fluxo de `init()` (`audio.hpp:40-49`)
+### Fluxo de `init()` (`audio.hpp:41-51`)
 
 ```cpp
 bool init() {
@@ -228,19 +234,29 @@ bool init() {
 | `AAudioStreamBuilder_setSampleRate` | `44100` |
 | `AAudioStreamBuilder_openStream` | guarda em `aaudio_stream_` |
 
-O builder é sempre apagado com `AAudioStreamBuilder_delete()`. A função retorna
-`true` apenas se `openStream() == AAUDIO_OK` **e** o stream não for nulo.
-São valores *solicitados* — o código **não chama** `AAudioStream_getSampleRate()`
-nem `getChannelCount()` para confirmar o que o dispositivo negociou.
+O builder é sempre apagado com `AAudioStreamBuilder_delete()`. A função verifica
+**todos os retornos**: `AAudio_createStreamBuilder()` precisa devolver
+`AAUDIO_OK` **e** um builder não nulo, e `openStream()` precisa devolver
+`AAUDIO_OK` **e** um stream não nulo (se o stream existir apesar do erro, ele é
+fechado). São valores *solicitados* — o código **não chama**
+`AAudioStream_getSampleRate()` nem `getChannelCount()` para confirmar o que o
+dispositivo negociou (§11).
 
 ### Configuração do OpenSLES (`init_opensles`)
 
-1. `slCreateEngine()` — único retorno verificado;
+Cada etapa verifica o retorno e, em caso de falha, chama `destroy_opensles()` e
+devolve `false`:
+
+1. `slCreateEngine()`;
 2. `Realize()` no engine;
-3. `GetInterface(SL_IID_ENGINE)`;
-4. `CreateOutputMix()` pedindo `SL_IID_PLAY`;
+3. `GetInterface(SL_IID_ENGINE)` (com checagem de ponteiro);
+4. `CreateOutputMix()` pedindo `SL_IID_PLAY` (com checagem de ponteiro);
 5. `Realize()` no output mix;
 6. retorna `true`.
+
+Assim, **`init()` verifica erros nos dois backends**: uma falha parcial não
+deixa objetos OpenSLES órfãos e `initialized_` só vira `true` quando o backend
+está realmente pronto. A única falha ainda sem log é a do OpenSLES (§12.4).
 
 **O player não é criado aqui**: `sles_player_` continua nulo até
 `play_opensles()` — o que tem uma consequência importante (§6.2 e §11).
@@ -288,7 +304,7 @@ O loop aceita chunks em qualquer ordem (`data` antes de `fmt ` funciona).
 Chunks desconhecidos são ignorados. Se houver mais de um `data`, o **último**
 sobrescreve os anteriores. O campo de tamanho do RIFF (offset 4) não é validado.
 
-### Validação final (`audio.hpp:89-97`)
+### Validação final (`audio.hpp:91-95`)
 
 | Condição | Motivo |
 |---|---|
@@ -337,7 +353,15 @@ if (!nativeapp::Audio::instance().load_wav("efeito.wav", efeito)) {
 void play(const AudioBuffer& buffer, float volume = 1.0f);
 ```
 
-`play()` começa com `if (buffer.empty()) return;` e depois despacha:
+`play()` valida o buffer e depois despacha:
+
+```cpp
+if (buffer.empty() || buffer.channels < 1 || buffer.channels > 2 ||
+    buffer.sample_rate <= 0 ||
+    buffer.samples.size() % static_cast<size_t>(buffer.channels) != 0) {
+    return;
+}
+```
 
 | Estado | Ação |
 |---|---|
@@ -345,23 +369,38 @@ void play(const AudioBuffer& buffer, float volume = 1.0f);
 | senão, `sles_player_ != nullptr` | `play_opensles(buffer, volume)` |
 | senão (init não chamado / falhou) | **nada** (silencioso) |
 
+O ganho aplicado pelos dois backends vem de
+`gain_for(volume) = clamp01(requested) * clamp01(volume_)`, com clamp também em
+`scale_sample()` (`-32768..32767`). Portanto `play(buf, 2.0f)` não estoura
+`int16_t` e `set_volume()` participa do resultado (§6.3).
+
 ### 6.1 Caminho AAudio (`play_aaudio`)
 
 ```
 frames = buffer.samples.size() / buffer.channels
+step   = double(buffer.sample_rate) / 44100.0
+out_frames = ceil(frames / step)
 ```
 
-| `buffer.channels` | O que acontece |
-|---|---|
-| `2` | Copia `samples` para `output`; se `volume < 1.0f`, multiplica cada amostra por `volume` |
-| `1` | Aloca `frames * 2`; para cada frame, `s = int16_t(sample * volume)` e grava `s` em L **e** R (mono duplicado) |
-| outro | Divisão por `channels` (0 → divisão por zero); `load_wav` nunca produz isso |
+O stream é fixo em **44100 Hz / 2 canais / PCM_I16**, mas o buffer de origem não
+precisa mais ter essa taxa: o código faz **resample linear** de
+`buffer.sample_rate` para 44100 e converte mono para estéreo no mesmo laço.
 
-Depois: `AAudioStream_requestStart()` (retorno ignorado) e um laço de
+| Aspecto | O que acontece |
+|---|---|
+| `buffer.channels == 1` | Cada amostra de origem é lida uma vez (`src_ch = 0`) e gravada em L **e** R |
+| `buffer.channels == 2` | Cada canal lê a sua própria amostra (`src_ch = ch`) |
+| Amostragem | `position = i * step`; `idx = floor(position)`, `next = idx+1` (ou `idx` no último frame), `t = position - idx`; interpola `a + (b-a)*t` |
+| Exemplo | WAV **22050 Hz mono** → 44100 Hz estéreo (cada amostra vira duas, com interpolação) |
+| Ganho | `scale_sample(valor, gain_for(volume))` em cada amostra de saída |
+| Proteções | `out_frames > 0` e `<= SIZE_MAX/2`; `idx` é limitado a `frames-1` |
+
+Depois: `AAudioStream_requestStart()` aceita `AAUDIO_OK` **ou**
+`AAUDIO_ERROR_INVALID_STATE` (qualquer outro erro aborta a escrita) e um laço de
 `AAudioStream_write(stream, frame, remaining, 1000000000LL)` — **1 segundo de
 timeout em nanossegundos por chamada**. O ponteiro avança `written * 2`
-int16-t por frame escrito; `written <= 0` encerra o laço. Erros de escrita não
-são relatados.
+int16-t por frame escrito; `written <= 0` encerra o laço. Escritas parciais são
+completadas pelo laço; erros de escrita não são relatados.
 
 É uma escrita **bloqueante na thread chamadora**: não há callback, não há fila
 assíncrona (§11).
@@ -378,36 +417,35 @@ Configuração montada por chamada:
 | Sink locator | `SLDataLocator_OutputMix{SL_DATALOCATOR_OUTPUTMIX, sles_output_mix_}` — uma **struct**, não ponteiro do objeto (comentário explícito no código) |
 | Interfaces pedidas | `SL_IID_PLAY`, `SL_IID_BUFFERQUEUE`, `SL_IID_VOLUME` |
 
-Fluxo: destrói player anterior (se houver) → `CreateAudioPlayer()` (falha =
-retorno silencioso) → `Realize()` → pega `SLPlayItf` e
-`SLAndroidSimpleBufferQueueItf` → `Enqueue(samples.data(), size)` →
-`SetPlayState(SL_PLAYSTATE_PLAYING)`. Um único buffer por player; não há
-re-enqueue nem callback de fim.
+Fluxo: copia `samples` para `sles_samples_` (mantido vivo até o player
+terminar) → se `gain < 1.0f`, escala cada amostra dessa cópia com
+`scale_sample(sample, gain_for(volume))` → destrói player anterior (se houver) →
+`CreateAudioPlayer()` (falha = retorno silencioso) → `Realize()` → pega
+`SLPlayItf` e `SLAndroidSimpleBufferQueueItf` →
+`Enqueue(sles_samples_.data(), size)` → `SetPlayState(SL_PLAYSTATE_PLAYING)`. Um
+único buffer por player; não há re-enqueue nem callback de fim. O buffer original
+`buffer.samples` **não é alterado**.
 
-> **Duas armadilhas sérias aqui:**
->
-> 1. **`play()` nunca chega nesse código.** Ele só chama `play_opensles()` se
->    `sles_player_` já não for nulo, mas `sles_player_` só é atribuído **dentro**
->    de `play_opensles()`. Com o fallback OpenSLES, `play()` é um no-op
->    permanente. Isso está detalhado em §11.
-> 2. **Mesmo que fosse chamado, o volume é descartado:** a primeira linha é
->    `(void)volume;`. A interface `SL_IID_VOLUME` é solicitada, mas nunca obtida
->    nem usada (`SetVolumeLevel` não aparece no arquivo).
+> **Armadilha séria aqui:** **`play()` nunca chega nesse código.** Ele só chama
+> `play_opensles()` se `sles_player_` já não for nulo, mas `sles_player_` só é
+> atribuído **dentro** de `play_opensles()`. Com o fallback OpenSLES, `play()` é
+> um no-op permanente, mesmo com o ganho já implementado. Isso está detalhado em
+> §11. A interface `SL_IID_VOLUME` continua sendo solicitada mas nunca obtida —
+> o volume é aplicado por escala de amostras, não por `SetVolumeLevel`.
 
 ### 6.3 Resumo do volume (o que realmente acontece)
 
-| Entrada | AAudio | OpenSLES |
+| Entrada | AAudio | OpenSLES (se o caminho fosse alcançado) |
 |---|---|---|
-| `play(buf, v)` com `v < 1` | Escala amostras (`sample * v`) estéreo; mono sempre multiplica | Parâmetro ignorado `(void)volume` — e o caminho é inalcançável (§6.2) |
-| `play(buf, v)` com `v >= 1` | Sem clamp; `v > 1` pode estourar `int16_t`, `v < 0` inverte fase | Ignorado |
-| `set_volume(v)` | **Sem efeito**: `volume_` nunca é lido em `play_aaudio` | **Sem efeito**: `volume_` nunca é lido em `play_opensles` |
+| `play(buf, v)` | Ganho `clamp01(v) × clamp01(volume_)`, amostra limitada a `int16_t` | Mesmo ganho, aplicado a uma cópia de `samples` |
+| `set_volume(v)` | Afeta o ganho da **próxima** chamada de `play()` | Idem |
 | `volume()` | Devolve o valor clampado guardado em `volume_` | Idem |
+| `v` NaN / ∞ em `set_volume()` | `clamp01()` devolve `1.0f` (volume default) | Idem |
+| Som já em reprodução | Não é alterado: o ganho é calculado dentro de `play()` | Não é alterado |
 
-O comentário em `audio.hpp:110` diz "Define volume 0..1 (apenas OpenSLES;
-AAudio usa Ganho no buffer)". A implementação **não corresponde a esse
-comentário**: o ganho em buffer existe no AAudio, e o OpenSLES não aplica volume.
-Se precisar de volume hoje, escalas as amostras você mesmo ou use o parâmetro de
-`play()` no caminho AAudio.
+O ganho é **por reprodução**: chame `set_volume()` antes de `play()`. Como o
+caminho OpenSLES é inalcançável no código atual (§6.2), na prática o ajuste só
+surte efeito em builds com AAudio disponível.
 
 ---
 
@@ -415,19 +453,20 @@ Se precisar de volume hoje, escalas as amostras você mesmo ou use o parâmetro 
 
 | Método | Comportamento exato |
 |---|---|
-| `void set_volume(float volume)` | `volume_ = volume < 0 ? 0 : volume > 1 ? 1 : volume;` — apenas clamp e armazenamento |
+| `void set_volume(float volume)` | `volume_ = std::isfinite(volume) ? std::max(0, std::min(1, volume)) : 1.0f`; NaN/∞ voltam ao default `1.0f` |
 | `float volume() const` | Retorna `volume_` (default `1.0f`) |
 | `bool using_aaudio() const` | `aaudio_stream_ != nullptr` — **não** significa "API >= 26" |
-| `void destroy()` | AAudio: `requestStop` + `close` + zera ponteiro; OpenSLES: `Destroy` em player → output mix → engine; zera `initialized_`. O retorno de `requestStop` é ignorado |
+| `void destroy()` | **Idempotente**: sem stream/objetos, só zera `initialized_` e limpa `sles_samples_`. Caso contrário, AAudio: `requestStop` + `close` + zera ponteiro; OpenSLES: `Destroy` em player → output mix → engine, zera os ponteiros e a interface do engine. O retorno de `requestStop` é ignorado |
 | `~Audio()` | Chama `destroy()` automaticamente (destrutor do singleton) |
 
-Depois de `destroy()`, os ponteiros de stream/player/mix/engine ficam nulos e
+Depois de `destroy()`, os ponteiros de stream/player/mix/engine e
+`sles_engine_interface_` ficam nulos, `sles_samples_` é esvaziado e
 `initialized_` volta a `false`; para voltar a tocar, chame `init()` de novo.
-`destroy()` não zera `sles_engine_interface_`, mas ele é reatribuído em uma nova
-inicialização.
+Chamar `destroy()` duas vezes (ou pelo destrutor depois de uma chamada manual) é
+seguro: não há `Destroy` em ponteiro nulo.
 
-`set_volume()` não altera som já em reprodução — nenhum dos backends relê
-`volume_` durante `play()`.
+`set_volume()` multiplica o ganho da **próxima** chamada de `play()` em ambos os
+backends (§6.3); ele não altera som já em reprodução.
 
 ---
 
@@ -436,18 +475,19 @@ inicialização.
 | Método | Assinatura | Retorno / efeito | Observações |
 |---|---|---|---|
 | `instance` | `static Audio& instance()` | Singleton | Construtor privado; uma instância por processo |
-| `init` | `bool init()` | `true` se backend pronto | Idempotente; AAudio é compile-time; falha OpenSLES é silenciosa |
+| `init` | `bool init()` | `true` se backend pronto | Idempotente; AAudio é compile-time; checa erros nos dois backends (falha OpenSLES sem log) |
 | `load_wav` | `bool load_wav(const std::string&, AudioBuffer&) const` | Preenche `out` ou retorna `false` | PCM 16-bit, mono/estéreo, WAV inteiro em memória |
-| `play` | `void play(const AudioBuffer&, float volume = 1.0f)` | Toca uma vez | `empty()` → no-op; AAudio bloqueante; fallback OpenSLES inalcançável |
-| `set_volume` | `void set_volume(float)` | Clampa e guarda 0..1 | Não afeta a reprodução no código atual |
+| `load` | `bool load(const std::string&, AudioBuffer&) const` | Preenche `out` ou retorna `false` | Implementado em `codecs.hpp`; aceita `.wav`/`.ogg`/`.mp3` |
+| `play` | `void play(const AudioBuffer&, float volume = 1.0f)` | Toca uma vez | Valida buffer; AAudio faz resample para 44100/2ch e é bloqueante; fallback OpenSLES inalcançável |
+| `set_volume` | `void set_volume(float)` | Clampa e guarda 0..1 | **Multiplica o ganho** de `play()`; NaN/∞ ⇒ `1.0f` |
 | `volume` | `float volume() const` | Valor guardado | Default `1.0f` |
 | `using_aaudio` | `bool using_aaudio() const` | `aaudio_stream_ != nullptr` | `'false'` pode significar fallback **ou** init falhado |
-| `destroy` | `void destroy()` | Libera stream/objetos | Chamado também pelo destrutor |
+| `destroy` | `void destroy()` | Libera stream/objetos | Idempotente; chamado também pelo destrutor |
 | `~Audio` | `~Audio()` | Chama `destroy()` | — |
 
 Métodos que **não existem** (para evitar buscas frustradas): `pause`, `resume`,
 `stop`, `loop`, `is_playing`, `seek`, `play_asset`, `set_callback`, `mix`,
-`load_ogg`, `load_mp3`.
+`load_ogg`, `load_mp3`. Para OGG/MP3 use `load()` (§8).
 
 ---
 
@@ -480,6 +520,7 @@ private:
         const bool aaudio = Audio::instance().using_aaudio();
         LOGI("audio init=%d aaudio=%d", ok, aaudio);
         // (!) Com o fallback OpenSLES, play() é no-op nesta versão do código.
+        Audio::instance().set_volume(0.8f);  // ganho global da próxima play()
 
         // --- 1) Beep 440 Hz gerado em memória (0,15 s, mono) -------------
         beep_.sample_rate = 44100;
@@ -499,7 +540,7 @@ private:
         if (Audio::instance().load_wav("efeito.wav", effect_)) {
             LOGI("efeito.wav: %d Hz, %d canais, %zu amostras",
                  effect_.sample_rate, effect_.channels, effect_.samples.size());
-            // volume 0.5 só tem efeito prático no caminho AAudio.
+            // ganho final = 0.5 (play) * 0.8 (set_volume) = 0.4.
             Audio::instance().play(effect_, 0.5f);
         } else {
             LOGI("efeito.wav ausente ou invalido");
@@ -593,17 +634,16 @@ rejeita qualquer outro formato (inclusive `WAVE_FORMAT_EXTENSIBLE`, §11).
 | **Fallback OpenSLES não reproduz** | `play()` exige `sles_player_ != nullptr`, mas esse ponteiro só é preenchido dentro de `play_opensles()`. Caminho inalcançável: `init()` pode retornar `true` e `play()` continuar sem efeito |
 | **Sem streaming** | `Assets::read()` carrega o WAV inteiro em `std::vector<uint8_t>`; depois tudo vira `std::vector<int16_t>`. Sem `read` incremental, sem ring buffer, sem callback de underrun |
 | **Sem loop** | Apesar de "loop" no comentário do topo do header, `play()` toca um buffer uma vez e não há nenhum método de repetição |
-| **Sem OGG/MP3** | Só `audio_format == 1` (PCM). O comentário inicial cita OGG via `stb_vorbis` como "não incluído" |
+| **OGG/MP3 só em `load()`** | `load_wav()` exige `audio_format == 1` (PCM); `Audio::load()` em `codecs.hpp` faz a decodificação de `.ogg`/`.mp3` |
 | **Sem WAVE_FORMAT_EXTENSIBLE** | `0xFFFE` cai na validação `audio_format != 1` → `load_wav()` retorna `false` |
-| **AAudio com formato fixo** | PCM_I16, 44100 Hz, 2 canais sempre. Mono é duplicado em L/R. Valores negociados pelo stream não são consultados |
+| **AAudio com formato de saída fixo** | PCM_I16, 44100 Hz, 2 canais sempre. A entrada é resampleada linearmente para 44100 e mono é duplicado em L/R; valores negociados pelo stream não são consultados |
 | **Escrita bloqueante** | `AAudioStream_write(..., 1000000000LL)` com timeout de 1 s, em chamada síncrona; nenhum callback assíncrono |
-| **Volume praticamente inerte** | `play(v)` escala só no AAudio; `set_volume()`/ `volume()` apenas guardam um float; OpenSLES faz `(void)volume` |
-| **Sem clamp em `play(v)`** | `v > 1` pode estourar `int16_t`; `v < 0` inverte a fase. O clamp existe só em `set_volume()` |
-| **Falhas silenciosas** | `init_opensles()` verifica apenas `slCreateEngine()`; `Realize`, `GetInterface`, `CreateOutputMix`, `Enqueue`, `SetPlayState` e `requestStart` têm retorno ignorado. `init()` não loga falha OpenSLES |
+| **Ganho por reprodução** | `set_volume()` vale para a **próxima** `play()`; não existe controle de volume do stream em tempo real. `play()` no OpenSLES permanece inalcançável (§6.2) |
+| **Falhas ainda silenciosas** | `init_opensles()` e `init_aaudio()` agora verificam os retornos, mas `Enqueue`, `SetPlayState` e escritas AAudio com `written <= 0` apenas encerram/retornam sem log; `init()` não loga falha OpenSLES |
 | **Sem concorrência explícita** | Um único stream AAudio e um único player OpenSLES; nenhum mutex ou controle de múltiplas reproduções sobrepostas |
 | **Sem pause/stop/seek/fade/pan** | Só `destroy()` para o stream AAudio; o player OpenSLES é destruído na próxima chamada de `play_opensles()` |
 | **Parser WAV minimalista** | Não valida tamanho RIFF, não exige `fmt ` antes de `data`, aceita `fmt ` maior que 16 bytes (desde que `audio_format == 1`), ignora chunks extras e descarta byte ímpar de `data` |
-| **Sem validação de `AudioBuffer` manual** | `channels == 0` + amostras → divisão por zero no AAudio; tamanho ímpar gera frame incompleto |
+| **Buffer manual inválido é ignorado** | `play()` exige 1–2 canais, `sample_rate > 0` e `samples.size() % channels == 0`; um buffer fora disso vira no-op silencioso |
 
 ---
 
@@ -635,12 +675,14 @@ Assets::instance(app_->activity).set_activity(app_->activity);
 Chame `init()`, `load_wav()` e `play()` em `on_ready()` ou em handlers de
 evento/toque — não em `on_draw()` nem em `on_tick()` a cada frame.
 
-### 12.3 Volume em OpenSLES
+### 12.3 Volume: quando ele entra em vigor
 
-Não espere `set_volume()` funcionar: ele só clampa `volume_`, que nunca é lido
-pelos backends. No OpenSLES, o parâmetro de `play()` também é explicitamente
-descartado. Se precisar de atenuação, pré-escale `buffer.samples` (ou use
-`play(buf, v)` sabendo que isso vale apenas para AAudio).
+`set_volume()` clampa o valor em `volume_` e esse campo é lido por
+`gain_for()` dentro de `play_aaudio()` / `play_opensles()`. Ou seja:
+**ajuste antes de chamar `play()`**. O OpenSLES escala uma **cópia** de
+`samples`, mantendo o buffer original intacto; o AAudio escala a saída já
+resampleada. Como o fallback OpenSLES é inalcançável (§6.2), na prática o
+controle de volume depende do caminho AAudio.
 
 ### 12.4 Falha silenciosa de `init()` e log enganoso
 
@@ -673,7 +715,7 @@ recompile com `--api 21` (o builder então não passa `-laaudio`).
 | `load_wav()` sempre `false` | `AAssetManager` não injetado, caminho com prefixo `assets/`, ou WAV não-PCM/8-bit/24-bit/extensible |
 | `init()` `true`, mas nenhum som | Fallback OpenSLES: `play()` não chama `play_opensles()` (§6.2) |
 | Som some no device API 21–25 com build `--api >= 26` | Dependência `libaaudio.so` e/ou chamadas AAudio compiladas; não há `dlopen` opcional |
-| Volume não muda | `set_volume()` não é usado; OpenSLES ignora `volume` |
+| Volume não muda | Fallback OpenSLES (caminho inalcançável), `set_volume()` chamado **depois** de `play()`, ou valor NaN/∞ clampado para `1.0f` |
 | "Travada" a cada frame | `AAudioStream_write()` bloqueante chamado na thread de render |
 
 ---
@@ -687,17 +729,20 @@ App (on_ready)
        └─ senão/falha: OpenSLES engine+mix     → using_aaudio() == false
 
 Carregar:  load_wav("efeito.wav", buf)         → PCM16, 1–2 canais, RIFF/WAVE
-Tocar:     play(buf, v)                        → AAudio escala v; OpenSLES não toca
-Ajustar:   set_volume(v) / volume()            → só guarda/clampa (sem efeito sonoro)
-Limpar:    destroy() (ou destrutor)            → fecha stream / objetos OpenSLES
+           load("musica.ogg", buf)             → via codecs.hpp (WAV/OGG/MP3)
+Tocar:     play(buf, v)                        → AAudio: resample 44100/2ch + ganho
+                                                 OpenSLES: ganho, mas caminho inalcançável
+Ajustar:   set_volume(v) → volume()            → ganho global da próxima play()
+Limpar:    destroy() (ou destrutor)            → idempotente; fecha stream/objetos
 ```
 
 Checklist antes de culpar o dispositivo:
 
 1. `--api >= 26` se quiser AAudio; `-laaudio` é automático no builder.
-2. WAV em `<projeto>/assets/`, PCM 16-bit, 44100 Hz, 1 ou 2 canais.
+2. WAV em `<projeto>/assets/`, PCM 16-bit, qualquer taxa > 0 (AAudio resampleia
+   para 44100), 1 ou 2 canais.
 3. Caminho passado sem o prefixo `assets/`.
 4. `init()` chamado e retorno verificado; `play()` fora da thread de desenho.
-5. Lembre-se: nesta versão, **o fallback OpenSLES não reproduz** e
-   **`set_volume()` não altera o áudio** — limitações reais do código, não
-   configuração faltando.
+5. `set_volume()` **antes** de `play()`; valores NaN/∞ viram `1.0f`.
+6. Lembre-se: **o fallback OpenSLES não reproduz** nesta versão — limitação real
+   do código, não configuração faltando.

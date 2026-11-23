@@ -1,7 +1,7 @@
 // nativeapp/audio.hpp — Áudio: AAudio (API 26+) com fallback OpenSLES.
 //
 // Toca WAV PCM de assets/ com controle de volume/loop. Para música longa use
-// OGG via stb_vorbis (não incluído); WAV é suficiente para efeitos e protótipos.
+// OGG via stb_vorbis (implementado em codecs.hpp/music.hpp).
 
 #pragma once
 
@@ -13,6 +13,8 @@
 #include "assets.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -87,7 +89,8 @@ public:
         }
 
         if (audio_format != 1 || bits_per_sample != 16 || pcm.empty() ||
-            sample_rate == 0 || num_channels < 1 || num_channels > 2) {
+            sample_rate == 0 || sample_rate > 0x7fffffffu ||
+            num_channels < 1 || num_channels > 2) {
             return false;
         }
         out.sample_rate = static_cast<int32_t>(sample_rate);
@@ -102,31 +105,40 @@ public:
     /// circular — AudioBuffer já está definido aqui).
     bool load(const std::string& path, AudioBuffer& out) const;
 
-    /// Toca um buffer uma vez.
+    /// Toca um buffer uma vez. O ganho final é `volume` × set_volume().
     void play(const AudioBuffer& buffer, float volume = 1.0f) {
-        if (buffer.empty()) return;
+        if (buffer.empty() || buffer.channels < 1 || buffer.channels > 2 ||
+            buffer.sample_rate <= 0 ||
+            buffer.samples.size() % static_cast<size_t>(buffer.channels) != 0) {
+            return;
+        }
+#if __ANDROID_API__ >= 26
         if (aaudio_stream_) {
             play_aaudio(buffer, volume);
-        } else if (sles_player_) {
-            play_opensles(buffer, volume);
+            return;
         }
+#endif
+        if (sles_player_) play_opensles(buffer, volume);
     }
 
-    /// Define volume 0..1 (apenas OpenSLES; AAudio usa Ganho no buffer).
-    void set_volume(float volume) { volume_ = volume < 0 ? 0 : volume > 1 ? 1 : volume; }
+    /// Define volume global 0..1; multiplica o volume por chamada de play().
+    void set_volume(float volume) {
+        volume_ = std::isfinite(volume) ? std::max(0.0f, std::min(1.0f, volume)) : 1.0f;
+    }
     float volume() const { return volume_; }
 
     bool using_aaudio() const { return aaudio_stream_ != nullptr; }
 
     void destroy() {
+#if __ANDROID_API__ >= 26
         if (aaudio_stream_) {
             AAudioStream_requestStop(aaudio_stream_);
             AAudioStream_close(aaudio_stream_);
             aaudio_stream_ = nullptr;
         }
-        if (sles_player_) { (*sles_player_)->Destroy(sles_player_); sles_player_ = nullptr; }
-        if (sles_output_mix_) { (*sles_output_mix_)->Destroy(sles_output_mix_); sles_output_mix_ = nullptr; }
-        if (sles_engine_) { (*sles_engine_)->Destroy(sles_engine_); sles_engine_ = nullptr; }
+#endif
+        destroy_opensles();
+        sles_samples_.clear();
         initialized_ = false;
     }
 
@@ -136,6 +148,21 @@ private:
     static uint16_t le16(const uint8_t* p) { return p[0] | (p[1] << 8); }
     static uint32_t le32(const uint8_t* p) {
         return p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
+    }
+
+    static float clamp01(float v) {
+        return std::isfinite(v) ? std::max(0.0f, std::min(1.0f, v)) : 1.0f;
+    }
+
+    float gain_for(float requested) const {
+        return clamp01(requested) * clamp01(volume_);
+    }
+
+    static int16_t scale_sample(int32_t sample, float gain) {
+        const float value = static_cast<float>(sample) * gain;
+        if (value >= 32767.0f) return 32767;
+        if (value <= -32768.0f) return -32768;
+        return static_cast<int16_t>(value);
     }
 
 #if __ANDROID_API__ >= 26
@@ -148,63 +175,115 @@ private:
         AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_I16);
         AAudioStreamBuilder_setChannelCount(builder, 2);
         AAudioStreamBuilder_setSampleRate(builder, 44100);
-        const aaudio_result_t result = AAudioStreamBuilder_openStream(builder, &aaudio_stream_);
+        AAudioStream* stream = nullptr;
+        const aaudio_result_t result = AAudioStreamBuilder_openStream(builder, &stream);
         AAudioStreamBuilder_delete(builder);
-        return result == AAUDIO_OK && aaudio_stream_ != nullptr;
+        if (result != AAUDIO_OK || !stream) {
+            if (stream) AAudioStream_close(stream);
+            aaudio_stream_ = nullptr;
+            return false;
+        }
+        aaudio_stream_ = stream;
+        return true;
     }
 
     void play_aaudio(const AudioBuffer& buffer, float volume) {
-        const int frames = static_cast<int>(buffer.samples.size() / buffer.channels);
-        // Converte mono -> estéreo se necessário (enviamos 2 canais no stream).
-        std::vector<int16_t> output;
-        if (buffer.channels == 2) {
-            output = buffer.samples;
-            if (volume < 1.0f) {
-                for (auto& sample : output) {
-                    sample = static_cast<int16_t>(sample * volume);
-                }
-            }
-        } else {
-            output.resize(frames * 2);
-            for (int i = 0; i < frames; ++i) {
-                const int16_t s = static_cast<int16_t>(buffer.samples[i] * volume);
-                output[i * 2] = s;
-                output[i * 2 + 1] = s;
+        const size_t channels = static_cast<size_t>(buffer.channels);
+        const size_t frames = buffer.samples.size() / channels;
+        if (frames == 0) return;
+
+        const float gain = gain_for(volume);
+        // O stream é fixo em 44100 Hz / 2 canais: interpola e converte
+        // mono -> estéreo (antes o WAV tocava desafinado se não fosse 44.1k).
+        const double step = static_cast<double>(buffer.sample_rate) / 44100.0;
+        const double out_frames_d = std::ceil(static_cast<double>(frames) / step);
+        if (out_frames_d <= 0.0 || out_frames_d > static_cast<double>(SIZE_MAX / 2)) return;
+        const size_t out_frames = static_cast<size_t>(out_frames_d);
+
+        std::vector<int16_t> output(out_frames * 2);
+        for (size_t i = 0; i < out_frames; ++i) {
+            const double position = static_cast<double>(i) * step;
+            size_t idx = static_cast<size_t>(position);
+            if (idx >= frames) idx = frames - 1;
+            const size_t next = idx + 1 < frames ? idx + 1 : idx;
+            const float t = static_cast<float>(position - static_cast<double>(idx));
+            for (size_t ch = 0; ch < 2; ++ch) {
+                const size_t src_ch = channels == 1 ? 0 : ch;
+                const int32_t a = buffer.samples[idx * channels + src_ch];
+                const int32_t b = buffer.samples[next * channels + src_ch];
+                const int32_t value = static_cast<int32_t>(a + (b - a) * t);
+                output[i * 2 + ch] = scale_sample(value, gain);
             }
         }
-        AAudioStream_requestStart(aaudio_stream_);
-        int16_t* frame = output.data();
-        int remaining = static_cast<int>(output.size() / 2);
+
+        const aaudio_result_t started = AAudioStream_requestStart(aaudio_stream_);
+        if (started != AAUDIO_OK && started != AAUDIO_ERROR_INVALID_STATE) return;
+        const int16_t* frame = output.data();
+        size_t remaining = output.size() / 2;
         while (remaining > 0) {
             const aaudio_result_t written = AAudioStream_write(
-                aaudio_stream_, frame, remaining, 1000000000LL);
+                aaudio_stream_, frame, static_cast<int32_t>(remaining), 1000000000LL);
             if (written <= 0) break;
-            frame += written * 2;
-            remaining -= static_cast<int>(written);
+            frame += static_cast<size_t>(written) * 2;
+            remaining -= static_cast<size_t>(written);
         }
     }
 #endif
 
     bool init_opensles() {
-        if (SL_RESULT_SUCCESS != slCreateEngine(&sles_engine_, 0, nullptr, 0, nullptr, nullptr)) return false;
-        (*sles_engine_)->Realize(sles_engine_, SL_BOOLEAN_FALSE);
-        (*sles_engine_)->GetInterface(sles_engine_, SL_IID_ENGINE, &sles_engine_interface_);
+        if (slCreateEngine(&sles_engine_, 0, nullptr, 0, nullptr, nullptr) != SL_RESULT_SUCCESS ||
+            !sles_engine_) {
+            destroy_opensles();
+            return false;
+        }
+        if ((*sles_engine_)->Realize(sles_engine_, SL_BOOLEAN_FALSE) != SL_RESULT_SUCCESS ||
+            (*sles_engine_)->GetInterface(sles_engine_, SL_IID_ENGINE, &sles_engine_interface_)
+                != SL_RESULT_SUCCESS || !sles_engine_interface_) {
+            destroy_opensles();
+            return false;
+        }
 
         const SLInterfaceID ids[] = {SL_IID_PLAY};
         const SLboolean req[] = {SL_BOOLEAN_TRUE};
-        (*sles_engine_interface_)->CreateOutputMix(
-            sles_engine_interface_, &sles_output_mix_, 1, ids, req);
-        (*sles_output_mix_)->Realize(sles_output_mix_, SL_BOOLEAN_FALSE);
+        if ((*sles_engine_interface_)->CreateOutputMix(
+                sles_engine_interface_, &sles_output_mix_, 1, ids, req)
+                != SL_RESULT_SUCCESS || !sles_output_mix_) {
+            destroy_opensles();
+            return false;
+        }
+        if ((*sles_output_mix_)->Realize(sles_output_mix_, SL_BOOLEAN_FALSE)
+                != SL_RESULT_SUCCESS) {
+            destroy_opensles();
+            return false;
+        }
         return true;
     }
 
+    void destroy_opensles() {
+        if (sles_player_) {
+            (*sles_player_)->Destroy(sles_player_);
+            sles_player_ = nullptr;
+        }
+        if (sles_output_mix_) {
+            (*sles_output_mix_)->Destroy(sles_output_mix_);
+            sles_output_mix_ = nullptr;
+        }
+        if (sles_engine_) {
+            (*sles_engine_)->Destroy(sles_engine_);
+            sles_engine_ = nullptr;
+        }
+        sles_engine_interface_ = nullptr;
+    }
+
     void play_opensles(const AudioBuffer& buffer, float volume) {
+        if (!sles_engine_interface_ || buffer.samples.empty()) return;
         // Aplica ganho em uma cópia: funciona independentemente de suporte a
         // SLVolumeItf no device e mantém o buffer original intacto.
         sles_samples_ = buffer.samples;  // mantém vivo até o player terminar
-        if (volume < 1.0f) {
+        const float gain = gain_for(volume);
+        if (gain < 1.0f) {
             for (auto& sample : sles_samples_) {
-                sample = static_cast<int16_t>(sample * volume);
+                sample = scale_sample(sample, gain);
             }
         }
         SLDataLocator_AndroidSimpleBufferQueue locator{
@@ -227,17 +306,24 @@ private:
         const SLboolean req[] = {SL_BOOLEAN_TRUE, SL_BOOLEAN_TRUE, SL_BOOLEAN_TRUE};
         if (sles_player_) { (*sles_player_)->Destroy(sles_player_); sles_player_ = nullptr; }
         if ((*sles_engine_interface_)->CreateAudioPlayer(
-                sles_engine_interface_, &sles_player_, &source, &sink, 3, ids, req) != SL_RESULT_SUCCESS) {
+                sles_engine_interface_, &sles_player_, &source, &sink, 3, ids, req)
+                != SL_RESULT_SUCCESS || !sles_player_) {
+            sles_player_ = nullptr;
             return;
         }
-        (*sles_player_)->Realize(sles_player_, SL_BOOLEAN_FALSE);
+        if ((*sles_player_)->Realize(sles_player_, SL_BOOLEAN_FALSE) != SL_RESULT_SUCCESS)
+            return;
         SLPlayItf play = nullptr;
         SLAndroidSimpleBufferQueueItf queue = nullptr;
-        (*sles_player_)->GetInterface(sles_player_, SL_IID_PLAY, &play);
-        (*sles_player_)->GetInterface(sles_player_, SL_IID_BUFFERQUEUE, &queue);
-        (*queue)->Enqueue(queue, sles_samples_.data(),
-                          sles_samples_.size() * sizeof(int16_t));
-        (*play)->SetPlayState(play, SL_PLAYSTATE_PLAYING);
+        if ((*sles_player_)->GetInterface(sles_player_, SL_IID_PLAY, &play) != SL_RESULT_SUCCESS ||
+            (*sles_player_)->GetInterface(sles_player_, SL_IID_BUFFERQUEUE, &queue)
+                != SL_RESULT_SUCCESS || !play || !queue) {
+            return;
+        }
+        if ((*queue)->Enqueue(queue, sles_samples_.data(),
+                              sles_samples_.size() * sizeof(int16_t)) == SL_RESULT_SUCCESS) {
+            (*play)->SetPlayState(play, SL_PLAYSTATE_PLAYING);
+        }
     }
 
     bool initialized_ = false;

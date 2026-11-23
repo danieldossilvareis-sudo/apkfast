@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -35,12 +36,17 @@ enum class Topology {
 
 /// Geometria reutilizável (CPU-side). O backend (GL/VK) faz o upload.
 struct MeshData {
+    /// Último índice uint16_t é 65535; 65536 é a contagem máxima de vértices.
+    static constexpr std::size_t max_vertices = 65536;
+
     std::vector<Vertex> vertices;
     std::vector<uint16_t> indices;
     Topology topology = Topology::Triangles;
 
+    /// Aponta três vértices novos (índice = coluna uint16_t). Faz sentido
+    /// para Topology::Triangles; outras topologias exigem indices manuais.
     void add_triangle(const Vertex& a, const Vertex& b, const Vertex& c) {
-        if (vertices.size() + 3 > 65536) {
+        if (vertices.size() > max_vertices - 3) {
             throw std::runtime_error("Mesh excede 65536 vertices (limite uint16)");
         }
         const uint16_t base = static_cast<uint16_t>(vertices.size());
@@ -52,8 +58,15 @@ struct MeshData {
         indices.push_back(base + 2);
     }
 
+    /// Quatro cantos tl, tr, br, bl → dois triângulos (diagonal tl→br).
+    /// Cada triângulo tem 3 vértices próprios, então o quad consome 6.
+    /// A capacidade é verificada antes de qualquer push_back: um quad que
+    /// não cabe não deixa a malha pela metade.
     void add_quad(const Vertex& tl, const Vertex& tr,
                   const Vertex& br, const Vertex& bl) {
+        if (vertices.size() > max_vertices - 6) {
+            throw std::runtime_error("Mesh excede 65536 vertices (limite uint16)");
+        }
         add_triangle(tl, tr, br);
         add_triangle(tl, br, bl);
     }

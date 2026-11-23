@@ -22,6 +22,9 @@ public:
         return singleton;
     }
 
+    Sensors(const Sensors&) = delete;
+    Sensors& operator=(const Sensors&) = delete;
+
     bool init() {
         if (initialized_) return true;
         manager_ = ASensorManager_getInstance();
@@ -29,29 +32,50 @@ public:
 
         accelerometer_ = ASensorManager_getDefaultSensor(manager_, ASENSOR_TYPE_ACCELEROMETER);
         gyroscope_ = ASensorManager_getDefaultSensor(manager_, ASENSOR_TYPE_GYROSCOPE);
-        if (!accelerometer_ && !gyroscope_) return false;
+        if (!accelerometer_ && !gyroscope_) {
+            manager_ = nullptr;
+            return false;
+        }
 
         // 0 = usa o looper da thread atual (o mesmo do App) com callbacks.
         looper_ = ALooper_prepare(0);
-        if (!looper_) return false;
+        if (!looper_) {
+            accelerometer_ = gyroscope_ = nullptr;
+            manager_ = nullptr;
+            return false;
+        }
 
         if (accelerometer_) {
             accel_event_queue_ = ASensorManager_createEventQueue(
                 manager_, looper_, kAccelId, &Sensors::accel_callback, this);
             if (accel_event_queue_) {
-                ASensorEventQueue_enableSensor(accel_event_queue_, accelerometer_);
-                ASensorEventQueue_setEventRate(
-                    accel_event_queue_, accelerometer_, 1000000 / 60);
+                if (ASensorEventQueue_enableSensor(accel_event_queue_, accelerometer_) < 0 ||
+                    ASensorEventQueue_setEventRate(
+                        accel_event_queue_, accelerometer_, 1000000 / 60) < 0) {
+                    __android_log_print(ANDROID_LOG_WARN, "nativeapp-sensor",
+                                        "falha ao configurar acelerometro");
+                }
+            } else {
+                accelerometer_ = nullptr;
             }
         }
         if (gyroscope_) {
             gyro_event_queue_ = ASensorManager_createEventQueue(
                 manager_, looper_, kGyroId, &Sensors::gyro_callback, this);
             if (gyro_event_queue_) {
-                ASensorEventQueue_enableSensor(gyro_event_queue_, gyroscope_);
-                ASensorEventQueue_setEventRate(
-                    gyro_event_queue_, gyroscope_, 1000000 / 60);
+                if (ASensorEventQueue_enableSensor(gyro_event_queue_, gyroscope_) < 0 ||
+                    ASensorEventQueue_setEventRate(
+                        gyro_event_queue_, gyroscope_, 1000000 / 60) < 0) {
+                    __android_log_print(ANDROID_LOG_WARN, "nativeapp-sensor",
+                                        "falha ao configurar giroscopio");
+                }
+            } else {
+                gyroscope_ = nullptr;
             }
+        }
+        if (!accelerometer_ && !gyroscope_) {
+            destroy();
+            return false;
         }
         initialized_ = true;
         return true;
@@ -82,18 +106,22 @@ public:
     bool has_gyroscope() const { return gyroscope_ != nullptr; }
 
     void destroy() {
-        if (accel_event_queue_) {
-            ASensorManager_destroyEventQueue(manager_, accel_event_queue_);
-            accel_event_queue_ = nullptr;
+        if (manager_) {
+            if (accel_event_queue_) {
+                ASensorManager_destroyEventQueue(manager_, accel_event_queue_);
+            }
+            if (gyro_event_queue_) {
+                ASensorManager_destroyEventQueue(manager_, gyro_event_queue_);
+            }
         }
-        if (gyro_event_queue_) {
-            ASensorManager_destroyEventQueue(manager_, gyro_event_queue_);
-            gyro_event_queue_ = nullptr;
-        }
+        accel_event_queue_ = nullptr;
+        gyro_event_queue_ = nullptr;
         accelerometer_ = nullptr;
         gyroscope_ = nullptr;
         looper_ = nullptr;
         manager_ = nullptr;
+        acceleration_ = {};
+        angular_velocity_ = {};
         initialized_ = false;
     }
 

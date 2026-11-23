@@ -24,6 +24,7 @@ public:
 
     /// Repasse todo evento recebido no App::on_input (key ou motion).
     void on_event(AInputEvent* event) {
+        if (!event) return;
         const int32_t type = AInputEvent_getType(event);
         if (type == AINPUT_EVENT_TYPE_KEY) {
             const int32_t code = AKeyEvent_getKeyCode(event);
@@ -33,29 +34,35 @@ public:
             if (down) keys_.insert(code);
             else if (action == AKEY_EVENT_ACTION_UP) keys_.erase(code);
             last_key_ = code;
+            // Botões de gamepad também chegam como KEY events (DPAD, A/B…).
+            mark_gamepad_source(AInputEvent_getSource(event));
             return;
         }
         if (type != AINPUT_EVENT_TYPE_MOTION) return;
 
         const int32_t source = AInputEvent_getSource(event);
         const bool is_mouse = (source & AINPUT_SOURCE_MOUSE) == AINPUT_SOURCE_MOUSE;
-        const bool is_gamepad = (source & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD ||
-                                (source & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK;
+        const bool is_gamepad = mark_gamepad_source(source);
+        // Eventos de hover/exit podem não ter nenhum ponteiro.
+        const bool has_pointer = AMotionEvent_getPointerCount(event) > 0;
 
         const int32_t action = AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK;
         const int32_t buttons = AMotionEvent_getButtonState(event);
 
         if (is_mouse) {
-            mouse_x_ = AMotionEvent_getX(event, 0);
-            mouse_y_ = AMotionEvent_getY(event, 0);
             mouse_buttons_ = buttons;
+            if (has_pointer) {
+                mouse_x_ = AMotionEvent_getX(event, 0);
+                mouse_y_ = AMotionEvent_getY(event, 0);
+            }
             if (action == AMOTION_EVENT_ACTION_SCROLL) {
-                scroll_x_ = AMotionEvent_getXOffset(event);
-                scroll_y_ = AMotionEvent_getYOffset(event);
+                // Soma os deltas até consume_scroll() (vários eventos/frame).
+                scroll_x_ += AMotionEvent_getXOffset(event);
+                scroll_y_ += AMotionEvent_getYOffset(event);
             }
         }
 
-        if (is_gamepad) {
+        if (is_gamepad && has_pointer) {
             // Analog sticks (AXIS_X/Y = esquerdo, Z/RZ = direito)
             stick_left_  = {AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_X, 0),
                             AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_Y, 0)};
@@ -63,7 +70,6 @@ public:
                             AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_RZ, 0)};
             triggers_ = {AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_LTRIGGER, 0),
                          AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_RTRIGGER, 0)};
-            gamepad_connected_ = true;
         }
     }
 
@@ -88,10 +94,11 @@ public:
     float mouse_x() const { return mouse_x_; }
     float mouse_y() const { return mouse_y_; }
     bool mouse_down(MouseButton button) const {
-        const int32_t bit = button == MouseButton::Left ? 1 :
-                            button == MouseButton::Right ? 2 :
-                            button == MouseButton::Middle ? 4 :
-                            button == MouseButton::Back ? 8 : 16;
+        const int32_t bit = button == MouseButton::Left ? AMOTION_EVENT_BUTTON_PRIMARY :
+                            button == MouseButton::Right ? AMOTION_EVENT_BUTTON_SECONDARY :
+                            button == MouseButton::Middle ? AMOTION_EVENT_BUTTON_TERTIARY :
+                            button == MouseButton::Back ? AMOTION_EVENT_BUTTON_BACK
+                                                        : AMOTION_EVENT_BUTTON_FORWARD;
         return (mouse_buttons_ & bit) != 0;
     }
     float scroll_x() const { return scroll_x_; }
@@ -117,6 +124,14 @@ public:
 
 private:
     InputHelpers() = default;
+
+    bool mark_gamepad_source(int32_t source) {
+        const bool is_gamepad =
+            (source & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD ||
+            (source & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK;
+        if (is_gamepad) gamepad_connected_ = true;
+        return is_gamepad;
+    }
 
     std::unordered_set<int32_t> keys_;
     int32_t last_key_ = 0;

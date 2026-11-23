@@ -22,9 +22,11 @@
 #include "math.hpp"
 
 #include <array>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -54,6 +56,37 @@ inline void gl_check(const char* operation) {
 #endif
 }
 
+namespace gl_detail {
+
+/// EGL não tem um "check" global como glGetError; registra o último erro
+/// para não engolir falhas silenciosas em chamadas não críticas.
+inline void egl_log_error(const char* operation) {
+    const EGLint error = eglGetError();
+    if (error != EGL_SUCCESS) {
+        __android_log_print(ANDROID_LOG_WARN, "nativeapp-gl",
+                            "%s: eglGetError=0x%x", operation, error);
+    }
+}
+
+inline void egl_require(bool success, const char* operation) {
+    if (!success) {
+        const EGLint error = eglGetError();
+        throw GLError(std::string(operation) + " falhou (EGL=" +
+                      std::to_string(error) + ")");
+    }
+}
+
+/// Nomes de objetos GL são válidos apenas no contexto que os criou. A geração
+/// muda a cada init/destroy de GLContext para que Textures de fora da cena
+/// não reutilizem (nem apaguem) nomes de um contexto morto.
+inline uint64_t& context_generation_ref() {
+    static uint64_t generation = 0;
+    return generation;
+}
+inline uint64_t context_generation() { return context_generation_ref(); }
+
+}  // namespace gl_detail
+
 // ============================================================================
 // GLContext
 // ============================================================================
@@ -65,7 +98,11 @@ public:
     GLContext(const GLContext&) = delete;
     GLContext& operator=(const GLContext&) = delete;
 
+    /// Inicialização idempotente e transacional: qualquer falha libera o que
+    /// já foi criado, deixando o objeto pronto para uma nova tentativa.
     void init(ANativeWindow* window, int client_version = 2) {
+        if (display_ != EGL_NO_DISPLAY) destroy();
+
         const EGLint attribs[] = {
             EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
             EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
@@ -75,94 +112,153 @@ public:
             EGL_NONE,
         };
         EGLint num_configs = 0;
-        display_ = eglGetDisplay(static_cast<EGLNativeDisplayType>(EGL_DEFAULT_DISPLAY));
-        if (display_ == EGL_NO_DISPLAY) throw GLError("eglGetDisplay falhou");
-        if (!eglInitialize(display_, nullptr, nullptr)) throw GLError("eglInitialize falhou");
+        EGLDisplay display = eglGetDisplay(
+            static_cast<EGLNativeDisplayType>(EGL_DEFAULT_DISPLAY));
+        gl_detail::egl_require(display != EGL_NO_DISPLAY, "eglGetDisplay");
+        gl_detail::egl_require(eglInitialize(display, nullptr, nullptr) == EGL_TRUE,
+                               "eglInitialize");
+        display_ = display;  // a partir daqui destroy() sabe como limpar
 
-        config_ = nullptr;
-        if (client_version >= 3) {
+        EGLConfig config = nullptr;
+        int version = client_version;
+        if (version >= 3) {
             EGLint es3_configs[] = {
                 EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
                 EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
                 EGL_DEPTH_SIZE, 24, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
                 EGL_NONE,
             };
-            if (!eglChooseConfig(display_, es3_configs, &config_, 1, &num_configs) ||
+            if (eglChooseConfig(display_, es3_configs, &config, 1, &num_configs) !=
+                    EGL_TRUE ||
                 num_configs < 1) {
-                client_version = 2;  // fallback
+                config = nullptr;
+                version = 2;  // fallback
+                gl_detail::egl_log_error("eglChooseConfig(ES3)");
             }
         }
-        if (!config_ && (!eglChooseConfig(display_, attribs, &config_, 1, &num_configs) ||
-                         num_configs < 1)) {
+        if (!config &&
+            (eglChooseConfig(display_, attribs, &config, 1, &num_configs) != EGL_TRUE ||
+             num_configs < 1)) {
+            gl_detail::egl_log_error("eglChooseConfig");
+            destroy();
             throw GLError("eglChooseConfig falhou");
         }
+        config_ = config;
 
         const EGLint context_attribs[] = {
-            EGL_CONTEXT_CLIENT_VERSION, client_version, EGL_NONE,
+            EGL_CONTEXT_CLIENT_VERSION, version, EGL_NONE,
         };
         context_ = eglCreateContext(display_, config_, EGL_NO_CONTEXT, context_attribs);
-        if (context_ == EGL_NO_CONTEXT) throw GLError("eglCreateContext falhou");
-        version_ = client_version;
+        if (context_ == EGL_NO_CONTEXT) {
+            gl_detail::egl_log_error("eglCreateContext");
+            destroy();
+            throw GLError("eglCreateContext falhou");
+        }
+        version_ = version;
 
         window_ = window;
         surface_ = eglCreateWindowSurface(display_, config_, window, nullptr);
-        if (surface_ == EGL_NO_SURFACE) throw GLError("eglCreateWindowSurface falhou");
-        make_current();
+        if (surface_ == EGL_NO_SURFACE) {
+            gl_detail::egl_log_error("eglCreateWindowSurface");
+            destroy();
+            throw GLError("eglCreateWindowSurface falhou");
+        }
+        if (!make_current()) {
+            destroy();
+            throw GLError("eglMakeCurrent falhou");
+        }
+        ++gl_detail::context_generation_ref();
     }
 
-    void make_current() const {
-        if (display_ != EGL_NO_DISPLAY && context_ != EGL_NO_CONTEXT &&
-            surface_ != EGL_NO_SURFACE) {
-            eglMakeCurrent(display_, surface_, surface_, context_);
+    /// Retorna false (e registra o erro) se não foi possível tornar o contexto
+    /// atual. Não lança: é chamado também durante a destruição.
+    bool make_current() const {
+        if (display_ == EGL_NO_DISPLAY || context_ == EGL_NO_CONTEXT ||
+            surface_ == EGL_NO_SURFACE) {
+            return false;
         }
+        const EGLBoolean ok = eglMakeCurrent(display_, surface_, surface_, context_);
+        if (ok != EGL_TRUE) gl_detail::egl_log_error("eglMakeCurrent");
+        return ok == EGL_TRUE;
     }
 
     void recreate_surface(ANativeWindow* window) {
-        if (!display_ || !config_) return;
-        make_current();
+        if (display_ == EGL_NO_DISPLAY || !config_) return;
         if (surface_ != EGL_NO_SURFACE) {
-            eglMakeCurrent(display_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-            eglDestroySurface(display_, surface_);
+            if (eglMakeCurrent(display_, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                               EGL_NO_CONTEXT) != EGL_TRUE) {
+                gl_detail::egl_log_error("eglMakeCurrent(unbind)");
+            }
+            if (eglDestroySurface(display_, surface_) != EGL_TRUE) {
+                gl_detail::egl_log_error("eglDestroySurface");
+            }
             surface_ = EGL_NO_SURFACE;
         }
         window_ = window;
         if (window_) {
             surface_ = eglCreateWindowSurface(display_, config_, window_, nullptr);
+            if (surface_ == EGL_NO_SURFACE) {
+                gl_detail::egl_log_error("eglCreateWindowSurface");
+            }
         }
         make_current();
     }
 
     void set_swap_interval(int interval) const {
-        if (display_) eglSwapInterval(display_, interval);
+        if (display_ != EGL_NO_DISPLAY &&
+            eglSwapInterval(display_, interval) != EGL_TRUE) {
+            gl_detail::egl_log_error("eglSwapInterval");
+        }
     }
 
     bool swap() const {
-        if (display_ && surface_ != EGL_NO_SURFACE) {
-            return eglSwapBuffers(display_, surface_) == EGL_TRUE;
+        if (display_ != EGL_NO_DISPLAY && surface_ != EGL_NO_SURFACE) {
+            const EGLBoolean ok = eglSwapBuffers(display_, surface_);
+            if (ok != EGL_TRUE) gl_detail::egl_log_error("eglSwapBuffers");
+            return ok == EGL_TRUE;
         }
         return false;
     }
 
     void clear_current() const {
-        if (display_) {
-            eglMakeCurrent(display_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (display_ != EGL_NO_DISPLAY &&
+            eglMakeCurrent(display_, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                           EGL_NO_CONTEXT) != EGL_TRUE) {
+            gl_detail::egl_log_error("eglMakeCurrent(clear)");
         }
     }
 
     void destroy() {
-        if (display_ == EGL_NO_DISPLAY) return;
+        if (display_ == EGL_NO_DISPLAY) {
+            surface_ = EGL_NO_SURFACE;
+            context_ = EGL_NO_CONTEXT;
+            config_ = nullptr;
+            window_ = nullptr;
+            version_ = 2;
+            return;
+        }
+        // Nunca destrói um contexto que ainda está atual.
+        clear_current();
         if (surface_ != EGL_NO_SURFACE) {
-            eglDestroySurface(display_, surface_);
+            if (eglDestroySurface(display_, surface_) != EGL_TRUE) {
+                gl_detail::egl_log_error("eglDestroySurface");
+            }
             surface_ = EGL_NO_SURFACE;
         }
         if (context_ != EGL_NO_CONTEXT) {
-            eglDestroyContext(display_, context_);
+            if (eglDestroyContext(display_, context_) != EGL_TRUE) {
+                gl_detail::egl_log_error("eglDestroyContext");
+            }
             context_ = EGL_NO_CONTEXT;
         }
-        eglTerminate(display_);
+        if (eglTerminate(display_) != EGL_TRUE) {
+            gl_detail::egl_log_error("eglTerminate");
+        }
         display_ = EGL_NO_DISPLAY;
         config_ = nullptr;
         window_ = nullptr;
+        version_ = 2;
+        ++gl_detail::context_generation_ref();
     }
 
     int version() const { return version_; }
@@ -191,6 +287,7 @@ public:
 
     /// Compila a partir de código-fonte (GLSL).
     void compile(const std::string& vertex_source, const std::string& fragment_source) {
+        destroy();  // recompilar não deve vazar o program anterior
         const GLuint vs = compile_stage(GL_VERTEX_SHADER, vertex_source.c_str());
         GLuint fs = 0;
         try {
@@ -229,6 +326,11 @@ public:
         glUniform4f(loc(name), x, y, z, w);
     }
     void set_uniform_mat4(const std::string& name, const float* matrix) {
+        if (!matrix) {
+            __android_log_print(ANDROID_LOG_WARN, "nativeapp-gl",
+                                "set_uniform_mat4(%s): matriz nula", name.c_str());
+            return;
+        }
         glUniformMatrix4fv(loc(name), 1, GL_FALSE, matrix);
     }
 
@@ -253,14 +355,15 @@ private:
     }
 
     static GLuint compile_stage(GLenum type, const char* source) {
-        GLuint shader = glCreateShader(type);
+        const GLuint shader = glCreateShader(type);
+        if (!shader) throw GLError("glCreateShader falhou");
         glShaderSource(shader, 1, &source, nullptr);
         glCompileShader(shader);
         GLint compiled = 0;
         glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
         if (!compiled) {
-            char log[2048];
-            glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
+            char log[2048] = {};
+            glGetShaderInfoLog(shader, sizeof(log) - 1, nullptr, log);
             glDeleteShader(shader);
             throw GLError(std::string("Shader falhou: ") + log);
         }
@@ -268,28 +371,39 @@ private:
     }
 
     void link(GLuint vs, GLuint fs) {
-        program_ = glCreateProgram();
-        glAttachShader(program_, vs);
-        glAttachShader(program_, fs);
-        // Fixa as locations para casar com Mesh::draw() (0=pos,1=normal,2=uv,3=color).
-        glBindAttribLocation(program_, 0, "a_position");
-        glBindAttribLocation(program_, 1, "a_normal");
-        glBindAttribLocation(program_, 2, "a_uv");
-        glBindAttribLocation(program_, 3, "a_color");
-        glLinkProgram(program_);
-        GLint linked = 0;
-        glGetProgramiv(program_, GL_LINK_STATUS, &linked);
-        if (!linked) {
-            char log[2048];
-            glGetProgramInfoLog(program_, sizeof(log), nullptr, log);
+        const GLuint program = glCreateProgram();
+        if (!program) {
             glDeleteShader(vs);
             glDeleteShader(fs);
-            glDeleteProgram(program_);
-            program_ = 0;
-            throw GLError(std::string("Link falhou: ") + log);
+            throw GLError("glCreateProgram falhou");
+        }
+        try {
+            glAttachShader(program, vs);
+            glAttachShader(program, fs);
+            // Fixa as locations para casar com Mesh::draw() (0=pos,1=normal,
+            // 2=uv,3=color). a_uv no location 2 é parte do contrato do texto.
+            glBindAttribLocation(program, 0, "a_position");
+            glBindAttribLocation(program, 1, "a_normal");
+            glBindAttribLocation(program, 2, "a_uv");
+            glBindAttribLocation(program, 3, "a_color");
+            glLinkProgram(program);
+            GLint linked = 0;
+            glGetProgramiv(program, GL_LINK_STATUS, &linked);
+            if (!linked) {
+                char log[2048] = {};
+                glGetProgramInfoLog(program, sizeof(log) - 1, nullptr, log);
+                throw GLError(std::string("Link falhou: ") + log);
+            }
+        } catch (...) {
+            glDeleteProgram(program);
+            glDeleteShader(vs);
+            glDeleteShader(fs);
+            throw;
         }
         glDeleteShader(vs);
         glDeleteShader(fs);
+        program_ = program;
+        locations_.clear();
     }
 
     GLuint program_ = 0;
@@ -309,7 +423,18 @@ public:
 
     void upload(const MeshData& data) {
         if (!vbo_) glGenBuffers(1, &vbo_);
-        if (!ibo_ && !data.indices.empty()) glGenBuffers(1, &ibo_);
+        if (!vbo_) { gl_check("mesh_gen_buffer"); return; }
+
+        // Índice fora do intervalo faria o GPU ler memória além do VBO.
+        bool indices_valid = true;
+        for (uint16_t index : data.indices) {
+            if (index >= data.vertices.size()) { indices_valid = false; break; }
+        }
+        if (!indices_valid) {
+            __android_log_print(ANDROID_LOG_WARN, "nativeapp-gl",
+                                "Mesh com índice >= nº de vértices; usando drawArrays");
+        }
+        if (!ibo_ && indices_valid && !data.indices.empty()) glGenBuffers(1, &ibo_);
 
         glBindBuffer(GL_ARRAY_BUFFER, vbo_);
         glBufferData(GL_ARRAY_BUFFER,
@@ -317,7 +442,7 @@ public:
                      data.vertices.data(), GL_STATIC_DRAW);
 
         vertex_count_ = static_cast<GLsizei>(data.vertices.size());
-        index_count_ = static_cast<GLsizei>(data.indices.size());
+        index_count_ = indices_valid ? static_cast<GLsizei>(data.indices.size()) : 0;
         if (ibo_ && index_count_ > 0) {
             glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo_);
             glBufferData(GL_ELEMENT_ARRAY_BUFFER,
@@ -395,16 +520,38 @@ public:
     bool load(const std::string& path) {
         auto& assets = Assets::instance(nullptr);
         if (!assets.manager()) return false;
+        const uint64_t generation = gl_detail::context_generation();
+        if (generation_ != generation) {
+            // Contexto novo: o nome antigo pode pertencer a outro objeto.
+            texture_ = 0;
+            width_ = height_ = 0;
+            generation_ = generation;
+        }
         const auto data = assets.read(path);
-        if (data.empty()) return false;
+        if (data.empty() || data.size() > static_cast<size_t>(INT_MAX)) return false;
 
         int width = 0, height = 0, channels = 0;
         stbi_uc* pixels = stbi_load_from_memory(
             data.data(), static_cast<int>(data.size()),
             &width, &height, &channels, 4);
-        if (!pixels) return false;
+        if (!pixels || width <= 0 || height <= 0) {
+            if (pixels) stbi_image_free(pixels);
+            return false;
+        }
 
-        if (!texture_) glGenTextures(1, &texture_);
+        // Decodifica primeiro para não perder a textura anterior se o
+        // carregamento falhar (o nome antigo já foi descartado acima quando
+        // houve troca de contexto).
+        if (texture_) {
+            glDeleteTextures(1, &texture_);
+            texture_ = 0;
+            width_ = height_ = 0;
+        }
+        glGenTextures(1, &texture_);
+        if (!texture_) {
+            stbi_image_free(pixels);
+            return false;
+        }
         glBindTexture(GL_TEXTURE_2D, texture_);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0,
                      GL_RGBA, GL_UNSIGNED_BYTE, pixels);
@@ -415,16 +562,23 @@ public:
         stbi_image_free(pixels);
         width_ = width;
         height_ = height;
+        generation_ = generation;
+        gl_check("texture_load");
         return true;
     }
 
     void bind(unsigned int unit = 0) const {
+        if (!texture_ || generation_ != gl_detail::context_generation()) return;
         glActiveTexture(GL_TEXTURE0 + unit);
         glBindTexture(GL_TEXTURE_2D, texture_);
     }
 
     void destroy() {
-        if (texture_) { glDeleteTextures(1, &texture_); texture_ = 0; }
+        if (texture_ && generation_ == gl_detail::context_generation()) {
+            glDeleteTextures(1, &texture_);
+        }
+        texture_ = 0;
+        width_ = height_ = 0;
     }
 
     int width() const { return width_; }
@@ -435,6 +589,7 @@ private:
     GLuint texture_ = 0;
     int width_ = 0;
     int height_ = 0;
+    uint64_t generation_ = gl_detail::context_generation();
 };
 
 // ============================================================================
@@ -454,16 +609,25 @@ protected:
     void init(ANativeWindow* window, int client_version) {
         if (initialized_) return;
         egl_.init(window, client_version);
-        glEnable(GL_DEPTH_TEST);
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glClearColor(clear_[0], clear_[1], clear_[2], clear_[3]);
+        try {
+            glEnable(GL_DEPTH_TEST);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glClearColor(clear_[0], clear_[1], clear_[2], clear_[3]);
 
-        shader_.compile(kVertexShader, kFragmentShader);
-        mesh_.upload(default_mesh());
-        const int w = window ? ANativeWindow_getWidth(window) : 0;
-        const int h = window ? ANativeWindow_getHeight(window) : 0;
-        if (w > 0 && h > 0) resize(w, h);
+            shader_.compile(kVertexShader, kFragmentShader);
+            mesh_.upload(default_mesh());
+            const int w = window ? ANativeWindow_getWidth(window) : 0;
+            const int h = window ? ANativeWindow_getHeight(window) : 0;
+            if (w > 0 && h > 0) resize(w, h);
+        } catch (...) {
+            // init() pode ser chamado de novo após uma falha (ex.: shader):
+            // não deixa EGL nem objetos GL parcialmente criados vazando.
+            shader_.destroy();
+            mesh_.destroy();
+            egl_.destroy();
+            throw;
+        }
         initialized_ = true;
     }
 
@@ -474,6 +638,9 @@ public:
     void resize(int width, int height) override {
         width_ = width;
         height_ = height;
+        // Janela em destruição pode reportar dimensões <= 0; glViewport com
+        // valores negativos geraria GL_INVALID_VALUE e estragaria a projeção.
+        if (width <= 0 || height <= 0) return;
         egl_.make_current();
         glViewport(0, 0, width_, height_);
         projection_ = mat4_ortho2d(static_cast<float>(width_), static_cast<float>(height_));
@@ -550,6 +717,7 @@ public:
         glEnable(GL_DEPTH_TEST);
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glActiveTexture(GL_TEXTURE0);
         glClearColor(clear_[0], clear_[1], clear_[2], clear_[3]);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     }
@@ -581,17 +749,24 @@ public:
         egl_.make_current();
         FontAtlas atlas;
         if (!atlas.load(path, pixel_size)) return false;
+        if (!atlas.valid() || atlas.atlas_size() <= 0 || !atlas.atlas()) return false;
         if (!text_shader_.program()) {
             text_shader_.compile(kTextVertexShader, kTextFragmentShader);
         }
-        if (!font_texture_) glGenTextures(1, &font_texture_);
+        if (!font_texture_) {
+            glGenTextures(1, &font_texture_);
+            if (!font_texture_) return false;
+        }
         glBindTexture(GL_TEXTURE_2D, font_texture_);
         // Expande o atlas de 1 canal para RGBA: GL_ALPHA é problemático em
         // alguns drivers GLES3 e o RGBA é universal.
-        const int n = atlas.atlas_size() * atlas.atlas_size();
-        std::vector<uint8_t> rgba(static_cast<size_t>(n) * 4, 255);
-        for (int i = 0; i < n; ++i) {
-            rgba[static_cast<size_t>(i) * 4 + 3] = atlas.atlas()[i];
+        const std::size_t side = static_cast<std::size_t>(atlas.atlas_size());
+        const std::size_t n = side * side;
+        if (n > std::numeric_limits<std::size_t>::max() / 4) return false;
+        std::vector<uint8_t> rgba(n * 4, 255);
+        const uint8_t* pixels = atlas.atlas();
+        for (std::size_t i = 0; i < n; ++i) {
+            rgba[i * 4 + 3] = pixels[i];
         }
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, atlas.atlas_size(), atlas.atlas_size(),
                      0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
@@ -599,6 +774,7 @@ public:
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        gl_check("font_atlas");
         font_ = std::make_unique<FontAtlas>(std::move(atlas));
         return true;
     }
@@ -635,9 +811,11 @@ public:
         }
         if (verts.empty()) return;
 
-        GLuint vbo = 0;
-        glGenBuffers(1, &vbo);
-        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        // Um único VBO persistente para todo o texto evita glGenBuffers/
+        // glDeleteBuffers a cada linha desenhada (media-demo desenha 4).
+        if (!text_vbo_) glGenBuffers(1, &text_vbo_);
+        if (!text_vbo_) return;
+        glBindBuffer(GL_ARRAY_BUFFER, text_vbo_);
         glBufferData(GL_ARRAY_BUFFER,
                      static_cast<GLsizeiptr>(verts.size() * sizeof(GlyphVert)),
                      verts.data(), GL_STREAM_DRAW);
@@ -651,15 +829,24 @@ public:
         glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(verts.size()));
         glDisableVertexAttribArray(0);
         glDisableVertexAttribArray(2);
-        glDeleteBuffers(1, &vbo);
+        gl_check("draw_text");
     }
 
     bool has_font() const { return font_ != nullptr; }
 
     void destroy() {
-        if (!initialized_) return;
+        if (egl_.display() == EGL_NO_DISPLAY) {
+            // init() nunca chegou a criar contexto (ou já foi destruído):
+            // apenas zera o estado lógico, sem chamar GL sem contexto atual.
+            font_.reset();
+            font_texture_ = 0;
+            text_vbo_ = 0;
+            initialized_ = false;
+            return;
+        }
         egl_.make_current();
         if (font_texture_) { glDeleteTextures(1, &font_texture_); font_texture_ = 0; }
+        if (text_vbo_) { glDeleteBuffers(1, &text_vbo_); text_vbo_ = 0; }
         font_.reset();
         text_shader_.destroy();
         textures_.clear();
@@ -738,6 +925,7 @@ private:
     Shader text_shader_;
     std::unique_ptr<FontAtlas> font_;
     GLuint font_texture_ = 0;
+    GLuint text_vbo_ = 0;
     Mat4 projection_ = mat4_identity();
     Mat4 model_ = mat4_identity();
     std::array<float, 4> clear_{0.08f, 0.08f, 0.12f, 1.0f};
@@ -766,12 +954,15 @@ public:
     /// Desenha a mesma mesh N vezes com matrizes model por instância.
     void draw_instanced(const MeshData& data, const Material& material,
                         const std::vector<Mat4>& models) {
-        if (models.empty()) return;
+        if (models.empty() || egl().display() == EGL_NO_DISPLAY) return;
         egl().make_current();
-        // GLES3 permite instancing via divisor de atributo; implementação
-        // simplificada usando uniforms por chamada (compatível com GLES2).
+        // Instancing real exigiria divisor de atributo e um shader dedicado;
+        // esta versão usa uniforms por chamada (compatível com GLES2), mas faz
+        // upload uma única vez em vez de reenviar a geometria a cada cópia.
+        Mesh mesh;
+        mesh.upload(data);
         for (const auto& model : models) {
-            draw(data, material, model.data());
+            draw_mesh(mesh, material, model.data());
         }
     }
 };
