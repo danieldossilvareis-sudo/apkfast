@@ -129,7 +129,9 @@ def install(abi: str = "arm64-v8a", api: int = 21, *, quiet: bool = False) -> Pa
         "-DBUILD_SHARED_LIBS=OFF",
         "-DWEBP_LINK_STATIC=ON",
         "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
-        "-DWEBP_ENABLE_SIMD=OFF",
+        # x86 Android targets need SSE2 enabled for libwebp's double math;
+        # ARM builds stay SIMD-free for deterministic portability.
+        f"-DWEBP_ENABLE_SIMD={'ON' if abi in ('x86', 'x86_64') else 'OFF'}",
         "-DWEBP_USE_THREAD=OFF",
         "-DWEBP_BUILD_ANIM_UTILS=OFF",
         "-DWEBP_BUILD_CWEBP=OFF",
