@@ -491,7 +491,7 @@ public:
         if (swapchain_) config.color_format = color_format_;
         config.depth_format = depth_format_;
         pipeline_config_ = std::move(config);
-        pipeline_.build(device_, render_pass_, nullptr, pipeline_config_);
+        pipeline_.build(device_, render_pass_, VK_NULL_HANDLE, pipeline_config_);
     }
 
     /// Desenha uma mesh (requer set_pipeline()).
@@ -1058,7 +1058,7 @@ private:
             // válido; com SPIR-V, reconstrói o pipeline para o novo render pass.
             if (!pipeline_config_.vertex_spv.empty()) {
                 pipeline_config_.color_format = color_format_;
-                pipeline_.build(device_, render_pass_, nullptr, pipeline_config_);
+                pipeline_.build(device_, render_pass_, VK_NULL_HANDLE, pipeline_config_);
             }
         } catch (...) {
             swapchain_ok_ = false;
