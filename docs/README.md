@@ -64,5 +64,8 @@ python3 apkfast.py install app.apk
 - [README da API](../include/nativeapp/README.md) — referência consolidada
 - [AUDIT.md](../AUDIT.md) — auditoria completa e bugs corrigidos
 - [Compatibilidade](compatibility.md) — SemVer da API nativeapp
-- [Migração](migration.md) — 2.2 → 2.3 → 2.4
+- [Migração](migration.md) — 2.2 → 2.3 → 2.5
+- [AAB / Google Play](aab.md) — bundletool, assinatura e publicação
+- [Publicação](publishing.md) — PyPI, TestPyPI e release
+- [CI em dispositivo](device-ci.md) — self-hosted e Firebase Test Lab
 - [CHANGELOG.md](../CHANGELOG.md) — histórico de versões

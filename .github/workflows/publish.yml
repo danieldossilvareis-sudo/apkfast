@@ -1,0 +1,101 @@
+name: Publish to PyPI
+
+# ATENÇÃO: este workflow NÃO foi executado nesta entrega. É apenas a automação
+# que dispara quando o maintainer publicar uma GitHub Release (ou acionar
+# workflow_dispatch manualmente). Nenhum upload foi feito aqui.
+#
+# OIDC (Trusted Publishing) requer cadastro do publisher no PyPI:
+#   PyPI -> seu projeto -> Settings -> Publishing -> Add a trusted publisher
+#   Owner: <dono>, Repository: apkfast, Workflow: publish.yml, Environment: pypi
+# Repita no TestPyPI se for publicar lá. Alternativamente, defina o secret
+# PYPI_API_TOKEN (necessário apenas se não usar OIDC).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "Destino do upload"
+        required: true
+        default: pypi
+        type: choice
+        options:
+          - pypi
+          - testpypi
+      dry_run:
+        description: "Apenas validar (sem upload)"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  # Release publicada => PyPI real. Dispatch => respeita os inputs acima.
+  REPOSITORY_URL: ${{ github.event_name == 'workflow_dispatch' && inputs.repository == 'testpypi' && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
+  DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
+
+jobs:
+  build:
+    name: Build and check distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install build tools
+        run: python3 -m pip install --upgrade build twine
+
+      - name: Build sdist + wheel
+        run: python3 -m build
+
+      - name: Validate metadata
+        run: python3 -m twine check dist/*
+
+      - name: Upload distributions as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish validated distributions
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist
+
+      - name: Dry run (no upload)
+        if: env.DRY_RUN == 'true'
+        run: |
+          echo "::notice::dry-run: sdist/wheel validados; nenhum upload foi realizado"
+          ls -l dist
+
+      - name: Publish via OIDC (Trusted Publishing)
+        if: env.DRY_RUN != 'true' && env.PYPI_API_TOKEN == ''
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: ${{ env.REPOSITORY_URL }}
+
+      - name: Publish via PYPI_API_TOKEN
+        if: env.DRY_RUN != 'true' && env.PYPI_API_TOKEN != ''
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: ${{ env.REPOSITORY_URL }}
+          password: ${{ secrets.PYPI_API_TOKEN }}

@@ -1,7 +1,7 @@
 # apkfast
 
 [![CI](https://github.com/danieldossilvareis-sudo/apkfast/actions/workflows/ci.yml/badge.svg)](https://github.com/danieldossilvareis-sudo/apkfast/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-2.4.1-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.5.0-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 CLI para **montar, compilar, otimizar e entregar APKs sem Gradle**, com suporte
@@ -23,7 +23,11 @@ Você pode sobrescrever com `--sdk-dir`, `--ndk-dir`, `--build-tools` ou
 
 ## Instalação
 
-### Via PyPI (recomendado)
+### Via PyPI (quando publicado)
+
+> **Atenção:** nesta versão (v2.4.1) o pacote **ainda não foi publicado** no
+> PyPI. Os comandos abaixo mostram o fluxo previsto após a primeira release
+> automatizada; até lá, use a seção **Via repositório**.
 
 ```sh
 python3 -m pip install apkfast
@@ -35,7 +39,7 @@ O wheel instala o comando `apkfast` e os dados de build (`include/`, `src/`,
 `patches/`, `docs/`) junto com o pacote Python. O SDK/NDK continua sendo
 detectado em `~/Android` (ou via `--sdk-dir`/`--ndk-dir`).
 
-### Via repositório (alternativa / desenvolvimento)
+### Via repositório (disponível agora / desenvolvimento)
 
 ```sh
 git clone https://github.com/apkfast/apkfast.git
@@ -272,6 +276,15 @@ python3 apkfast.py build projeto-inexistente -q
 > de engenharia reversa (símbolos, RTTI e tabelas dinâmicas removidos). Para
 > código Java, o R8 é usado quando disponível no SDK; arquivos
 > `proguard-rules.pro` no projeto são respeitados.
+
+## AAB / Google Play
+
+Use `build . --aab` para gerar o APK **e** um AAB assinado para a Play Store
+(`--aab-only` gera só o AAB; `--aab-output` escolhe o caminho). O AAB usa a
+mesma keystore do build — em releases, forneça uma **upload key** via
+`--keystore` (a chave de debug não pode ser publicada). O bundletool 1.18.3 é
+baixado com SHA256 verificado e cacheado em `~/.apkfast/tools/`. Detalhes,
+limitações e verificação: [`docs/aab.md`](docs/aab.md).
 
 ## SDL2 e SDL3 (sem Gradle)
 

@@ -175,3 +175,52 @@ foi alterada e nenhuma API existente foi removida.
 - Item (3) do escopo (cache de recursos/APK assinado) **não foi implementado**:
   mexeria em `builder.py`/`apkfast.py`, que são de propriedade da sessão
   coordenadora. Nenhum atalho de build foi introduzido nesta rodada.
+
+## v2.5.0 — EQUIPE A
+
+Escopo: AAB (Android App Bundle) no backend, fechando a limitação de
+distribuição da v2.5.0. Nenhuma versão foi alterada; `publish.py`,
+`device_ci.py`, `.github/`, `pyproject.toml`, `CHANGELOG.md` e `include/`
+não foram tocados nesta rodada.
+
+### Feito
+
+- `apkfast/bundle.py`: `ensure_bundletool()` (bundletool 1.18.3 fixo, SHA256
+  `a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29`, cache
+  em `~/.apkfast/tools/` com verificação antes de cada uso, redownload se o
+  cache divergir, `.part` + rename atômico), `prepare_module()`/`build_aab()`
+  (`base.zip` com `manifest/AndroidManifest.xml`, `resources.pb`, `res/`,
+  `dex/`, `lib/<abi>/`, `assets/`), `sign_aab()` (jarsigner v1/SHA-256, nunca
+  apksigner) e `verify_aab()` (`validate` + `dump manifest` + `build-apks
+  --mode=universal` com `--aapt2` da toolchain).
+- `apkfast/builder.py`: segundo `aapt2 link --proto-format` isolado em
+  `_link_proto()` (o link do APK continua intacto), extração da resolução de
+  keystore para `_resolve_keystore()` (APK e AAB usam a mesma chave), flags
+  `--aab`/`--aab-only`/`--aab-output`/`--bundletool-version` e nome padrão
+  espelhando o APK. Aviso explícito sobre upload key × app signing e sobre
+  keystore de debug.
+- `apkfast/builder.py` (correção descoberta na validação com recursos): o
+  aapt2 2.20 grava um ZIP contendo um `.flat` mesmo com `-o arquivo`; o
+  builder agora extrai o `.flat` interno antes do link. Sem isso, qualquer
+  projeto com `res/` falhava no link proto (e também no APK) com
+  `magic value is 0x04034b50`.
+- `apkfast/cli.py`: flags novas no `build`, relatório JSON com o caminho do
+  AAB e versão do bundletool, saída no console com ambos os artefatos.
+- `docs/aab.md`, seção curta no `README.md`, `tests/test_bundle.py` (unitários
+  sem download: versão/SHA, nomes de arquivo, layout do `base.zip`, recusa de
+  ABI inválida, comandos de build/sign/verify).
+
+### Riscos e limitações honestas
+
+- Apenas o módulo `base`: sem dynamic features, asset packs ou `.obb`.
+- `build-apks` local depende de um `aapt2` executável no host; o binário
+  linux/x86_64 embutido no bundletool não roda no Termux, por isso o apkfast
+  passa `--aapt2` da toolchain explicitamente. Se o aapt2 instalado não
+  suportar `--proto-format`, o build falha com dica de usar o aapt2 do Maven.
+- `--bundletool-version` diferente do padrão consulta o digest do release no
+  GitHub; sem conectividade, use a versão fixa ou `APKFAST_BUNDLETOOL_SHA256`.
+- Verificação local (`validate` + `dump` + APK universal) não substitui o
+  upload de teste no Play Console (políticas e Play App Signing).
+- `.gitignore` está fora da propriedade desta equipe: output padrão
+  `dist/*.aab` ainda aparece como untracked. A sessão coordenadora deve
+  adicionar `*.aab` ao `.gitignore` (não feito aqui).

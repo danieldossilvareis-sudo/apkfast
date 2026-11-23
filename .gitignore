@@ -9,6 +9,7 @@ venv/
 build/
 dist/
 *.apk
+*.aab
 *.a
 *.so
 *.o

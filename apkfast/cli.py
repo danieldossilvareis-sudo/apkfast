@@ -12,8 +12,10 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from . import bundle as bundle_mod
 from .builder import BuildOptions, BuildError, build
 from .completions import SHELLS
+from . import publish
 from .cache_transport import register as register_cache_transport
 from .toolchain import detect
 
@@ -155,6 +157,19 @@ def _config_status(project: Path) -> dict:
 def _add_build_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("project", nargs="?", default=".", help="diretório do projeto")
     parser.add_argument("-o", "--output", help="caminho do APK final")
+    parser.add_argument(
+        "--aab", action="store_true",
+        help="gera também o AAB (além do APK) para upload na Play Store",
+    )
+    parser.add_argument(
+        "--aab-only", action="store_true",
+        help="gera apenas o AAB (sem APK)",
+    )
+    parser.add_argument("--aab-output", help="caminho do arquivo .aab final")
+    parser.add_argument(
+        "--bundletool-version", default=bundle_mod.BUNDLETOOL_VERSION,
+        help=f"versão fixa do bundletool (default: {bundle_mod.BUNDLETOOL_VERSION})",
+    )
     parser.add_argument("--build-dir", help="diretório de arquivos temporários")
     parser.add_argument(
         "--generate-lock", action="store_true",
@@ -282,7 +297,9 @@ def _generate_lock(args: argparse.Namespace) -> int:
     return 0
 
 
-def _write_build_report(args: argparse.Namespace, apk: Path, log: Any) -> None:
+def _write_build_report(
+    args: argparse.Namespace, apk: Path, log: Any, aab: Path | None = None
+) -> None:
     """Grava metadados do build em JSON (fora do APK)."""
     project = Path(args.project).expanduser().resolve()
     if args.report:
@@ -316,6 +333,8 @@ def _write_build_report(args: argparse.Namespace, apk: Path, log: Any) -> None:
         "apiVersion": _api_version_string(),
         "project": str(project),
         "output": str(apk.resolve()),
+        "aab": str(aab.resolve()) if aab is not None else None,
+        "bundletoolVersion": args.bundletool_version if (aab is not None) else None,
         "abis": abis,
         "api": args.api,
         "minSdk": args.min_sdk,
@@ -345,6 +364,10 @@ def _cmd_build(args: argparse.Namespace) -> int:
     options = BuildOptions(
         project=Path(args.project),
         output=Path(args.output) if args.output else None,
+        aab=bool(args.aab or args.aab_only),
+        aab_only=bool(args.aab_only),
+        aab_output=Path(args.aab_output) if args.aab_output else None,
+        bundletool_version=args.bundletool_version,
         build_dir=Path(args.build_dir) if args.build_dir else None,
         abi=args.abi,
         abis=[a.strip() for a in args.abis.split(",") if a.strip()],
@@ -384,8 +407,10 @@ def _cmd_build(args: argparse.Namespace) -> int:
         log.error(f"[✗] {exc}")
         return 1
     log.info(f"[✓] Build concluído: {apk}")
+    if options.built_aab is not None:
+        log.info(f"[✓] AAB: {options.built_aab}")
     if args.report is not None:
-        _write_build_report(args, apk, log)
+        _write_build_report(args, apk, log, options.built_aab)
     return 0
 
 
@@ -937,6 +962,7 @@ def create_parser() -> argparse.ArgumentParser:
     _add_cache_transport_args(p_cache_import, export=False)
     p_cache_import.set_defaults(func=_cmd_cache_import)
     register_cache_transport(sub)
+    publish.register(sub)
 
     p_luna = sub.add_parser("lunasvg-install", help="prepara LunaSVG (SVG completo)")
     _add_quiet(p_luna)

@@ -13,6 +13,7 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import bundle as bundle_mod
 from . import cache as cache_mod
 from . import config_schema, lockfile as lock_mod
 from .manifest import ManifestInfo, is_native_activity, parse_manifest
@@ -68,6 +69,11 @@ class Logger:
 class BuildOptions:
     project: Path
     output: Path | None = None
+    aab: bool = False
+    aab_only: bool = False
+    aab_output: Path | None = None
+    bundletool_version: str = bundle_mod.BUNDLETOOL_VERSION
+    built_aab: Path | None = None        # preenchido por build() quando --aab
     build_dir: Path | None = None
     abi: str = "arm64-v8a"          # usar "all" para fat APK
     abis: list[str] = field(default_factory=list)
@@ -328,8 +334,39 @@ def _compile_resources(
         flat_name = "_".join(relative.parts) + ".flat"
         output = compiled_dir / flat_name
         _run([tc.aapt2, "compile", "-o", str(output), str(source)], log)
-        flat_files.append(output)
-    return flat_files
+        # Algumas versões do aapt2 (inclusive a 2.20 usada no Termux) gravam
+        # um ZIP com um único .flat dentro mesmo quando -o é um arquivo.
+        # aapt2 link não aceita esse ZIP: extrai o .flat real antes de linkar.
+        flat_files.extend(_unpack_compiled_flat(output, compiled_dir))
+    return sorted(set(flat_files))
+
+
+def _unpack_compiled_flat(output: Path, compiled_dir: Path) -> list[Path]:
+    if not zipfile.is_zipfile(output):
+        return [output]
+    try:
+        with zipfile.ZipFile(output) as archive:
+            names = archive.namelist()
+            if len(names) != 1:
+                raise BuildError(
+                    f"aapt2 compile gerou {len(names)} arquivos em {output} (esperado 1)."
+                )
+            name = names[0]
+            if (
+                not name.endswith(".flat")
+                or "/" in name
+                or "\\" in name
+                or ".." in name
+                or Path(name).is_absolute()
+            ):
+                raise BuildError(f"Nome de .flat inesperado no ZIP {output}: {name!r}")
+            payload = archive.read(name)
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise BuildError(f"Falha ao ler saída do aapt2 {output}: {exc}") from exc
+    inner = compiled_dir / name
+    output.unlink(missing_ok=True)
+    inner.write_bytes(payload)
+    return [inner]
 
 
 def _collect_sources(project: Path, explicit: list[str]) -> list[Path]:
@@ -1090,6 +1127,69 @@ def _add_extra_files_with_zip(apk: Path, extra_root: Path) -> None:
         raise BuildError(f"Falha ao empacotar arquivos extras no APK: {exc}") from exc
 
 
+def _resolve_keystore(tc: Toolchain, options: BuildOptions, log: Logger) -> Path:
+    """Keystore único para APK e AAB (debug criado sob demanda)."""
+    keystore = options.keystore
+    if keystore is None:
+        if options.release:
+            raise BuildError(
+                "Modo release exige --keystore. Use --keystore outro.jks "
+                "(ou rode sem --release para usar o keystore debug)."
+            )
+        keystore = _default_keystore()
+        ensure_debug_keystore(
+            tc, keystore, options.keystore_password, options.key_alias, log
+        )
+    elif not keystore.is_file():
+        raise BuildError(f"Keystore não encontrado: {keystore}")
+    return keystore
+
+
+def _link_proto(
+    tc: Toolchain,
+    options: BuildOptions,
+    work: Path,
+    manifest_path: Path,
+    manifest: ManifestInfo,
+    flat_files: list[Path],
+) -> Path:
+    """Segundo link do aapt2, em protobuf, usado apenas pelo AAB."""
+    log = options.log
+    assert log is not None
+    proto = work / "aab" / "proto.apk"
+    proto.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        tc.aapt2,
+        "link",
+        "--proto-format",
+        "-o",
+        str(proto),
+        "--manifest",
+        str(manifest_path),
+        "-I",
+        str(tc.platform_dir / "android.jar"),
+        "--min-sdk-version",
+        str(options.min_sdk),
+        "--target-sdk-version",
+        str(options.target_sdk),
+        "--version-code",
+        manifest.version_code or "1",
+        "--version-name",
+        manifest.version_name or "1.0",
+        "--auto-add-overlay",
+    ]
+    for flat in flat_files:
+        cmd += ["-R", str(flat)]
+    try:
+        _run(cmd, log)
+    except BuildError as exc:
+        raise BuildError(
+            f"{exc}\n[!] O aapt2 precisa aceitar --proto-format para gerar AAB. "
+            "Use um aapt2 recente do Maven com.android.tools.build:aapt2."
+        ) from exc
+    return proto
+
+
 def _align_and_sign(
     tc: Toolchain,
     options: BuildOptions,
@@ -1116,19 +1216,7 @@ def _align_and_sign(
         log.warn("[!] zipalign sem suporte a -P 16; usando alinhamento 4.")
         _run([tc.zipalign, "-f", "4", str(unsigned), str(aligned)], log)
 
-    keystore = options.keystore
-    if keystore is None:
-        if options.release:
-            raise BuildError(
-                "Modo release exige --keystore. Use --keystore outro.jks "
-                "(ou rode sem --release para usar o keystore debug)."
-            )
-        keystore = _default_keystore()
-        ensure_debug_keystore(
-            tc, keystore, options.keystore_password, options.key_alias, log
-        )
-    elif not keystore.is_file():
-        raise BuildError(f"Keystore não encontrado: {keystore}")
+    keystore = _resolve_keystore(tc, options, log)
 
     signed = work / "apk" / "signed.apk"
     cmd = [
@@ -1209,6 +1297,7 @@ def _release_build_lock(lock: Path) -> None:
 def build(options: BuildOptions) -> Path:
     log = options.log
     assert log is not None
+    options.built_aab = None  # não herda resultado de um build anterior
     project = options.project.expanduser().resolve()
     if not project.is_dir():
         raise BuildError(f"Diretório de projeto não existe: {project}")
@@ -1274,6 +1363,15 @@ def build(options: BuildOptions) -> Path:
     duplicates = sorted({abi for abi in abis if abis.count(abi) > 1})
     if duplicates:
         raise BuildError(f"ABI(s) repetida(s): {', '.join(duplicates)}.")
+
+    want_aab = options.aab or options.aab_only
+    if want_aab:
+        try:
+            options.bundletool_version = bundle_mod.validate_version(
+                options.bundletool_version
+            )
+        except bundle_mod.BundleError as exc:
+            raise BuildError(str(exc)) from exc
 
     tc = detect(
         abi=abis[0],
@@ -1355,28 +1453,112 @@ def build(options: BuildOptions) -> Path:
                 lib, extra_libs = _native_build(abi_tc, options, project, work, manifest)
                 _stage_native_lib(work, abi, lib, extra_libs)
 
-            log.info("[*] Empacotando APK...")
-            unsigned = _link_apk(tc, options, work, manifest_path, manifest, flats, dex)
-            _add_extra_files_with_zip(unsigned, work / "apk")
-
-            log.info("[*] Alinhando e assinando...")
-            signed = _align_and_sign(tc, options, work, unsigned)
-
             suffix = "all" if len(abis) > 1 else abis[0]
             if options.release:
                 suffix += "-release"
-            output = options.output or (project / "dist" / f"{manifest.package.split('.')[-1]}-{suffix}.apk")
-            output = output.expanduser().resolve()
-            if output == project or output in project.parents:
-                raise BuildError(f"--output não pode ser o projeto nem um ancestral dele: {output}")
-            try:
-                output.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(signed, output)
-            except OSError as exc:
-                raise BuildError(f"Falha ao gravar APK final {output}: {exc}") from exc
-            size = output.stat().st_size / 1024
-            log.info(f"[✓] APK final: {output} ({size:.1f} KiB)")
-            return output
+            apk_result: Path | None = None
+
+            if not options.aab_only:
+                log.info("[*] Empacotando APK...")
+                unsigned = _link_apk(tc, options, work, manifest_path, manifest, flats, dex)
+                _add_extra_files_with_zip(unsigned, work / "apk")
+
+                log.info("[*] Alinhando e assinando...")
+                signed = _align_and_sign(tc, options, work, unsigned)
+
+                output = options.output or (
+                    project / "dist" / f"{manifest.package.split('.')[-1]}-{suffix}.apk"
+                )
+                output = output.expanduser().resolve()
+                if output == project or output in project.parents:
+                    raise BuildError(
+                        f"--output não pode ser o projeto nem um ancestral dele: {output}"
+                    )
+                try:
+                    output.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(signed, output)
+                except OSError as exc:
+                    raise BuildError(f"Falha ao gravar APK final {output}: {exc}") from exc
+                size = output.stat().st_size / 1024
+                log.info(f"[✓] APK final: {output} ({size:.1f} KiB)")
+                apk_result = output
+
+            if want_aab:
+                log.info("[*] Gerando AAB...")
+                keystore = _resolve_keystore(tc, options, log)
+                log.warn(
+                    "[!] AAB será assinado com a MESMA keystore do APK "
+                    f"({keystore}, alias {options.key_alias}). "
+                    "Para a Play Store use uma upload key própria; se ela estiver "
+                    "inscrita no Play App Signing, NÃO use a chave de app signing."
+                )
+                if options.keystore is None:
+                    log.warn(
+                        "[!] Keystore de debug: o AAB resultante NÃO pode ser publicado "
+                        "na Play Store (use --release --keystore ...)."
+                    )
+                try:
+                    bundletool = bundle_mod.ensure_bundletool(
+                        options.bundletool_version, quiet=log.quiet
+                    )
+                    aab_output = bundle_mod.default_aab_path(
+                        manifest.package,
+                        suffix,
+                        project / "dist",
+                        apk_output=options.output,
+                        explicit=options.aab_output,
+                    ).expanduser().resolve()
+                    if aab_output == project or aab_output in project.parents:
+                        raise BuildError(
+                            f"--aab-output não pode ser o projeto nem um ancestral dele: {aab_output}"
+                        )
+                    proto = _link_proto(tc, options, work, manifest_path, manifest, flats)
+                    assets_dir = options.assets_dir or (project / "assets")
+                    unsigned_aab = bundle_mod.build_aab(
+                        work=work,
+                        proto_apk=proto,
+                        bundletool=bundletool,
+                        dex_dir=work / "apk",
+                        lib_dir=work / "apk" / "lib",
+                        assets_dir=assets_dir if assets_dir.is_dir() else None,
+                        quiet=log.quiet,
+                        java=tc.java,
+                    )
+                    signed_aab = bundle_mod.sign_aab(
+                        unsigned_aab,
+                        keystore=keystore,
+                        store_password=options.keystore_password,
+                        key_alias=options.key_alias,
+                        key_password=options.key_password,
+                        output=work / "aab" / "signed.aab",
+                        quiet=log.quiet,
+                    )
+                    bundle_mod.verify_aab(
+                        signed_aab,
+                        bundletool=bundletool,
+                        work=work / "aab",
+                        aapt2=tc.aapt2,
+                        keystore=keystore,
+                        store_password=options.keystore_password,
+                        key_alias=options.key_alias,
+                        key_password=options.key_password,
+                        quiet=log.quiet,
+                        java=tc.java,
+                    )
+                    aab_output.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(signed_aab, aab_output)
+                except bundle_mod.BundleError as exc:
+                    raise BuildError(str(exc)) from exc
+                except OSError as exc:
+                    raise BuildError(f"Falha ao gravar AAB final: {exc}") from exc
+                options.built_aab = aab_output
+                size = aab_output.stat().st_size / 1024
+                log.info(f"[✓] AAB final: {aab_output} ({size:.1f} KiB)")
+
+            result = apk_result if apk_result is not None else options.built_aab
+            if result is None:
+                raise BuildError("Nenhum artefato foi gerado (verifique --aab/--aab-only).")
+            return result
         finally:
             _release_build_lock(lock)
     finally:

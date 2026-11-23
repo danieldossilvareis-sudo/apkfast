@@ -1,0 +1,226 @@
+name: Device validation (real)
+
+# ATENÇÃO: workflow ADITIVO e NÃO executado nesta entrega. Ele NÃO substitui a
+# "Build matrix" (.github/workflows/device.yml), que continua intacta.
+#
+# Modos (configuráveis sem editar este arquivo):
+#   1. self-hosted: vars.DEVICE_RUNNER_LABEL (label do runner com KVM/aparelho)
+#   2. Firebase Test Lab: secrets.GCLOUD_PROJECT (+ GCLOUD_SERVICE_ACCOUNT_JSON)
+#
+# Se nenhum dos dois estiver configurado, o job "skip" apenas avisa e a execução
+# termina com sucesso (não falha).
+
+on:
+  workflow_dispatch:
+    inputs:
+      abi:
+        description: "ABI do APK de exemplo (quando apk_url estiver vazio)"
+        required: true
+        default: x86_64
+        type: choice
+        options:
+          - arm64-v8a
+          - armeabi-v7a
+          - x86_64
+      package:
+        description: "Package do APK validado"
+        required: false
+        default: com.example.nativehello
+        type: string
+      apk_url:
+        description: "URL de um APK pronto (opcional); vazio = compila native-hello"
+        required: false
+        type: string
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  config:
+    name: Resolve device mode
+    runs-on: ubuntu-latest
+    outputs:
+      self_hosted: ${{ steps.decide.outputs.self_hosted }}
+      firebase: ${{ steps.decide.outputs.firebase }}
+      none: ${{ steps.decide.outputs.none }}
+      label: ${{ steps.decide.outputs.label }}
+    env:
+      # Secrets não podem ser usados em jobs.<job_id>.if; por isso viram env.
+      DEVICE_RUNNER_LABEL: ${{ vars.DEVICE_RUNNER_LABEL }}
+      GCLOUD_PROJECT: ${{ secrets.GCLOUD_PROJECT }}
+    steps:
+      - id: decide
+        run: |
+          set -eu
+          echo "self_hosted=false" >> "$GITHUB_OUTPUT"
+          echo "firebase=false" >> "$GITHUB_OUTPUT"
+          echo "none=false" >> "$GITHUB_OUTPUT"
+          if [ -n "${DEVICE_RUNNER_LABEL:-}" ]; then
+            echo "self_hosted=true" >> "$GITHUB_OUTPUT"
+            printf 'label=%s\n' "$DEVICE_RUNNER_LABEL" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "${GCLOUD_PROJECT:-}" ]; then
+            echo "firebase=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -z "${DEVICE_RUNNER_LABEL:-}" ] && [ -z "${GCLOUD_PROJECT:-}" ]; then
+            echo "none=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::device-real: nenhum modo configurado. Defina vars.DEVICE_RUNNER_LABEL e/ou secrets.GCLOUD_PROJECT."
+          fi
+
+  skip:
+    name: No device mode configured
+    needs: config
+    if: needs.config.outputs.none == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain skip
+        run: |
+          echo "device-real: SKIPPED (sem modo configurado)"
+          echo "Configure vars.DEVICE_RUNNER_LABEL (runner self-hosted) ou secrets.GCLOUD_PROJECT (Firebase Test Lab)."
+
+  self-hosted:
+    name: Self-hosted (KVM / dispositivo)
+    needs: config
+    if: needs.config.outputs.self_hosted == 'true'
+    runs-on: ${{ needs.config.outputs.label }}
+    timeout-minutes: 60
+    env:
+      PACKAGE: ${{ inputs.package || 'com.example.nativehello' }}
+      ABI: ${{ inputs.abi || 'x86_64' }}
+      APK_URL: ${{ inputs.apk_url || '' }}
+      DEVICE_SERIAL: ${{ vars.DEVICE_SERIAL || '' }}
+      APKFAST_ANDROID_ROOT: ${{ vars.APKFAST_ANDROID_ROOT || '' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Prepare APK
+        run: |
+          set -eu
+          mkdir -p dist
+          if [ -n "${APK_URL:-}" ]; then
+            curl -fL --retry 3 -o dist/app.apk "$APK_URL"
+          else
+            python3 apkfast.py build examples/native-hello \
+              --abi "$ABI" -o "$PWD/dist/app.apk"
+          fi
+          test -s dist/app.apk
+
+      - name: Validate on real device
+        run: |
+          set -eu
+          extra=()
+          if [ -n "${DEVICE_SERIAL:-}" ]; then extra+=(--serial "$DEVICE_SERIAL"); fi
+          sh scripts/device-check.sh "${extra[@]}" \
+            --log-file device-check.log dist/app.apk "$PACKAGE"
+
+      - name: Upload device log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: device-check-self-hosted
+          path: device-check.log
+          if-no-files-found: ignore
+
+  firebase-test-lab:
+    name: Firebase Test Lab (robo)
+    needs: config
+    if: needs.config.outputs.firebase == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GCLOUD_PROJECT: ${{ secrets.GCLOUD_PROJECT }}
+      GCLOUD_SERVICE_ACCOUNT_JSON: ${{ secrets.GCLOUD_SERVICE_ACCOUNT_JSON }}
+      PACKAGE: ${{ inputs.package || 'com.example.nativehello' }}
+      ABI: ${{ inputs.abi || 'x86_64' }}
+      APK_URL: ${{ inputs.apk_url || '' }}
+      RESULTS_BUCKET: ${{ vars.FIREBASE_RESULTS_BUCKET || '' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Prepare APK
+        run: |
+          set -eu
+          mkdir -p dist testlab-results
+          if [ -n "${APK_URL:-}" ]; then
+            curl -fL --retry 3 -o dist/app.apk "$APK_URL"
+          else
+            python3 apkfast.py build examples/native-hello \
+              --abi "$ABI" -o "$PWD/dist/app.apk"
+          fi
+          test -s dist/app.apk
+
+      - name: Authenticate gcloud
+        run: |
+          set -eu
+          command -v gcloud >/dev/null || { echo "::error::gcloud CLI não disponível no runner"; exit 1; }
+          test -n "${GCLOUD_SERVICE_ACCOUNT_JSON:-}" || {
+            echo "::error::GCLOUD_SERVICE_ACCOUNT_JSON não configurado"; exit 1;
+          }
+          key="$RUNNER_TEMP/gcloud-sa.json"
+          printf '%s' "$GCLOUD_SERVICE_ACCOUNT_JSON" > "$key"
+          chmod 600 "$key"
+          gcloud auth activate-service-account --key-file="$key"
+          gcloud config set project "$GCLOUD_PROJECT"
+
+      - name: Run Firebase Test Lab
+        id: testlab
+        run: |
+          set -eu
+          results_dir="apkfast-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          args=(
+            firebase test android run --type robo
+            --app dist/app.apk
+            --device model=Pixel2,version=28,locale=en,orientation=portrait
+            --project "$GCLOUD_PROJECT"
+            --results-dir "$results_dir"
+            --timeout 5m
+          )
+          if [ -n "${RESULTS_BUCKET:-}" ]; then
+            args+=(--results-bucket "$RESULTS_BUCKET")
+          fi
+          gcloud "${args[@]}" 2>&1 | tee "$RUNNER_TEMP/testlab.out"
+          echo "results_dir=$results_dir" >> "$GITHUB_OUTPUT"
+          if [ -n "${RESULTS_BUCKET:-}" ]; then
+            echo "results_bucket=$RESULTS_BUCKET" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch and check Test Lab logcat
+        if: steps.testlab.outputs.results_bucket != ''
+        env:
+          RESULTS_BUCKET: ${{ steps.testlab.outputs.results_bucket }}
+          RESULTS_DIR: ${{ steps.testlab.outputs.results_dir }}
+        run: |
+          set -eu
+          if ! command -v gsutil >/dev/null; then
+            echo "::warning::gsutil indisponível; pulando verificação do logcat do Test Lab"
+            exit 0
+          fi
+          if ! gsutil -m cp -r "gs://${RESULTS_BUCKET}/${RESULTS_DIR}/*" testlab-results/; then
+            echo "::warning::não foi possível baixar os logs do Test Lab"
+            exit 0
+          fi
+          matches="$(grep -REI 'FATAL|dlopen failed|AndroidRuntime.*Exception' testlab-results || true)"
+          if [ -n "$matches" ]; then
+            printf '%s\n' "$matches" | head -n 20 >&2
+            echo "::error::logcat do Test Lab contém padrão de crash"
+            exit 1
+          fi
+          echo "OK: logcat do Test Lab sem FATAL/dlopen failed/AndroidRuntime exceptions"
+
+      - name: Upload Test Lab results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testlab-results
+          path: testlab-results
+          if-no-files-found: ignore

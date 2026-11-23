@@ -1,5 +1,43 @@
 # Changelog
 
+## [2.5.0] - 2026-11-23 — Backend completo
+
+Fecha os três bloqueadores restantes de distribuição/qualidade.
+
+### Adicionado — Equipe A (AAB)
+
+- **AAB (Android App Bundle)** via bundletool 1.18.3 pinned (SHA256 verificado)
+- `build --aab`, `--aab-only`, `--aab-output`, `--bundletool-version`
+- montagem do `base.zip`, link `aapt2 --proto-format`, assinatura AAB com
+  `jarsigner` e verificação com `bundletool validate`/`build-apks`
+- correção de bug no aapt2 2.20: `.flat` vinha dentro de um ZIP e era extraído
+  antes do link (afetava qualquer projeto com `res/`)
+- `docs/aab.md`
+
+### Adicionado — Equipe B (distribuição/qualidade)
+
+- comandos `dist` e `publish-pypi` com dry-run por padrão, `--yes` para upload,
+  token apenas via ambiente e redação de segredos
+- `.github/workflows/publish.yml`: release → build/twine check → PyPI/TestPyPI
+  via OIDC ou `PYPI_API_TOKEN`
+- `.github/workflows/device-real.yml`: modos self-hosted (KVM/aparelho) e
+  Firebase Test Lab, com skip explícito quando não configurado
+- `scripts/device-check.sh` para validação adb local
+- `docs/publishing.md`, `docs/device-ci.md`
+
+### Validado
+
+- 53 testes unitários OK
+- AAB real: `native-hello`, `image-demo` e fat APK (`--abi all`) validados com
+  `bundletool validate` e `build-apks --mode=universal`
+- `jarsigner -verify` OK
+- script `device-check.sh` com adb falso: caminho feliz e detecção de `FATAL`
+
+### Ainda externo
+
+- Upload real ao PyPI depende de credenciais/OIDC configuradas; automação pronta
+- CI de dispositivo real depende de runner self-hosted ou projeto Firebase
+
 ## [2.4.1] - 2026-11-23 — Patch de estabilidade
 
 - CI convertida de emulator para **build matrix** confiável: API 21/28/35 ×
