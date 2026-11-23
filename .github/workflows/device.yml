@@ -29,17 +29,19 @@ jobs:
       # ubuntu-latest já traz ANDROID_HOME/sdkmanager. O setup-android@v3
       # tenta instalar o pacote "tools", que foi removido do repositório
       # Android e quebra o job antes de qualquer teste.
-      - name: Verify preinstalled Android SDK
+      - name: Resolve preinstalled sdkmanager
         run: |
           set -e
           test -n "$ANDROID_HOME"
-          command -v sdkmanager
+          sdkmgr="$(find "$ANDROID_HOME/cmdline-tools" -type f -path '*/bin/sdkmanager' | sort | tail -1)"
+          test -n "$sdkmgr"
+          echo "SDKMGR=$sdkmgr" >> "$GITHUB_ENV"
 
       - name: Install SDK platforms and NDK
         run: |
           set -e
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager --install \
+          yes | "$SDKMGR" --licenses >/dev/null 2>&1 || true
+          "$SDKMGR" --install \
             "platform-tools" \
             "platforms;android-21" \
             "platforms;android-28" \
