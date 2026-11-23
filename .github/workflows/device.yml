@@ -26,7 +26,14 @@ jobs:
         with:
           python-version: "3.11"
 
-      - uses: android-actions/setup-android@v3
+      # ubuntu-latest já traz ANDROID_HOME/sdkmanager. O setup-android@v3
+      # tenta instalar o pacote "tools", que foi removido do repositório
+      # Android e quebra o job antes de qualquer teste.
+      - name: Verify preinstalled Android SDK
+        run: |
+          set -e
+          test -n "$ANDROID_HOME"
+          command -v sdkmanager
 
       - name: Install SDK platforms and NDK
         run: |
