@@ -28,7 +28,7 @@ cabeçalho único (`gl.hpp`), que encapsula EGL + OpenGL ES 2/3 para uma
       │
   Mesh        — VBO + IBO reutilizável
       │
-  Texture     — carrega PNG/JPEG de assets/
+  Texture     — carrega PNG/JPEG/WebP/SVG de assets/
       │
       ▼
   GLES2Scene  — orquestra tudo (implementa Scene)
@@ -515,7 +515,7 @@ seja, também passa pelo upload do `temporary_mesh_` da cena a cada iteração.
 
 ---
 
-## 5. `Texture` — stb_image embutido e cache na cena
+## 5. `Texture` — stb_image, WebP/SVG e cache na cena
 
 ```cpp
 class Texture {
@@ -525,7 +525,11 @@ public:
     Texture(const Texture&) = delete;
     Texture& operator=(const Texture&) = delete;
 
-    bool load(const std::string& path);
+    bool load(const std::string& path);                 // detecta o formato
+    bool load_webp_asset(const std::string& path);
+    bool load_svg_asset(const std::string& path,
+                        int width = 0, int height = 0);
+    bool load_rgba(const uint8_t* rgba, int width, int height);
     void bind(unsigned int unit = 0) const;
     void destroy();
 
@@ -536,6 +540,10 @@ public:
 ```
 
 ### 5.1 `load(path)`
+
+Desde a v2.2.0 o formato é escolhido por magic bytes: PNG/JPEG continuam no
+stb_image, WebP usa `BitmapFactory` + `AndroidBitmap_*` via JNI, e SVG é
+rasterizado pelo NanoSVG. Veja [image-formats.md](image-formats.md).
 
 ```cpp
 auto& assets = Assets::instance(nullptr);

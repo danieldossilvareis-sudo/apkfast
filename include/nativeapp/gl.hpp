@@ -19,6 +19,7 @@
 #include "assets.hpp"
 #include "font.hpp"
 #include "graphics_types.hpp"
+#include "image_codecs.hpp"
 #include "math.hpp"
 
 #include <array>
@@ -517,54 +518,22 @@ public:
     Texture(const Texture&) = delete;
     Texture& operator=(const Texture&) = delete;
 
-    bool load(const std::string& path) {
-        auto& assets = Assets::instance(nullptr);
-        if (!assets.manager()) return false;
-        const uint64_t generation = gl_detail::context_generation();
-        if (generation_ != generation) {
-            // Contexto novo: o nome antigo pode pertencer a outro objeto.
-            texture_ = 0;
-            width_ = height_ = 0;
-            generation_ = generation;
-        }
-        const auto data = assets.read(path);
-        if (data.empty() || data.size() > static_cast<size_t>(INT_MAX)) return false;
+    /// Carrega PNG/JPEG/WebP/SVG de assets/ (formato detectado por magic bytes).
+    bool load(const std::string& path) { return load_with_size(path, 0, 0); }
 
-        int width = 0, height = 0, channels = 0;
-        stbi_uc* pixels = stbi_load_from_memory(
-            data.data(), static_cast<int>(data.size()),
-            &width, &height, &channels, 4);
-        if (!pixels || width <= 0 || height <= 0) {
-            if (pixels) stbi_image_free(pixels);
-            return false;
-        }
+    /// Alias explícito: útil para documentar intenção em código de usuário.
+    bool load_webp_asset(const std::string& path) { return load(path); }
 
-        // Decodifica primeiro para não perder a textura anterior se o
-        // carregamento falhar (o nome antigo já foi descartado acima quando
-        // houve troca de contexto).
-        if (texture_) {
-            glDeleteTextures(1, &texture_);
-            texture_ = 0;
-            width_ = height_ = 0;
-        }
-        glGenTextures(1, &texture_);
-        if (!texture_) {
-            stbi_image_free(pixels);
-            return false;
-        }
-        glBindTexture(GL_TEXTURE_2D, texture_);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        stbi_image_free(pixels);
-        width_ = width;
-        height_ = height;
-        generation_ = generation;
-        gl_check("texture_load");
-        return true;
+    /// Rasteriza SVG para width x height (0,0 = tamanho natural do documento).
+    bool load_svg_asset(const std::string& path, int width = 0, int height = 0) {
+        return load_with_size(path, width, height);
+    }
+
+    /// Sobe RGBA já decodificado (uint8_t, 4 bytes por pixel).
+    bool load_rgba(const uint8_t* rgba, int width, int height) {
+        if (!rgba || width <= 0 || height <= 0) return false;
+        refresh_generation();
+        return upload_rgba(rgba, width, height);
     }
 
     void bind(unsigned int unit = 0) const {
@@ -586,6 +555,46 @@ public:
     GLuint id() const { return texture_; }
 
 private:
+    void refresh_generation() {
+        const uint64_t generation = gl_detail::context_generation();
+        if (generation_ == generation) return;
+        // Contexto novo: o nome antigo pode pertencer a outro objeto.
+        texture_ = 0;
+        width_ = height_ = 0;
+        generation_ = generation;
+    }
+
+    bool upload_rgba(const uint8_t* rgba, int width, int height) {
+        // Só destrói a textura antiga depois de ter pixels válidos em mãos.
+        if (texture_) {
+            glDeleteTextures(1, &texture_);
+            texture_ = 0;
+            width_ = height_ = 0;
+        }
+        glGenTextures(1, &texture_);
+        if (!texture_) return false;
+        glBindTexture(GL_TEXTURE_2D, texture_);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        width_ = width;
+        height_ = height;
+        generation_ = gl_detail::context_generation();
+        gl_check("texture_load");
+        return true;
+    }
+
+    bool load_with_size(const std::string& path, int svg_w, int svg_h) {
+        refresh_generation();
+        DecodedImage image;
+        if (!decode_asset_image(path, image, svg_w, svg_h)) return false;
+        if (image.width <= 0 || image.height <= 0 || image.rgba.empty()) return false;
+        return upload_rgba(image.rgba.data(), image.width, image.height);
+    }
+
     GLuint texture_ = 0;
     int width_ = 0;
     int height_ = 0;

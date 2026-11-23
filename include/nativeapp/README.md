@@ -89,7 +89,7 @@ Created → Ready ↔ Paused → Destroyed
 | `GLContext` | Display/context/surface EGL, `set_swap_interval()`, `recreate_surface()` |
 | `Shader` | `compile(src,src)`, `load(assets/vs,assets/fs)`, `set_uniform*()` |
 | `Mesh` | VBO + IBO reutilizável, `upload(MeshData)`, `draw()` |
-| `Texture` | PNG/JPEG de `assets/` via stb_image, `bind(unit)` |
+| `Texture` | PNG/JPEG/stb, WebP via AndroidBitmap e SVG via NanoSVG, `bind(unit)` |
 | `GLES2Scene` | Implementa `Scene`, shaders padrão, `set_shader()`, `set_mesh()`, `set_projection()` |
 | `GLES3Scene` | Extende GLES2 com `draw_instanced()` |
 

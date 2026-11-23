@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -88,6 +90,8 @@ class BuildOptions:
     libraries: list[str] = field(default_factory=list)
     libs_dir: Path | None = None
     assets_dir: Path | None = None
+    incremental: bool | None = None  # None = usar apkfast.json (default: true)
+    clean_cache: bool = False
     verbose: bool = False
     quiet: bool = False
     log: Logger | None = None
@@ -163,6 +167,129 @@ def _clean(path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise BuildError(f"Falha ao criar {path}: {exc}") from exc
+
+
+_CACHE_SCHEMA = 1
+
+
+def _sha256_file(path: Path) -> str:
+    """Hash de arquivo em streaming (headers NDK podem ser grandes)."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+
+
+def _cache_dir(work: Path, project: Path, abi: str) -> Path:
+    """Cache fora de `work`, que é apagado por `_clean()` a cada build."""
+    project_key = _sha256_text(str(project))[:12]
+    return work.parent / ".apkfast-cache" / project_key / abi
+
+
+def _read_cache(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict) or data.get("schema") != _CACHE_SCHEMA:
+        return {"schema": _CACHE_SCHEMA, "objects": {}}
+    if not isinstance(data.get("objects"), dict):
+        data["objects"] = {}
+    return data
+
+
+def _write_cache(path: Path, cache: dict) -> None:
+    """Escrita atômica: um build interrompido não corrompe o cache."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_text(json.dumps(cache, sort_keys=True))
+        os.replace(tmp, path)
+    except OSError:
+        # Cache é otimização: falhar ao gravar nunca deve quebrar o build.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _parse_depfile(path: Path) -> list[Path]:
+    """Lê o Makefile gerado por clang -MD (-MF) e devolve os headers."""
+    try:
+        text = path.read_text(errors="ignore")
+    except OSError:
+        return []
+    # Continuações de linha viram espaço antes da tokenização.
+    text = text.replace("\\\n", " ")
+    if ":" not in text:
+        return []
+    body = text.split(":", 1)[1]
+    tokens: list[str] = []
+    current: list[str] = []
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char == "\\" and index + 1 < len(body):
+            current.append(body[index + 1])
+            index += 2
+            continue
+        if char.isspace():
+            if current:
+                tokens.append("".join(current))
+                current = []
+            index += 1
+            continue
+        current.append(char)
+        index += 1
+    if current:
+        tokens.append("".join(current))
+    return [Path(token) for token in tokens if Path(token).is_file()]
+
+
+def _dep_state(paths: list[str]) -> list[list[str]]:
+    """Estado atual dos headers de um depfile: [caminho, hash do conteúdo]."""
+    state: list[list[str]] = []
+    for raw in paths:
+        path = Path(raw)
+        if not path.is_file():
+            return []
+        state.append([raw, _sha256_file(path)])
+    return state
+
+
+def _compiler_key(compiler: Path, tc: "Toolchain", log: Logger) -> str:
+    """Identifica o compilador de forma barata, sem poluir a saída."""
+    result = _execute([compiler, "--version"], log, capture=True)
+    version = result.stdout if result.returncode == 0 else ""
+    return _sha256_text(
+        "|".join(
+            str(part)
+            for part in (
+                compiler,
+                version,
+                tc.ndk_dir,
+                tc.sysroot,
+                tc.native_app_glue_dir(),
+            )
+        )
+    )
+
+
+def _api_headers_key(api_include: Path) -> str:
+    """Hash de todos os headers/impls do nativeapp (invalidam a detecção)."""
+    if not api_include.is_dir():
+        return ""
+    digest = hashlib.sha256()
+    for path in sorted(api_include.rglob("*")):
+        if path.suffix not in (".h", ".hpp", ".c", ".cpp"):
+            continue
+        digest.update(str(path.relative_to(api_include)).encode("utf-8", "replace"))
+        digest.update(_sha256_file(path).encode("ascii"))
+    return digest.hexdigest()
 
 
 def _strip_c_comments(text: str) -> str:
@@ -447,6 +574,78 @@ def _native_build(
     native_dir.mkdir(parents=True, exist_ok=True)
     objects: list[Path] = []
 
+    # Cache incremental vive FORA de work (que é apagado por _clean()).
+    cache_dir = _cache_dir(work, project, tc.abi)
+    if options.clean_cache or options.incremental is False:
+        if cache_dir.is_dir():
+            shutil.rmtree(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / "cache.json"
+    cache = _read_cache(cache_file)
+
+    def save_cache() -> None:
+        _write_cache(cache_file, cache)
+
+    compiler_keys: dict[str, str] = {}
+
+    def compiler_key_for(compiler: Path) -> str:
+        key = str(compiler)
+        if key not in compiler_keys:
+            compiler_keys[key] = _compiler_key(compiler, tc, log)
+        return compiler_keys[key]
+
+    def compile_unit(
+        source: Path,
+        *,
+        compiler: Path,
+        flags: list[str],
+        extra_key: str = "",
+    ) -> Path:
+        """Compila uma TU com cache por hash de fonte, flags e headers."""
+        base_cmd = [compiler, "-c", str(source), *flags]
+        cmd_key = _sha256_text(json.dumps([str(part) for part in base_cmd]))
+        key = _sha256_text(
+            "|".join(
+                (
+                    str(source.resolve()),
+                    cmd_key,
+                    compiler_key_for(compiler),
+                    api_key,
+                    extra_key,
+                )
+            )
+        )
+        obj = cache_dir / f"obj_{key[:20]}.o"
+        dep = cache_dir / f"obj_{key[:20]}.d"
+        entry = cache["objects"].get(key)
+        reused = False
+        if (
+            options.incremental is not False
+            and isinstance(entry, dict)
+            and entry.get("src_hash") == _sha256_file(source)
+            and obj.is_file()
+        ):
+            old_state = entry.get("dep_state")
+            new_state = _dep_state(entry.get("deps", []))
+            reused = bool(old_state) and old_state == new_state
+        if reused:
+            log.detail(f"[cache] reuso: {source.name}")
+            return obj
+
+        cmd = base_cmd[:2] + ["-o", str(obj), "-MD", "-MF", str(dep)] + base_cmd[2:]
+        _run(cmd, log)
+        deps = [str(path) for path in _parse_depfile(dep)]
+        cache["objects"][key] = {
+            "src": str(source),
+            "src_hash": _sha256_file(source),
+            "cmd_key": cmd_key,
+            "deps": deps,
+            "dep_state": _dep_state(deps),
+            "obj": obj.name,
+        }
+        save_cache()
+        return obj
+
     optimization = {
         "none": "-O0 -g",
         "release": "-O2 -DNDEBUG",
@@ -495,6 +694,7 @@ def _native_build(
     # Diretório da API nativeapp (headers ficam em <raiz do apkfast>/include).
     root = Path(__file__).resolve().parent.parent
     api_include = root / "include"
+    api_key = _api_headers_key(api_include) if options.use_nativeapp else ""
     raylib_dir = root / "vendor" / "raylib"
     raylib_static = raylib_dir / "lib" / f"libraylib-{tc.abi}.a"
 
@@ -515,20 +715,19 @@ def _native_build(
     ]
 
     log.info(f"[*] Compilando {len(sources)} arquivo(s) nativo(s) para {tc.abi}")
-    for index, source in enumerate(sources):
+    for source in sources:
         is_cpp = source.suffix in CPP_SUFFIXES
         compiler = tc.clang(cpp=is_cpp)
-        obj = native_dir / f"obj_{index}_{source.stem}.o"
-        cmd = [compiler, "-c", str(source), "-o", str(obj)]
-        cmd += compiler_flags(compiler)
-        cmd += base_flags
-        cmd += ["-std=c++17"] if is_cpp else ["-std=c11"]
-        cmd += common_flags
-        _run(cmd, log)
-        objects.append(obj)
+        flags = (
+            compiler_flags(compiler)
+            + base_flags
+            + (["-std=c++17"] if is_cpp else ["-std=c11"])
+            + common_flags
+        )
+        objects.append(compile_unit(source, compiler=compiler, flags=flags))
 
     glue_source = tc.native_app_glue_dir() / "android_native_app_glue.c"
-    glue_obj = native_dir / "android_native_app_glue.o"
+    glue_compiled = False
     # O raylib fornece android_main() (que chama main()), mas não fornece
     # ANativeActivity_onCreate — esse símbolo vem do glue do NDK. Portanto
     # compilamos o glue normalmente; o usuário deve definir main(), não
@@ -538,21 +737,21 @@ def _native_build(
     # referência dupla a android_main.
     if glue_source.is_file() and not uses_sdl3 and not uses_sdl2:
         glue_compiler = tc.clang()
-        cmd = [glue_compiler, "-c", str(glue_source), "-o", str(glue_obj)]
-        cmd += compiler_flags(glue_compiler)
-        cmd += base_flags + ["-std=c11"] + common_flags
-        _run(cmd, log)
-        objects.append(glue_obj)
+        flags = compiler_flags(glue_compiler) + base_flags + ["-std=c11"] + common_flags
+        objects.append(
+            compile_unit(glue_source, compiler=glue_compiler, flags=flags, extra_key="glue")
+        )
+        glue_compiled = True
 
-    if is_native_activity(manifest) and not uses_raylib and not uses_sdl3 and not uses_sdl2 and not any(
-        "android_native_app_glue" in o.name for o in objects
-    ):
+    if is_native_activity(manifest) and not uses_raylib and not uses_sdl3 and not uses_sdl2 and not glue_compiled:
         log.warn("[!] Aviso: NativeActivity declarada mas native_app_glue não foi compilado.")
 
-    output = native_dir / f"lib{_native_lib_name(manifest, project)}.so"
+    lib_name = _native_lib_name(manifest, project)
+    output = native_dir / f"lib{lib_name}.so"
+    cached_so = cache_dir / f"lib{lib_name}.so"
     has_cpp = any(s.suffix in CPP_SUFFIXES for s in sources)
     linker = tc.clang(cpp=has_cpp)
-    cmd = [linker, "-shared", "-o", str(output)]
+    cmd = [linker, "-shared", "-o", str(cached_so)]
     cmd += compiler_flags(linker)
     cmd += [
         "-Wl,--gc-sections",
@@ -575,6 +774,8 @@ def _native_build(
         "-ldl",
         "-landroid",
         "-llog",
+        # Stub do AndroidBitmap_* usado pelo decode WebP via BitmapFactory.
+        *( ["-ljnigraphics"] if options.use_nativeapp else [] ),
         "-Wl,--no-as-needed", "-lOpenSLES",
         *( ["-laaudio"] if tc.api >= 26 else [] ),
         "-Wl,--as-needed",
@@ -632,13 +833,49 @@ def _native_build(
         # falha com "cannot locate symbol vkCreateInstance". Forçamos o
         # DT_NEEDED com --no-as-needed.
         cmd += ["-Wl,--no-as-needed", "-lvulkan", "-Wl,--as-needed"]
-    _run(cmd, log)
+    # O link também é cacheado: inclui flags, objetos, .a/.so de entrada e
+    # modo de strip; assim um build sem mudanças não chama clang nem llvm-strip.
+    strip = tc.ndk_toolchain_bin / "llvm-strip"
+    strip_mode = ""
+    if (options.optimize != "none" or options.obfuscate) and strip.is_file():
+        strip_mode = "--strip-all" if options.obfuscate else "--strip-unneeded"
 
-    if options.optimize != "none" or options.obfuscate:
-        strip = tc.ndk_toolchain_bin / "llvm-strip"
-        if strip.is_file():
-            strip_args = [strip, "--strip-all" if options.obfuscate else "--strip-unneeded", str(output)]
-            _run(strip_args, log)
+    link_files = objects + [
+        Path(part) for part in cmd
+        # O próprio -o não é input: ele ainda não existia no link anterior.
+        if part != str(cached_so)
+        and Path(part).is_file()
+        and Path(part).suffix in (".a", ".so")
+    ] + list(extra_libs)
+    link_state = (
+        [str(part) for part in cmd]
+        + [compiler_key_for(linker), strip_mode, lib_name]
+        + [_sha256_file(lib) for lib in dict.fromkeys(link_files) if lib.is_file()]
+    )
+    link_key = _sha256_text(json.dumps(link_state))
+    link_entry = cache.get("link")
+    reuse_link = (
+        options.incremental is not False
+        and isinstance(link_entry, dict)
+        and link_entry.get("key") == link_key
+        and cached_so.is_file()
+        and link_entry.get("so_hash") == _sha256_file(cached_so)
+    )
+    if reuse_link:
+        log.detail(f"[cache] reuso: lib{lib_name}.so")
+    else:
+        _run(cmd, log)
+        if strip_mode:
+            _run([strip, strip_mode, str(cached_so)], log)
+        cache["link"] = {
+            "key": link_key,
+            "so": cached_so.name,
+            "so_hash": _sha256_file(cached_so),
+        }
+        save_cache()
+
+    if cached_so.resolve() != output.resolve():
+        shutil.copy2(cached_so, output)
 
     return output, extra_libs
 
@@ -1017,6 +1254,15 @@ def build(options: BuildOptions) -> Path:
         if not isinstance(raw_dir, str):
             raise BuildError("'libsDir' em apkfast.json deve ser um texto.")
         options.libs_dir = Path(raw_dir)
+    if options.incremental is None:
+        raw_incremental = config.get("incremental", True)
+        if not isinstance(raw_incremental, bool):
+            raise BuildError("'incremental' em apkfast.json deve ser true ou false.")
+        options.incremental = raw_incremental
+    if "cleanCache" in config:
+        if not isinstance(config["cleanCache"], bool):
+            raise BuildError("'cleanCache' em apkfast.json deve ser true ou false.")
+        options.clean_cache = options.clean_cache or config["cleanCache"]
 
     abis = options.selected_abis()
     if not abis:

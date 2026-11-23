@@ -58,6 +58,14 @@ def _add_build_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-o", "--output", help="caminho do APK final")
     parser.add_argument("--build-dir", help="diretório de arquivos temporários")
     parser.add_argument(
+        "--no-incremental", dest="incremental", action="store_false", default=None,
+        help="desliga o cache incremental (recompila tudo)",
+    )
+    parser.add_argument(
+        "--clean-cache", action="store_true",
+        help="apaga o cache incremental antes do build",
+    )
+    parser.add_argument(
         "--abi",
         default="arm64-v8a",
         help="ABI alvo: arm64-v8a, armeabi-v7a, x86, x86_64 ou all (default: arm64-v8a)",
@@ -143,6 +151,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
         libraries=args.libraries,
         libs_dir=Path(args.libs_dir) if args.libs_dir else None,
         assets_dir=Path(args.assets) if args.assets else None,
+        incremental=args.incremental,
+        clean_cache=args.clean_cache,
         verbose=args.verbose,
         quiet=_quiet(args),
         log=log,

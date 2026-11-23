@@ -1,7 +1,7 @@
 # apkfast
 
 [![CI](https://github.com/danieldossilvareis-sudo/apkfast/actions/workflows/ci.yml/badge.svg)](https://github.com/danieldossilvareis-sudo/apkfast/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-2.1.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.2.0-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 CLI para **montar, compilar, otimizar e entregar APKs sem Gradle**, com suporte
@@ -119,7 +119,9 @@ APP_MAIN(App)
 
 Documentação completa:
 - [Guias individuais de cada helper](docs/README.md) — recomendado
-  (inclui [bibliotecas próprias](docs/libraries.md))
+  (inclui [bibliotecas próprias](docs/libraries.md),
+  [imagens WebP/SVG](docs/image-formats.md) e
+  [build incremental](docs/incremental.md))
 - [Referência consolidada da API](include/nativeapp/README.md)
 Exemplos: `examples/nativeapp-gl`, `examples/nativeapp-vulkan`,
 `examples/nativeapp-advanced` (Mesh/Material/matrizes/dt/Scene) e
@@ -128,10 +130,11 @@ Exemplos: `examples/nativeapp-gl`, `examples/nativeapp-vulkan`,
 A API agora inclui `Shader`, `Mesh`, `Texture`, `GLContext`, `GraphicsPipeline`
 Vulkan com depth + 2 frames in-flight, matemática `Mat4`, `on_update(dt)`,
 input polling, assets via `AAssetManager`, **`TextInput`** (teclado virtual
-via JNI, sem EditText), **áudio** (AAudio + OpenSLES), **sensores**,
+via JNI, sem EditText), **áudio** (AAudio + OpenSLES), **imagens** PNG/JPEG,
+**WebP** (via `BitmapFactory`) e **SVG** (via NanoSVG), **sensores**,
 **gamepad/mouse** e **device** (vibração/bateria/orientação).
-Exemplos: `examples/text-input-hello` e `examples/device-demo`. Veja a
-[documentação completa](include/nativeapp/README.md).
+Exemplos: `examples/text-input-hello`, `examples/device-demo` e
+`examples/image-demo`. Veja a [documentação completa](include/nativeapp/README.md).
 
 A API de permissões também funciona com **raylib** (`GetAndroidApp()`) e
 **SDL2/SDL3** (`JniPermissions` via `SDL_AndroidGetActivity()` /
@@ -198,6 +201,9 @@ de `apkfast.json` (`nativeLibraryName`) ou usa `main` como padrão.
 | `--src` | fonte específica (repitível) |
 | `--cflags` / `--ldflags` | flags extras |
 | `--assets` | diretório de assets |
+| `--no-incremental` | desliga o cache incremental (padrão: ligado) |
+| `--clean-cache` | apaga o cache incremental antes do build |
+| `--lib` / `--libs-dir` | bibliotecas `.a`/`.so` próprias (repitível) |
 
 O keystore de debug é criado automaticamente em `~/.apkfast/debug.jks`.
 

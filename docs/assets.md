@@ -410,16 +410,16 @@ Trecho real de `include/nativeapp/gl.hpp`:
 
 ```cpp
 bool load(const std::string& path) {
-    auto& assets = Assets::instance(nullptr);
-    if (!assets.manager()) return false;
-    const auto data = assets.read(path);
-    if (data.empty()) return false;
-    // ... stbi_load_from_memory(..., 4) → GL_RGBA ...
+    return load_with_size(path, 0, 0);
+    // decode_asset_image() detecta PNG/JPEG (stb), WebP (Android) ou SVG (NanoSVG)
+    // e faz upload RGBA → GL_RGBA.
 }
 ```
 
 * Retorna `false` se não há manager **ou** se `read()` não trouxe bytes **ou**
-  se o decodificador `stbi_load_from_memory` falhar.
+  se o decodificador do formato detectado falhar.
+* WebP e SVG são suportados desde a v2.2.0; veja
+  [image-formats.md](image-formats.md).
 * O caminho é relativo à raiz de `assets/` (sem prefixo `assets/`).
 * O `Material::texture` de `graphics_types.hpp` é justamente o nome de arquivo
   passado para `Texture::load()` pelo `GLES2Scene::draw_mesh()`.
@@ -569,5 +569,5 @@ const bool saved = assets.write("dados/novo.json", data);  // sempre false
 | Bytes brutos | `read(path)` → `std::vector<uint8_t>` |
 | Texto / código GLSL | `read_text(path)` → `std::string` |
 | Carregar shader GLES | `Shader::load(vert, frag)` (lança `GLError`) |
-| Carregar imagem GLES | `Texture::load(path)` (retorna `bool`) |
+| Carregar imagem GLES | `Texture::load(path)` (PNG/JPEG/WebP/SVG, retorna `bool`) |
 | Escrever em `assets/` | Não existe — `write()` sempre retorna `false` |

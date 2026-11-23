@@ -1,5 +1,32 @@
 # Changelog
 
+## [2.2.0] - 2026-11-23 — Build incremental + WebP/SVG
+
+### Adicionado
+- **Build incremental** com cache por projeto/ABI fora do `work`:
+  hash da fonte, flags, toolchain, headers do nativeapp, depfiles (`-MD -MF`)
+  e link cacheado. Flags `--no-incremental` e `--clean-cache`, chaves
+  `incremental`/`cleanCache` em `apkfast.json`. Guia `docs/incremental.md`
+- **WebP** via `BitmapFactory` + `AndroidBitmap_*` (JNI puro, sem Java
+  customizado), com alpha premultiplicado corrigido e stride respeitado
+- **SVG** via NanoSVG vendorizado (licença zlib), rasterizado para RGBA com
+  tamanho natural ou `width/height` explícitos
+- `Texture::load()` detecta formato por magic bytes; novos métodos
+  `load_webp_asset()`, `load_svg_asset()` e `load_rgba()`
+- `image_codecs.hpp`, `image_impl.hpp`, `jni_bitmap.hpp`
+- builder linka `-ljnigraphics` automaticamente
+- exemplo `examples/image-demo` com WebP e SVG
+
+### Validado
+- 14 exemplos compilam (incluindo raylib/SDL, que usam o TU sem `stbi_*`)
+- dispositivo: `I image-demo: webp=OK 64x64 svg=OK 256x256`, `0 FATAL`
+- cache quente: nenhuma chamada a clang/llvm-strip; source alterada
+  recompila só aquela TU
+
+### Notas
+- WebP animado: apenas primeiro frame
+- SVG cobre paths/formas/gradientes simples (sem CSS/texto/filtros)
+
 ## [2.1.0] - 2026-11-23 — Bibliotecas próprias (.a/.so)
 
 ### Adicionado

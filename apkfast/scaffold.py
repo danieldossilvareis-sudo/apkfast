@@ -510,6 +510,8 @@ def create_project(target: Path, config: ProjectConfig) -> None:
                 "template": config.template,
                 "libraries": [],
                 "libsDir": "libs",
+                "incremental": True,
+                "cleanCache": False,
             },
             indent=2,
         )

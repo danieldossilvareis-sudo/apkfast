@@ -27,3 +27,6 @@
 #define DR_MP3_NO_STDIO
 #include <nativeapp/third_party/dr_mp3.h>
 #undef DR_MP3_IMPLEMENTATION
+
+// WebP (BitmapFactory/AndroidBitmap) + SVG (NanoSVG).
+#include <nativeapp/image_impl.hpp>

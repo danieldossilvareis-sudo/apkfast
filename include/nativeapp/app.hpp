@@ -22,6 +22,7 @@
 #include "assets.hpp"
 #include "graphics_types.hpp"
 #include "input_helpers.hpp"
+#include "jni_bitmap.hpp"
 #include "permissions.hpp"
 #include "permissions_jni.hpp"
 #include "text_input.hpp"
@@ -119,6 +120,7 @@ public:
         // Cleanup de refs JNI globais antes de notificar a subclasse.
         Permissions::instance(nullptr).shutdown();
         JniPermissions::instance(nullptr, nullptr).shutdown();
+        JniBitmap::instance().shutdown();
         on_destroy();
     }
 
@@ -223,6 +225,8 @@ private:
             initialized_ = true;
             // Injeta o AAssetManager antes de qualquer cena carregar assets.
             Assets::instance(app_->activity).set_activity(app_->activity);
+            // JNI compartilhado para decode de WebP via BitmapFactory.
+            JniBitmap::instance(app_->activity);
             // Inicializa o TextInput com o JNIEnv/Activity da UI thread.
             JNIEnv* ui_env = nullptr;
             if (app_->activity->vm) {
