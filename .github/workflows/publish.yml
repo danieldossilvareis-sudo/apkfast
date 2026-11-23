@@ -38,6 +38,26 @@ env:
   DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
 
 jobs:
+  config:
+    name: Resolve publish mode
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.decide.outputs.enabled }}
+    env:
+      PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+      PYPI_PUBLISH_ENABLED: ${{ vars.PYPI_PUBLISH_ENABLED }}
+    steps:
+      - id: decide
+        run: |
+          set -eu
+          if [ "${PYPI_PUBLISH_ENABLED:-}" = "true" ] || [ -n "${PYPI_API_TOKEN:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "PyPI publish habilitado."
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::PyPI publish desabilitado (defina vars.PYPI_PUBLISH_ENABLED=true, configure o Trusted Publisher ou o secret PYPI_API_TOKEN). O build/check das distribuições ainda roda."
+          fi
+
   build:
     name: Build and check distributions
     runs-on: ubuntu-latest
@@ -64,9 +84,21 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  skip-publish:
+    name: Publish disabled (no credentials configured)
+    needs: [config, build]
+    if: needs.config.outputs.enabled != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain skip
+        run: |
+          echo "publish.yml: SKIPPED (nenhuma credencial PyPI configurada)"
+          echo "As distribuições foram construídas e validadas no job build."
+
   publish:
     name: Publish validated distributions
-    needs: build
+    needs: [config, build]
+    if: needs.config.outputs.enabled == 'true'
     runs-on: ubuntu-latest
     environment:
       name: pypi
