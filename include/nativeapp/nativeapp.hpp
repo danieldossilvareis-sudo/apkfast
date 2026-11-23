@@ -21,9 +21,12 @@
 
 #include "app.hpp"
 #include "audio.hpp"
+#include "codecs.hpp"
 #include "device.hpp"
+#include "font.hpp"
 #include "gl.hpp"
 #include "input_helpers.hpp"
+#include "music.hpp"
 #include "permissions.hpp"
 #include "permissions_jni.hpp"
 #include "sensor.hpp"

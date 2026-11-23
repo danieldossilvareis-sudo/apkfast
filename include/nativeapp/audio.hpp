@@ -97,6 +97,11 @@ public:
         return true;
     }
 
+    /// Carrega qualquer formato suportado de assets/ (.wav/.ogg/.mp3).
+    /// Implementado em codecs.hpp (incluído abaixo para evitar dependência
+    /// circular — AudioBuffer já está definido aqui).
+    bool load(const std::string& path, AudioBuffer& out) const;
+
     /// Toca um buffer uma vez.
     void play(const AudioBuffer& buffer, float volume = 1.0f) {
         if (buffer.empty()) return;
@@ -244,5 +249,7 @@ private:
     SLObjectItf sles_output_mix_ = nullptr;
     SLObjectItf sles_player_ = nullptr;
 };
+
+// A implementação de Audio::load está em codecs.hpp (evita ciclo de include).
 
 }  // namespace nativeapp

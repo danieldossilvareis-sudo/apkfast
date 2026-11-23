@@ -1,5 +1,29 @@
 # Changelog
 
+## [2.0.0] - 2026-11-23 — Backend completo multimídia
+
+### Adicionado
+- **Fontes TTF/OTF** via stb_truetype: `FontAtlas` + `GLES2Scene::load_font()`
+  e `draw_text()` (atlas ASCII 32..126, cores por chamada)
+- **OGG Vorbis** via stb_vorbis e **MP3** via dr_mp3 — `Codecs::decode_*()`
+  e `Audio::load()` com detecção por extensão (.wav/.ogg/.mp3)
+- **`Music`** — streaming de música com AAudio data callback (API 26+),
+  loop, volume, resample 44100 Hz, memória constante
+- **Injeção automática do TU third-party** (`src/nativeapp_impl.cpp`) pelo
+  builder: uma única compilação de stb_image, stb_truetype, stb_vorbis e
+  dr_mp3 por app — corrige o problema de `*_IMPLEMENTATION` dentro de headers
+- Exemplo `examples/media-demo` com TTF, PNG, WAV, OGG, MP3 e streaming
+- Guias `docs/fonts.md` e `docs/audio-codecs.md`
+
+### Compatibilidade
+- Caminhos de assets são **relativos** ao diretório `assets/` do projeto
+  (`"tone.ogg"`, não `"assets/tone.ogg"`) — documentado
+- WebP e SVG ficam para v2.1 (decisão de escopo)
+
+### Validado
+- `media-demo` no dispositivo: sprite 64×64, fonte carregada, WAV 22050
+  samples, OGG/MP3 176400 samples, música em stream aberta, 0 crash
+
 ## [1.0.0] - 2026-11-22 (pós-release)
 
 ### Documentação

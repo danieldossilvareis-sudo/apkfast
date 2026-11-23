@@ -17,6 +17,7 @@
 #include <GLES3/gl3.h>
 
 #include "assets.hpp"
+#include "font.hpp"
 #include "graphics_types.hpp"
 #include "math.hpp"
 
@@ -30,9 +31,9 @@
 #include <unordered_map>
 #include <vector>
 
-#define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
-#undef STB_IMAGE_IMPLEMENTATION
+// As implementações das libs third-party vivem em src/nativeapp_impl.cpp,
+// injetado automaticamente pelo builder uma única vez por app.
+#include "third_party/stb_image.h"
 
 namespace nativeapp {
 
@@ -574,9 +575,84 @@ public:
         present();
     }
 
+    /// Carrega uma fonte TTF/OTF de assets/ e sobe o atlas para a GPU.
+    bool load_font(const std::string& path, int pixel_size = 24) {
+        if (!initialized_) return false;
+        egl_.make_current();
+        FontAtlas atlas;
+        if (!atlas.load(path, pixel_size)) return false;
+        if (!text_shader_.program()) {
+            text_shader_.compile(kTextVertexShader, kTextFragmentShader);
+        }
+        if (!font_texture_) glGenTextures(1, &font_texture_);
+        glBindTexture(GL_TEXTURE_2D, font_texture_);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, atlas.atlas_size(), atlas.atlas_size(),
+                     0, GL_ALPHA, GL_UNSIGNED_BYTE, atlas.atlas());
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        font_ = std::make_unique<FontAtlas>(std::move(atlas));
+        return true;
+    }
+
+    /// Desenha texto usando a fonte carregada (coordenadas de tela).
+    void draw_text(const std::string& text, float x, float y, float scale = 1.0f,
+                   float r = 1.0f, float g = 1.0f, float b = 1.0f, float a = 1.0f) {
+        if (!font_ || !font_texture_) return;
+        egl_.make_current();
+        text_shader_.use();
+        const Mat4 identity = mat4_identity();
+        text_shader_.set_uniform_mat4("u_projection", projection_.data());
+        text_shader_.set_uniform_mat4("u_model", identity.data());
+        text_shader_.set_uniform("u_color", r, g, b, a);
+        text_shader_.set_uniform("u_texture", 0);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, font_texture_);
+
+        struct GlyphVert { float x, y, u, v; };
+        std::vector<GlyphVert> verts;
+        verts.reserve(text.size() * 6);
+        float cx = x, cy = y;
+        for (char c : text) {
+            const GlyphQuad q = font_->quad(c, cx, cy, scale);
+            if (q.x1 <= q.x0) continue;
+            // Dois triângulos por glyph (UVs do atlas stb = GL, y invertido).
+            verts.push_back({q.x0, q.y0, q.u0, q.v0});
+            verts.push_back({q.x1, q.y0, q.u1, q.v0});
+            verts.push_back({q.x1, q.y1, q.u1, q.v1});
+            verts.push_back({q.x0, q.y0, q.u0, q.v0});
+            verts.push_back({q.x1, q.y1, q.u1, q.v1});
+            verts.push_back({q.x0, q.y1, q.u0, q.v1});
+        }
+        if (verts.empty()) return;
+
+        GLuint vbo = 0;
+        glGenBuffers(1, &vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER,
+                     static_cast<GLsizeiptr>(verts.size() * sizeof(GlyphVert)),
+                     verts.data(), GL_STREAM_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(GlyphVert),
+                              reinterpret_cast<void*>(offsetof(GlyphVert, x)));
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(GlyphVert),
+                              reinterpret_cast<void*>(offsetof(GlyphVert, u)));
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(verts.size()));
+        glDisableVertexAttribArray(0);
+        glDisableVertexAttribArray(1);
+        glDeleteBuffers(1, &vbo);
+    }
+
+    bool has_font() const { return font_ != nullptr; }
+
     void destroy() {
         if (!initialized_) return;
         egl_.make_current();
+        if (font_texture_) { glDeleteTextures(1, &font_texture_); font_texture_ = 0; }
+        font_.reset();
+        text_shader_.destroy();
         textures_.clear();
         temporary_mesh_.destroy();
         mesh_.destroy();
@@ -620,6 +696,29 @@ private:
         }
     )";
 
+    static constexpr const char* kTextVertexShader = R"(
+        attribute vec2 a_position;
+        attribute vec2 a_uv;
+        uniform mat4 u_projection;
+        uniform mat4 u_model;
+        varying vec2 v_uv;
+        void main() {
+            v_uv = a_uv;
+            gl_Position = u_projection * u_model * vec4(a_position, 0.0, 1.0);
+        }
+    )";
+
+    static constexpr const char* kTextFragmentShader = R"(
+        precision mediump float;
+        varying vec2 v_uv;
+        uniform vec4 u_color;
+        uniform sampler2D u_texture;
+        void main() {
+            float alpha = texture2D(u_texture, v_uv).a;
+            gl_FragColor = vec4(u_color.rgb, u_color.a * alpha);
+        }
+    )";
+
     GLContext egl_;
     Shader shader_;
     Shader* shader_override_ = nullptr;
@@ -627,6 +726,9 @@ private:
     Mesh* mesh_override_ = nullptr;
     Mesh temporary_mesh_;
     std::unordered_map<std::string, std::unique_ptr<Texture>> textures_;
+    Shader text_shader_;
+    std::unique_ptr<FontAtlas> font_;
+    GLuint font_texture_ = 0;
     Mat4 projection_ = mat4_identity();
     Mat4 model_ = mat4_identity();
     std::array<float, 4> clear_{0.08f, 0.08f, 0.12f, 1.0f};

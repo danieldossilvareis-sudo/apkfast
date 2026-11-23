@@ -212,6 +212,24 @@ def _native_build(
     if not sources:
         return None, []
 
+    # Injeta o TU com as implementações third-party do nativeapp (stb_image,
+    # stb_truetype, stb_vorbis, dr_mp3) exatamente uma vez por build.
+    if options.use_nativeapp:
+        # Detecta raylib antes da injeção (ela já define os símbolos stbi_*).
+        uses_raylib_here = any(
+            "raylib.h" in s.read_text(errors="ignore") for s in sources if s.is_file()
+        )
+        impl_name = (
+            "nativeapp_impl_no_image.cpp" if uses_raylib_here else "nativeapp_impl.cpp"
+        )
+        impl = Path(__file__).resolve().parent.parent / "src" / impl_name
+        if impl.is_file():
+            injected = work / "injected" / impl_name
+            injected.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(impl, injected)
+            sources.append(injected)
+            log.detail(f"[*] TU third-party do nativeapp injetado ({impl_name}).")
+
     native_dir = work / "native" / NDK_ARCH_DIR[tc.abi]
     native_dir.mkdir(parents=True, exist_ok=True)
     objects: list[Path] = []
