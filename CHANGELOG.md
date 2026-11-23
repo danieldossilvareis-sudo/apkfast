@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.0.0] - 2026-11-23 (pós-release)
+
+### Corrigido
+- **Texto não aparecia no media-demo**: o atlas de fonte era uploaded como
+  `GL_ALPHA` (problemático em alguns drivers GLES3) e os UVs eram invertidos
+  no shader. Agora o atlas é expandido para RGBA e os UVs do
+  `stbtt_GetPackedQuad(..., 1)` são usados diretamente
+- `draw_text()` usa o location de atributo correto (2 = `a_uv`, fixo pelo
+  `Shader::link()`) e desabilita depth test para texto 2D
+- Caminhos de assets documentados como relativos (`"font.ttf"`)
+
 ## [2.0.0] - 2026-11-23 — Backend completo multimídia
 
 ### Adicionado

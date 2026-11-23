@@ -586,8 +586,15 @@ public:
         }
         if (!font_texture_) glGenTextures(1, &font_texture_);
         glBindTexture(GL_TEXTURE_2D, font_texture_);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, atlas.atlas_size(), atlas.atlas_size(),
-                     0, GL_ALPHA, GL_UNSIGNED_BYTE, atlas.atlas());
+        // Expande o atlas de 1 canal para RGBA: GL_ALPHA é problemático em
+        // alguns drivers GLES3 e o RGBA é universal.
+        const int n = atlas.atlas_size() * atlas.atlas_size();
+        std::vector<uint8_t> rgba(static_cast<size_t>(n) * 4, 255);
+        for (int i = 0; i < n; ++i) {
+            rgba[static_cast<size_t>(i) * 4 + 3] = atlas.atlas()[i];
+        }
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, atlas.atlas_size(), atlas.atlas_size(),
+                     0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -602,6 +609,7 @@ public:
         if (!font_ || !font_texture_) return;
         egl_.make_current();
         text_shader_.use();
+        glDisable(GL_DEPTH_TEST);  // texto é 2D sobreposto
         const Mat4 identity = mat4_identity();
         text_shader_.set_uniform_mat4("u_projection", projection_.data());
         text_shader_.set_uniform_mat4("u_model", identity.data());
@@ -636,12 +644,13 @@ public:
         glEnableVertexAttribArray(0);
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(GlyphVert),
                               reinterpret_cast<void*>(offsetof(GlyphVert, x)));
-        glEnableVertexAttribArray(1);
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(GlyphVert),
+        // Shader::link() fixa a_uv no location 2 (a_normal é 1).
+        glEnableVertexAttribArray(2);
+        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(GlyphVert),
                               reinterpret_cast<void*>(offsetof(GlyphVert, u)));
         glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(verts.size()));
         glDisableVertexAttribArray(0);
-        glDisableVertexAttribArray(1);
+        glDisableVertexAttribArray(2);
         glDeleteBuffers(1, &vbo);
     }
 
