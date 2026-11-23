@@ -224,3 +224,53 @@ não foram tocados nesta rodada.
 - `.gitignore` está fora da propriedade desta equipe: output padrão
   `dist/*.aab` ainda aparece como untracked. A sessão coordenadora deve
   adicionar `*.aab` ao `.gitignore` (não feito aqui).
+
+## v2.6.0 — EQUIPE B
+
+Escopo: itens (5) e (7) do roadmap — cachear recursos/APK assinado e entregar
+diagnóstico rico (motivos de hit/miss + timings no `--report`). Nenhuma versão
+foi alterada. Arquivos de propriedade de outras equipes não foram tocados.
+
+### Feito
+
+- `apkfast/resource_cache.py` (novo): `resource_key()` (res/, assets/, manifesto,
+  min/target SDK, package/versão, caminho lógico + `--version` do aapt2,
+  namespace/projectId), `apk_key()` (resource_key + hashes das `.so`/dex,
+  ABIs, nome da lib, flags de zipalign/assinatura e fingerprint da keystore),
+  `keystore_fingerprint_info()` com import tolerante de
+  `apkfast.signing.signature_fingerprint()`, blobs ZIP/digest via
+  `cache.CacheContext`, verificação SHA256/ZIP antes do uso e limpeza escopada
+  por projeto (`clear_resource_cache()` / `clear_apk_cache()`).
+- `apkfast/builder.py`: hits de `resource` copiam os flats; `apkLink` copia o
+  APK unsigned após aapt2 link + arquivos extras; `apk` copia o APK assinado
+  para `work/apk/signed.apk` e pula `aapt2 link`, `zipalign` e `apksigner`.
+  Trocar a keystore invalida o APK assinado mas ainda reaproveita o unsigned.
+  `--no-incremental` desliga leitura/escrita em todos os níveis;
+  `--clean-cache` também remove as novas entradas e blobs órfãos.
+- `apkfast/builder.py` + `apkfast/cli.py`: `cache_events` com
+  `stage/result/reason/key` (resource/link/apk/native), misses explicados em
+  `-v`, e timings `toolchain_ms`, `resources_ms`, `native_ms`, `package_ms`,
+  `sign_ms`, `total_ms`. `_write_build_report()` ganhou `cache` e `timings`
+  mantendo todas as chaves anteriores.
+- `docs/build-cache.md`, seção curta no `README.md`,
+  `tests/test_resource_cache.py` (8 testes: invalidadores de chaves, keystore,
+  hit/miss, corrupção de blob, limpeza escopada e payload do relatório).
+
+### Riscos e limitações honestas
+
+- D8/R8 e o AAB (`--aab`) continuam rodando sempre; seus tempos entram em
+  `package_ms`, mas não há cache próprio para eles.
+- O fingerprint de `signing.py` é o SHA256 do arquivo da keystore, não o
+  fingerprint do certificado: basta o arquivo mudar para invalidar. Senhas não
+  entram na chave.
+- A chave do APK inclui hashes dos binários `zipalign`/`apksigner` e a flags
+  `-P 16`. Se o zipalign não aceitar `-P 16` e cair para 4, o build loga o
+  aviso, mas a chave não muda (o artefato em cache continua o mesmo).
+- caches são por combinação exata de ABIs; alternar `--abi` e `--abi all`
+  gera chaves diferentes.
+- Não houve validação com SDK/NDK reais nesta rodada. Foi feito um smoke
+  end-to-end com aapt2/zipalign/apksigner/clang falsos confirmando: 1º build
+  miss em tudo, 2º build hit de resource/native/link/APK (sem zipalign nem
+  apksigner), 3º build com keystore diferente reaproveitando o APK unsigned.
+  Ainda assim, um build com as ferramentas reais deve ser feito pelo
+  coordenador.

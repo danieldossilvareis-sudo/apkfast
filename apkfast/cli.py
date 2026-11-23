@@ -247,10 +247,29 @@ def _add_build_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--sdk-dir", help="caminho explícito do Android SDK")
     parser.add_argument("--ndk-dir", help="caminho explícito do Android NDK")
     parser.add_argument("--build-tools", help="versão dos build-tools (ex: 37.0.0)")
-    parser.add_argument("--keystore", help="keystore para assinar (default: ~/.apkfast/debug.jks)")
-    parser.add_argument("--store-pass", default="android", help="senha do keystore")
-    parser.add_argument("--alias", default="androiddebugkey", help="alias da chave")
-    parser.add_argument("--key-pass", default="android", help="senha da chave")
+    parser.add_argument("--keystore", help="keystore para assinar (ou APKFAST_KEYSTORE)")
+    parser.add_argument("--store-pass", help="senha do keystore (ou APKFAST_STORE_PASS)")
+    parser.add_argument("--alias", help="alias da chave (ou APKFAST_KEY_ALIAS)")
+    parser.add_argument("--key-pass", help="senha da chave (ou APKFAST_KEY_PASS)")
+    for scheme in ("v1", "v2", "v3", "v4"):
+        dest = f"{scheme}_signing"
+        parser.add_argument(
+            f"--{scheme}-signing", dest=dest, action="store_true", default=None,
+            help=f"habilita assinatura {scheme.upper()} (padrão: automático)",
+        )
+        parser.add_argument(
+            f"--no-{scheme}-signing", dest=dest, action="store_false", default=None,
+            help=f"desabilita assinatura {scheme.upper()}",
+        )
+    parser.add_argument(
+        "--version-code-strategy", choices=("manifest+1", "explicit", "timestamp"),
+        default="manifest+1", help="estratégia do versionCode (default: manifest+1)",
+    )
+    parser.add_argument("--version-code", type=int, help="versionCode explícito")
+    parser.add_argument(
+        "--timestamp-version-code", action="store_true",
+        help="atalho para --version-code-strategy timestamp",
+    )
     parser.add_argument("--cflags", default="", help="flags extras para C/C++")
     parser.add_argument("--ldflags", default="", help="flags extras para o linker")
     parser.add_argument("--src", action="append", default=[], help="arquivo fonte (repitível)")
@@ -298,7 +317,11 @@ def _generate_lock(args: argparse.Namespace) -> int:
 
 
 def _write_build_report(
-    args: argparse.Namespace, apk: Path, log: Any, aab: Path | None = None
+    args: argparse.Namespace,
+    apk: Path,
+    log: Any,
+    aab: Path | None = None,
+    options: Any | None = None,
 ) -> None:
     """Grava metadados do build em JSON (fora do APK)."""
     project = Path(args.project).expanduser().resolve()
@@ -345,6 +368,36 @@ def _write_build_report(
         "config": config.get("config", {}),
         "configValid": config["valid"],
     }
+
+    # Diagnóstico de cache/timings (v2.6.0). As chaves antigas acima seguem
+    # intactas: consumidores existentes do --report não precisam mudar.
+    events = list(getattr(options, "cache_events", []) or []) if options else []
+    ctx = getattr(options, "cache_ctx", None) if options else None
+    raw_timings = getattr(options, "timings_ms", {}) if options else {}
+    timings = {
+        name: int(raw_timings.get(name, 0) or 0)
+        for name in (
+            "toolchain_ms",
+            "resources_ms",
+            "native_ms",
+            "package_ms",
+            "sign_ms",
+            "total_ms",
+        )
+    }
+    report["cache"] = {
+        "enabled": (getattr(options, "incremental", True) is not False) if options else True,
+        "mode": str(getattr(ctx, "mode", "") or "") if ctx is not None else "",
+        "root": str(getattr(ctx, "root", "") or "") if ctx is not None else "",
+        "namespace": str(getattr(options, "cache_namespace", "") or "") if options else "",
+        "events": events,
+        "hits": sum(1 for item in events if item.get("result") == "hit"),
+        "misses": sum(1 for item in events if item.get("result") == "miss"),
+        "keystoreFingerprint": (
+            dict(getattr(options, "cache_keystore_fingerprint", {}) or {}) if options else {}
+        ),
+    }
+    report["timings"] = timings
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -383,6 +436,15 @@ def _cmd_build(args: argparse.Namespace) -> int:
         keystore_password=args.store_pass,
         key_alias=args.alias,
         key_password=args.key_pass,
+        v1_signing=args.v1_signing,
+        v2_signing=args.v2_signing,
+        v3_signing=args.v3_signing,
+        v4_signing=args.v4_signing,
+        version_code_strategy=(
+            "timestamp" if args.timestamp_version_code else args.version_code_strategy
+        ),
+        version_code=args.version_code,
+        timestamp_version_code=args.timestamp_version_code,
         extra_cflags=args.cflags.split(),
         extra_ldflags=args.ldflags.split(),
         sources=args.src,
@@ -410,7 +472,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
     if options.built_aab is not None:
         log.info(f"[✓] AAB: {options.built_aab}")
     if args.report is not None:
-        _write_build_report(args, apk, log, options.built_aab)
+        _write_build_report(args, apk, log, options.built_aab, options)
     return 0
 
 

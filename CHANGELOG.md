@@ -1,5 +1,46 @@
 # Changelog
 
+## [2.6.0] - 2026-11-23 — Robustez final
+
+Quatro itens de endurecimento do backend.
+
+### Adicionado — Equipe A
+
+- **Pinning de fontes**: raylib 5.5, SDL2 2.32.10 e SDL3 3.4.20 com SHA256
+  verificado; overrides controlados por `APKFAST_*_VERSION` / `_SHA256`
+- `apkfast/signing.py`:
+  - assinatura v1/v2/v3/v4 com degradação segura e flags CLI
+  - keystore/senhas/alias por variáveis de ambiente
+  - `versionCode` automático (`manifest+1`, `explicit`, `timestamp`)
+  - fingerprint da keystore para chave de cache
+- `.idsig` (v4) copiado junto do APK final
+- `docs/signing.md`
+
+### Adicionado — Equipe B
+
+- **Cache de recursos e APK assinado**: `aapt2 compile`, `aapt2 link` e
+  `zipalign + apksigner` reaproveitados quando chave e keystore batem
+- trocar keystore invalida só o APK assinado; unsigned continua em cache
+- **Diagnóstico**: `build --report` agora traz `cache.events` com motivo de
+  hit/miss e `timings_ms` por etapa
+- `docs/build-cache.md`
+
+### Validado
+
+- 82 testes unitários OK
+- 14 exemplos compilam
+- build real: primeiro build com misses, segundo com hits em `native`/`link`/
+  `apk`; `sign_ms` cai de ~2881 ms para ~26 ms
+- AAB continua gerado e validado com bundletool
+
+### Limitações restantes
+
+- D8/R8 e AAB não são cacheados
+- chaves de cache por combinação exata de ABIs
+- `timestamp` usa segundos (limite 2.1e9 do Play); use `explicit` após ~2036
+- GitHub Actions ainda não publica no PyPI nem roda dispositivo real sem
+  credenciais/runner configurados
+
 ## [2.5.0] - 2026-11-23 — Backend completo
 
 Fecha os três bloqueadores restantes de distribuição/qualidade.

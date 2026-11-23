@@ -1,7 +1,7 @@
 # apkfast
 
 [![CI](https://github.com/danieldossilvareis-sudo/apkfast/actions/workflows/ci.yml/badge.svg)](https://github.com/danieldossilvareis-sudo/apkfast/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-2.5.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.6.0-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 CLI para **montar, compilar, otimizar e entregar APKs sem Gradle**, com suporte
@@ -285,6 +285,15 @@ mesma keystore do build — em releases, forneça uma **upload key** via
 `--keystore` (a chave de debug não pode ser publicada). O bundletool 1.18.3 é
 baixado com SHA256 verificado e cacheado em `~/.apkfast/tools/`. Detalhes,
 limitações e verificação: [`docs/aab.md`](docs/aab.md).
+
+## Cache de recursos e APK
+
+Além de objetos C/C++ e da `.so`, o build passa a reaproveitar flats do aapt2,
+o APK unsigned e o APK assinado — incluindo a chave da keystore na chave de
+cache, para nunca servir um APK assinado por outra chave. `--no-incremental`
+desliga leitura/escrita, `--clean-cache` limpa só o escopo do projeto e
+`build --report` passa a conter `cache` (hits, misses e motivos) e `timings`.
+Detalhes: [`docs/build-cache.md`](docs/build-cache.md).
 
 ## SDL2 e SDL3 (sem Gradle)
 

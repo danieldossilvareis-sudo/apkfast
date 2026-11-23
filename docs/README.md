@@ -66,6 +66,8 @@ python3 apkfast.py install app.apk
 - [Compatibilidade](compatibility.md) — SemVer da API nativeapp
 - [Migração](migration.md) — 2.2 → 2.3 → 2.5
 - [AAB / Google Play](aab.md) — bundletool, assinatura e publicação
+- [Assinatura](signing.md) — v1/v2/v3/v4, keystore e versionCode
+- [Cache de build](build-cache.md) — recursos, APK assinado e diagnóstico
 - [Publicação](publishing.md) — PyPI, TestPyPI e release
 - [CI em dispositivo](device-ci.md) — self-hosted e Firebase Test Lab
 - [CHANGELOG.md](../CHANGELOG.md) — histórico de versões

@@ -9,13 +9,18 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterator
 
 from . import bundle as bundle_mod
 from . import cache as cache_mod
 from . import config_schema, lockfile as lock_mod
+from . import resource_cache as res_cache
+from . import signing as signing_mod
 from .manifest import ManifestInfo, is_native_activity, parse_manifest
 from .toolchain import NDK_ARCH_DIR, Toolchain, detect
 
@@ -88,9 +93,16 @@ class BuildOptions:
     vulkan: bool = False
     use_nativeapp: bool = True
     keystore: Path | None = None
-    keystore_password: str = "android"
-    key_alias: str = "androiddebugkey"
-    key_password: str = "android"
+    keystore_password: str | None = None  # None = APKFAST_STORE_PASS / "android"
+    key_alias: str | None = None          # None = APKFAST_KEY_ALIAS / padrão
+    key_password: str | None = None       # None = APKFAST_KEY_PASS / "android"
+    v1_signing: bool | None = None
+    v2_signing: bool | None = None
+    v3_signing: bool | None = None
+    v4_signing: bool | None = None
+    version_code_strategy: str = "manifest+1"
+    version_code: int | None = None
+    timestamp_version_code: bool = False
     sdk_dir: str | None = None
     ndk_dir: str | None = None
     build_tools: str | None = None
@@ -112,6 +124,10 @@ class BuildOptions:
     verbose: bool = False
     quiet: bool = False
     log: Logger | None = None
+    # Diagnóstico da v2.6.0 (preenchido durante build(), consumido pelo --report).
+    cache_events: list[dict] = field(default_factory=list)
+    timings_ms: dict[str, int] = field(default_factory=dict)
+    cache_keystore_fingerprint: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.log is None:
@@ -134,6 +150,32 @@ def _tail(text: str, limit: int = 40) -> str:
     return f"... ({omitted} linha(s) omitida(s))\n" + "\n".join(lines[-limit:])
 
 
+@contextmanager
+def _timed(options: "BuildOptions", stage: str) -> Iterator[None]:
+    """Acumula milissegundos por etapa (soma quando a etapa roda mais de uma vez)."""
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed = int(round((time.perf_counter() - started) * 1000))
+        options.timings_ms[stage] = options.timings_ms.get(stage, 0) + elapsed
+
+
+def _cache_event(
+    options: "BuildOptions",
+    stage: str,
+    result: str,
+    reason: str,
+    key: str = "",
+) -> None:
+    """Registra hit/miss e, em -v, explica o miss com uma linha curta."""
+    event = res_cache.cache_event(stage, result, reason, key)
+    options.cache_events.append(event)
+    log = options.log
+    if log is not None and event["result"] == "miss":
+        log.detail(f"[cache] {stage} miss: {event['reason']} ({event['key']})")
+
+
 def _execute(
     cmd: list[str],
     log: Logger,
@@ -142,7 +184,7 @@ def _execute(
     capture: bool = False,
 ) -> subprocess.CompletedProcess:
     """Executa um comando, transformando falhas de execução em BuildError."""
-    log.command(cmd)
+    log.command(signing_mod.redact_args(cmd))
     argv = [str(c) for c in cmd]
     try:
         return subprocess.run(
@@ -164,7 +206,8 @@ def _run(cmd: list[str], log: Logger, *, cwd: Path | None = None) -> subprocess.
     if result.returncode != 0:
         output = _tail(result.stdout or "") if capture else ""
         raise BuildError(
-            f"Comando falhou ({result.returncode}): {' '.join(str(c) for c in cmd)}"
+            f"Comando falhou ({result.returncode}): "
+            + " ".join(signing_mod.redact_args(cmd))
             + (f"\n{output}" if output else "")
         )
     return result
@@ -315,13 +358,41 @@ def ensure_debug_keystore(
 
 
 def _compile_resources(
-    tc: Toolchain, project: Path, staged_res: Path, work: Path, log: Logger
+    tc: Toolchain,
+    project: Path,
+    staged_res: Path,
+    work: Path,
+    log: Logger,
+    options: "BuildOptions | None" = None,
+    manifest: ManifestInfo | None = None,
 ) -> list[Path]:
     res_dir = project / "res"
     if not res_dir.is_dir() or not any(res_dir.iterdir()):
         return []
     compiled_dir = work / "compiled_res"
     compiled_dir.mkdir(parents=True, exist_ok=True)
+
+    ctx = options.cache_ctx if options is not None else None
+    incremental = options is not None and options.incremental is not False
+    key = ""
+    if ctx is not None and manifest is not None:
+        if incremental:
+            key = res_cache.resource_key(project, manifest, options, tc, ctx)
+            try:
+                flats = res_cache.load_resource(ctx, key, compiled_dir)
+                _cache_event(
+                    options,
+                    "resource",
+                    "hit",
+                    f"{len(flats)} flat(s) reaproveitado(s) do cache",
+                    key,
+                )
+                return flats
+            except (res_cache.CacheMiss, OSError) as exc:
+                _cache_event(options, "resource", "miss", str(exc), key)
+        else:
+            _cache_event(options, "resource", "miss", "incremental desligado (--no-incremental)")
+
     # Preserve resource qualifiers in the flat filename: values-pt/strings.xml
     # becomes values-pt_strings.arsc.flat, which aapt2 link understands.
     flat_files: list[Path] = []
@@ -338,7 +409,10 @@ def _compile_resources(
         # um ZIP com um único .flat dentro mesmo quando -o é um arquivo.
         # aapt2 link não aceita esse ZIP: extrai o .flat real antes de linkar.
         flat_files.extend(_unpack_compiled_flat(output, compiled_dir))
-    return sorted(set(flat_files))
+    flat_files = sorted(set(flat_files))
+    if ctx is not None and key and incremental:
+        res_cache.store_resource(ctx, key, flat_files)
+    return flat_files
 
 
 def _unpack_compiled_flat(output: Path, compiled_dir: Path) -> list[Path]:
@@ -539,6 +613,8 @@ def _native_build(
         cache_mod.write_cache(ctx, abi, cache_data)
 
     compiler_fps: dict[str, str] = {}
+    object_hits = 0
+    object_misses = 0
 
     def compiler_fp(compiler: Path) -> str:
         key = str(compiler)
@@ -564,6 +640,7 @@ def _native_build(
         extra_key: str = "",
     ) -> Path:
         """Compila uma TU com chave portável por fonte/flags/headers."""
+        nonlocal object_hits, object_misses
         source_hash = cache_mod.sha256_file(source)
         key = cache_mod.object_key(
             source=source,
@@ -598,8 +675,10 @@ def _native_build(
                 reused = False
                 obj_path = None
         if reused and obj_path is not None:
+            object_hits += 1
             log.detail(f"[cache] reuso: {source.name}")
             return obj_path
+        object_misses += 1
 
         obj_tmp = ctx.abi_dir(abi) / f"obj_{key[:20]}.o"
         cmd = [compiler, "-c", str(source), "-o", str(obj_tmp),
@@ -750,6 +829,14 @@ def _native_build(
     if is_native_activity(manifest) and not uses_raylib and not uses_sdl3 and not uses_sdl2 and not glue_compiled:
         log.warn("[!] Aviso: NativeActivity declarada mas native_app_glue não foi compilado.")
 
+    _cache_event(
+        options,
+        "native",
+        "hit" if object_misses == 0 and object_hits else "miss",
+        f"objetos: {object_hits} reaproveitado(s), {object_misses} compilado(s) ({abi})",
+        ctx.project_id,
+    )
+
     lib_name = _native_lib_name(manifest, project)
     output = native_dir / f"lib{lib_name}.so"
     so_tmp = ctx.abi_dir(abi) / f"lib{lib_name}.link.so"
@@ -873,8 +960,16 @@ def _native_build(
             cached_so = None
     if reuse_link and cached_so is not None:
         log.detail(f"[cache] reuso: lib{lib_name}.so")
+        _cache_event(options, "native", "hit", f"link reaproveitado ({abi})", key)
     else:
-        log.detail(f"[cache] link miss: salvo={link_entry.get('key') if isinstance(link_entry, dict) else None} novo={key}")
+        previous = link_entry.get("key") if isinstance(link_entry, dict) else None
+        reason = (
+            f"link: entrada ausente ({abi})"
+            if previous is None
+            else f"link: chave mudou ({abi}, salvo={str(previous)[:8]})"
+        )
+        log.detail(f"[cache] link miss: salvo={previous} novo={key}")
+        _cache_event(options, "native", "miss", reason, key)
         _run(cmd, log)
         if strip_mode:
             _run([strip, strip_mode, str(so_tmp)], log)
@@ -1219,25 +1314,23 @@ def _align_and_sign(
     keystore = _resolve_keystore(tc, options, log)
 
     signed = work / "apk" / "signed.apk"
-    cmd = [
-        tc.apksigner,
-        "sign",
-        "--ks",
-        str(keystore),
-        "--ks-pass",
-        f"pass:{options.keystore_password}",
-        "--ks-key-alias",
-        options.key_alias,
-        "--key-pass",
-        f"pass:{options.key_password}",
-        "--v1-signing-enabled",
-        "true" if options.min_sdk < 24 else "false",
-        "--v2-signing-enabled",
-        "true",
-        "--out",
-        str(signed),
-        str(aligned),
-    ]
+    try:
+        cmd = signing_mod.apksigner_sign_args(
+            apksigner=tc.apksigner,
+            keystore=keystore,
+            store_pass=options.keystore_password or "android",
+            key_pass=options.key_password or "android",
+            key_alias=options.key_alias or "androiddebugkey",
+            unsigned=aligned,
+            output=signed,
+            v1=options.v1_signing if options.v1_signing is not None else options.min_sdk < 24,
+            v2=options.v2_signing if options.v2_signing is not None else True,
+            v3=options.v3_signing if options.v3_signing is not None else True,
+            v4=options.v4_signing if options.v4_signing is not None else True,
+            warn=lambda message: log.warn(message),
+        )
+    except signing_mod.SigningError as exc:
+        raise BuildError(str(exc)) from exc
     _run(cmd, log)
 
     verify = _execute(
@@ -1294,9 +1387,10 @@ def _release_build_lock(lock: Path) -> None:
         pass
 
 
-def build(options: BuildOptions) -> Path:
+def _build(options: BuildOptions) -> Path:
     log = options.log
     assert log is not None
+    started_total = time.perf_counter()
     options.built_aab = None  # não herda resultado de um build anterior
     project = options.project.expanduser().resolve()
     if not project.is_dir():
@@ -1306,6 +1400,43 @@ def build(options: BuildOptions) -> Path:
     if not manifest_path.is_file():
         raise BuildError(f"AndroidManifest.xml não encontrado em {project}")
     manifest = parse_manifest(manifest_path)
+
+    # Keystore/version code: CLI > variáveis de ambiente > padrões seguros.
+    try:
+        resolved_signing = signing_mod.resolve_keystore_options(
+            keystore=options.keystore,
+            store_pass=options.keystore_password,
+            key_pass=options.key_password,
+            key_alias=options.key_alias,
+            release=options.release,
+        )
+    except signing_mod.SigningError as exc:
+        raise BuildError(str(exc)) from exc
+    options.keystore = resolved_signing.keystore
+    options.keystore_password = resolved_signing.store_pass
+    options.key_password = resolved_signing.key_pass
+    options.key_alias = resolved_signing.key_alias
+
+    try:
+        version_code = signing_mod.next_version_code(
+            manifest_path,
+            strategy=options.version_code_strategy,
+            explicit=options.version_code,
+            timestamp=options.timestamp_version_code,
+        )
+    except signing_mod.SigningError as exc:
+        # Manifesto sem versionCode é comum em exemplos/testes: usa o mesmo
+        # padrão do aapt2 (1). Outros erros continuam bloqueando o build.
+        if (
+            options.version_code_strategy == "manifest+1"
+            and "sem android:versionCode" in str(exc)
+            and options.version_code is None
+            and not options.timestamp_version_code
+        ):
+            version_code = 1
+        else:
+            raise BuildError(str(exc)) from exc
+    manifest.version_code = str(version_code)
 
     # Config do projeto (apkfast.json): bibliotecas próprias podem ser
     # declaradas aqui; flags de CLI têm precedência.
@@ -1427,12 +1558,19 @@ def build(options: BuildOptions) -> Path:
             f"--cache-dir não pode ficar dentro de --build-dir: {ctx.root} dentro de {work}"
         )
     options.cache_ctx = ctx
+    options.timings_ms["toolchain_ms"] = int(
+        round((time.perf_counter() - started_total) * 1000)
+    )
     if not ctx.writable:
         log.warn(f"[!] Cache somente leitura ({ctx.root}); usando modo verify sem gravação.")
 
     cache_locks = cache_mod.acquire_all(ctx, abis)
     try:
         if options.clean_cache:
+            # Limpa primeiro as entradas novas (para também remover blobs
+            # órfãos) e depois o cache C/C++ por ABI, como antes.
+            res_cache.clear_apk_cache(ctx)
+            res_cache.clear_resource_cache(ctx)
             for abi in abis:
                 cache_mod.clear_abi(ctx, abi)
         # Validações e detecção da toolchain terminaram antes de qualquer limpeza.
@@ -1445,13 +1583,21 @@ def build(options: BuildOptions) -> Path:
             for line in tc.summary().splitlines():
                 log.detail(f"    {line}")
 
-            flats = _compile_resources(tc, project, work / "res", work, log)
-            dex = _compile_java(tc, options, work, log)
+            with _timed(options, "resources_ms"):
+                flats = _compile_resources(
+                    tc, project, work / "res", work, log, options, manifest
+                )
 
-            for abi in abis:
-                abi_tc = tc.for_abi(abi)
-                lib, extra_libs = _native_build(abi_tc, options, project, work, manifest)
-                _stage_native_lib(work, abi, lib, extra_libs)
+            with _timed(options, "package_ms"):
+                dex = _compile_java(tc, options, work, log)
+
+            with _timed(options, "native_ms"):
+                for abi in abis:
+                    abi_tc = tc.for_abi(abi)
+                    lib, extra_libs = _native_build(
+                        abi_tc, options, project, work, manifest
+                    )
+                    _stage_native_lib(work, abi, lib, extra_libs)
 
             suffix = "all" if len(abis) > 1 else abis[0]
             if options.release:
@@ -1460,11 +1606,121 @@ def build(options: BuildOptions) -> Path:
 
             if not options.aab_only:
                 log.info("[*] Empacotando APK...")
-                unsigned = _link_apk(tc, options, work, manifest_path, manifest, flats, dex)
-                _add_extra_files_with_zip(unsigned, work / "apk")
+                apk_root = work / "apk"
+                unsigned = apk_root / "unsigned_unaligned.apk"
+                signed = apk_root / "signed.apk"
+                incremental = options.incremental is not False and ctx is not None
+                lib_name = _native_lib_name(manifest, project)
+                # A keystore precisa existir antes do cálculo da chave: o
+                # fingerprint entra no apk_key (e nunca volta ao report).
+                keystore = _resolve_keystore(tc, options, log)
+                options.cache_keystore_fingerprint = res_cache.keystore_fingerprint_info(
+                    keystore
+                )
+                signed_key = ""
+                link_key = ""
+                signed_ready = False
+                if incremental:
+                    assert ctx is not None
+                    signed_key = res_cache.apk_key(
+                        project, manifest, options, tc, ctx,
+                        apk_root=apk_root, lib_name=lib_name,
+                        keystore=keystore, abis=abis, signed=True,
+                    )
+                    link_key = res_cache.apk_key(
+                        project, manifest, options, tc, ctx,
+                        apk_root=apk_root, lib_name=lib_name,
+                        abis=abis, signed=False,
+                    )
+                    try:
+                        with _timed(options, "sign_ms"):
+                            res_cache.load_apk(ctx, signed_key, signed)
+                        signed_ready = True
+                        _cache_event(
+                            options, "apk", "hit",
+                            "APK assinado reaproveitado (keystore igual)", signed_key,
+                        )
+                        log.info("[*] APK assinado reaproveitado do cache.")
+                    except (res_cache.CacheMiss, OSError) as exc:
+                        reason = str(exc)
+                        new_fp = str(
+                            options.cache_keystore_fingerprint.get("fingerprint", "")
+                        )
+                        for record in res_cache.apk_records(ctx):
+                            meta = record.get("metadata", {})
+                            old_fp = str(meta.get("fingerprint", ""))
+                            if (
+                                meta.get("baseKey") == link_key
+                                and old_fp
+                                and new_fp
+                                and old_fp != new_fp
+                            ):
+                                reason = (
+                                    f"keystore diferente (salvo={old_fp[:8]}, "
+                                    f"atual={new_fp[:8]})"
+                                )
+                                break
+                        _cache_event(options, "apk", "miss", reason, signed_key)
+                else:
+                    _cache_event(
+                        options, "apk", "miss", "incremental desligado (--no-incremental)"
+                    )
 
-                log.info("[*] Alinhando e assinando...")
-                signed = _align_and_sign(tc, options, work, unsigned)
+                if signed_ready:
+                    # aapt2 link, zipalign e apksigner não rodam: a chave do APK
+                    # assinado já cobre resource/native/dex e a keystore.
+                    _cache_event(
+                        options, "link", "hit",
+                        "pulado: APK assinado reaproveitado", link_key,
+                    )
+                else:
+                    unsigned_ready = False
+                    with _timed(options, "package_ms"):
+                        if incremental:
+                            assert ctx is not None
+                            try:
+                                res_cache.load_apk(
+                                    ctx, link_key, unsigned, unsigned=True
+                                )
+                                unsigned_ready = True
+                                _cache_event(
+                                    options, "link", "hit",
+                                    "APK unsigned reaproveitado do cache", link_key,
+                                )
+                            except (res_cache.CacheMiss, OSError) as exc:
+                                _cache_event(
+                                    options, "link", "miss", str(exc), link_key
+                                )
+                        else:
+                            _cache_event(
+                                options, "link", "miss",
+                                "incremental desligado (--no-incremental)",
+                            )
+                        if not unsigned_ready:
+                            unsigned = _link_apk(
+                                tc, options, work, manifest_path, manifest, flats, dex
+                            )
+                            _add_extra_files_with_zip(unsigned, apk_root)
+                            if incremental:
+                                assert ctx is not None
+                                res_cache.store_apk(
+                                    ctx, link_key, unsigned, unsigned=True
+                                )
+
+                    log.info("[*] Alinhando e assinando...")
+                    with _timed(options, "sign_ms"):
+                        signed = _align_and_sign(tc, options, work, unsigned)
+                    if incremental:
+                        assert ctx is not None
+                        res_cache.store_apk(
+                            ctx,
+                            signed_key,
+                            signed,
+                            metadata={
+                                **options.cache_keystore_fingerprint,
+                                "baseKey": link_key,
+                            },
+                        )
 
                 output = options.output or (
                     project / "dist" / f"{manifest.package.split('.')[-1]}-{suffix}.apk"
@@ -1477,6 +1733,9 @@ def build(options: BuildOptions) -> Path:
                 try:
                     output.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(signed, output)
+                    idsig = signed.with_name(signed.name + ".idsig")
+                    if idsig.is_file():
+                        shutil.copy2(idsig, Path(str(output) + ".idsig"))
                 except OSError as exc:
                     raise BuildError(f"Falha ao gravar APK final {output}: {exc}") from exc
                 size = output.stat().st_size / 1024
@@ -1563,3 +1822,14 @@ def build(options: BuildOptions) -> Path:
             _release_build_lock(lock)
     finally:
         cache_mod.release_all(cache_locks)
+
+
+def build(options: BuildOptions) -> Path:
+    """Entrada pública: mede o tempo total mesmo em caso de erro."""
+    started = time.perf_counter()
+    try:
+        return _build(options)
+    finally:
+        options.timings_ms["total_ms"] = int(
+            round((time.perf_counter() - started) * 1000)
+        )
