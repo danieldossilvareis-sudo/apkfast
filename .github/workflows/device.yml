@@ -80,7 +80,7 @@ jobs:
           for example in native-hello image-demo permissions-test; do
             python3 apkfast.py build "examples/$example" \
               --abi "${{ matrix.abi }}" \
-              --api 36 --min-sdk 21 --target-sdk 36 \
+              --api 35 --min-sdk 21 --target-sdk 36 \
               --sdk-dir "$ANDROID_HOME" \
               --ndk-dir "$ANDROID_HOME/ndk/$NDK_VERSION" \
               --build-tools "$BUILD_TOOLS" \
