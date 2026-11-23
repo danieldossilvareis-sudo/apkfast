@@ -18,7 +18,7 @@ jobs:
         abi: [arm64-v8a, armeabi-v7a]
     env:
       NDK_VERSION: 27.2.12479018
-      BUILD_TOOLS: 36.0.0
+      BUILD_TOOLS: 37.0.0
     steps:
       - uses: actions/checkout@v5
 
