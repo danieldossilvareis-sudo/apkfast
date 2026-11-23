@@ -74,11 +74,13 @@ struct MeshData {
     static MeshData quad(float w = 1.0f, float h = 1.0f) {
         MeshData mesh;
         const float hw = w / 2.0f, hh = h / 2.0f;
+        // UVs com V invertido: stb/libwebp/LunaSVG entregam a primeira linha
+        // no topo, enquanto GL_TEXTURE_2D coloca t=0 na base.
         mesh.add_quad(
-            Vertex{-hw,  hh, 0, 0,0,1, 0,0, 1,1,1,1},
-            Vertex{ hw,  hh, 0, 0,0,1, 1,0, 1,1,1,1},
-            Vertex{ hw, -hh, 0, 0,0,1, 1,1, 1,1,1,1},
-            Vertex{-hw, -hh, 0, 0,0,1, 0,1, 1,1,1,1});
+            Vertex{-hw,  hh, 0, 0,0,1, 0,1, 1,1,1,1},
+            Vertex{ hw,  hh, 0, 0,0,1, 1,1, 1,1,1,1},
+            Vertex{ hw, -hh, 0, 0,0,1, 1,0, 1,1,1,1},
+            Vertex{-hw, -hh, 0, 0,0,1, 0,0, 1,1,1,1});
         return mesh;
     }
 

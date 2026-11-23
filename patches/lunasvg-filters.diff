@@ -1,0 +1,3905 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c526159..24c781e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -24,6 +24,7 @@ set(lunasvg_sources
+     source/lunasvg.cpp
+     source/graphics.cpp
+     source/svgelement.cpp
++    source/svgfilterelement.cpp
+     source/svggeometryelement.cpp
+     source/svglayoutstate.cpp
+     source/svgpaintelement.cpp
+@@ -37,6 +38,7 @@ set(lunasvg_headers
+     include/lunasvg.h
+     source/graphics.h
+     source/svgelement.h
++    source/svgfilterelement.h
+     source/svggeometryelement.h
+     source/svglayoutstate.h
+     source/svgpaintelement.h
+@@ -60,6 +62,7 @@ set_target_properties(lunasvg PROPERTIES
+ target_include_directories(lunasvg PRIVATE
+     ${CMAKE_CURRENT_SOURCE_DIR}/include
+     ${CMAKE_CURRENT_SOURCE_DIR}/source
++    ${CMAKE_CURRENT_SOURCE_DIR}/plutovg/source
+ )
+ 
+ target_include_directories(lunasvg PUBLIC
+diff --git a/meson.build b/meson.build
+index 135087d..516d5bc 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1,4 +1,4 @@
+-project('lunasvg', 'cpp',
++project('lunasvg', 'cpp', 'c',
+     version: '3.5.0',
+     license: 'MIT',
+     meson_version: '>=1.3.0',
+@@ -15,13 +15,15 @@ lunasvg_sources = [
+     'source/lunasvg.cpp',
+     'source/graphics.cpp',
+     'source/svgelement.cpp',
++    'source/svgfilterelement.cpp',
+     'source/svggeometryelement.cpp',
+     'source/svgpaintelement.cpp',
+     'source/svgparser.cpp',
+     'source/svgproperty.cpp',
+     'source/svglayoutstate.cpp',
+     'source/svgrenderstate.cpp',
+-    'source/svgtextelement.cpp'
++    'source/svgtextelement.cpp',
++    'plutovg/source/plutovg-filter.c'
+ ]
+ 
+ lunasvg_compile_args = []
+@@ -37,7 +39,7 @@ if get_option('load-system-fonts').disabled()
+ endif
+ 
+ lunasvg_lib = library('lunasvg', lunasvg_sources,
+-    include_directories: include_directories('include', 'source'),
++    include_directories: include_directories('include', 'source', 'plutovg/source', 'plutovg/include'),
+     dependencies: plutovg_dep,
+     version: meson.project_version(),
+     cpp_args: lunasvg_cpp_args,
+diff --git a/plutovg/CMakeLists.txt b/plutovg/CMakeLists.txt
+index da14c80..1f6452e 100644
+--- a/plutovg/CMakeLists.txt
++++ b/plutovg/CMakeLists.txt
+@@ -9,6 +9,7 @@ project(plutovg LANGUAGES C VERSION ${PLUTOVG_VERSION_MAJOR}.${PLUTOVG_VERSION_M
+ set(plutovg_sources
+     source/plutovg-blend.c
+     source/plutovg-canvas.c
++    source/plutovg-filter.c
+     source/plutovg-font.c
+     source/plutovg-matrix.c
+     source/plutovg-paint.c
+@@ -23,6 +24,7 @@ set(plutovg_sources
+ set(plutovg_headers
+     include/plutovg.h
+     source/plutovg-private.h
++    source/plutovg-filter.h
+     source/plutovg-utils.h
+     source/plutovg-ft-math.h
+     source/plutovg-ft-raster.h
+diff --git a/plutovg/meson.build b/plutovg/meson.build
+index 4dfeeef..dec1030 100644
+--- a/plutovg/meson.build
++++ b/plutovg/meson.build
+@@ -45,6 +45,7 @@ endif
+ plutovg_sources = [
+     'source/plutovg-blend.c',
+     'source/plutovg-canvas.c',
++    'source/plutovg-filter.c',
+     'source/plutovg-font.c',
+     'source/plutovg-matrix.c',
+     'source/plutovg-paint.c',
+diff --git a/plutovg/source/plutovg-filter.c b/plutovg/source/plutovg-filter.c
+new file mode 100644
+index 0000000..52efc9a
+--- /dev/null
++++ b/plutovg/source/plutovg-filter.c
+@@ -0,0 +1,1608 @@
++#include "plutovg-filter.h"
++
++#include <string.h>
++#include <math.h>
++#include <stdlib.h>
++
++static inline uint32_t premultiply_pixel(uint32_t r, uint32_t g, uint32_t b, uint32_t a)
++{
++    r = (r * a + 127) / 255;
++    g = (g * a + 127) / 255;
++    b = (b * a + 127) / 255;
++    return (a << 24) | (r << 16) | (g << 8) | b;
++}
++
++static inline uint32_t clamp255(int v)
++{
++    return v < 0 ? 0 : (v > 255 ? 255 : (uint32_t)v);
++}
++
++void plutovg_filter_flood(
++    plutovg_surface_t* dst,
++    float r, float g, float b, float a,
++    int x, int y, int width, int height)
++{
++    uint32_t ir = clamp255((int)(r * 255.f + 0.5f));
++    uint32_t ig = clamp255((int)(g * 255.f + 0.5f));
++    uint32_t ib = clamp255((int)(b * 255.f + 0.5f));
++    uint32_t ia = clamp255((int)(a * 255.f + 0.5f));
++    uint32_t pixel = premultiply_pixel(ir, ig, ib, ia);
++
++    int dst_width = plutovg_surface_get_width(dst);
++    int dst_height = plutovg_surface_get_height(dst);
++    int dst_stride = plutovg_surface_get_stride(dst);
++    unsigned char* dst_data = plutovg_surface_get_data(dst);
++
++    int x0 = x < 0 ? 0 : x;
++    int y0 = y < 0 ? 0 : y;
++    int x1 = (x + width) > dst_width ? dst_width : (x + width);
++    int y1 = (y + height) > dst_height ? dst_height : (y + height);
++
++    for(int row = y0; row < y1; ++row) {
++        uint32_t* dst_row = (uint32_t*)(dst_data + row * dst_stride);
++        for(int col = x0; col < x1; ++col) {
++            dst_row[col] = pixel;
++        }
++    }
++}
++
++void plutovg_filter_offset(
++    plutovg_surface_t* dst, const plutovg_surface_t* src,
++    int dx, int dy,
++    int x, int y, int width, int height)
++{
++    int dst_width = plutovg_surface_get_width(dst);
++    int dst_height = plutovg_surface_get_height(dst);
++    int dst_stride = plutovg_surface_get_stride(dst);
++    unsigned char* dst_data = plutovg_surface_get_data(dst);
++
++    int src_width = plutovg_surface_get_width(src);
++    int src_height = plutovg_surface_get_height(src);
++    int src_stride = plutovg_surface_get_stride(src);
++    const unsigned char* src_data = plutovg_surface_get_data(src);
++
++    int x0 = x < 0 ? 0 : x;
++    int y0 = y < 0 ? 0 : y;
++    int x1 = (x + width) > dst_width ? dst_width : (x + width);
++    int y1 = (y + height) > dst_height ? dst_height : (y + height);
++
++    // Clear destination region
++    for(int row = y0; row < y1; ++row) {
++        memset(dst_data + row * dst_stride + x0 * 4, 0, (x1 - x0) * 4);
++    }
++
++    // Copy offset pixels
++    for(int row = y0; row < y1; ++row) {
++        int src_row = row - dy;
++        if(src_row < 0 || src_row >= src_height)
++            continue;
++        uint32_t* dst_pixels = (uint32_t*)(dst_data + row * dst_stride);
++        const uint32_t* src_pixels = (const uint32_t*)(src_data + src_row * src_stride);
++        for(int col = x0; col < x1; ++col) {
++            int src_col = col - dx;
++            if(src_col < 0 || src_col >= src_width)
++                continue;
++            dst_pixels[col] = src_pixels[src_col];
++        }
++    }
++}
++
++void plutovg_filter_merge(
++    plutovg_surface_t* dst,
++    const plutovg_surface_t** inputs, int inputCount,
++    int x, int y, int width, int height)
++{
++    int dst_width = plutovg_surface_get_width(dst);
++    int dst_height = plutovg_surface_get_height(dst);
++    int dst_stride = plutovg_surface_get_stride(dst);
++    unsigned char* dst_data = plutovg_surface_get_data(dst);
++
++    int x0 = x < 0 ? 0 : x;
++    int y0 = y < 0 ? 0 : y;
++    int x1 = (x + width) > dst_width ? dst_width : (x + width);
++    int y1 = (y + height) > dst_height ? dst_height : (y + height);
++
++    // Clear destination region
++    for(int row = y0; row < y1; ++row) {
++        memset(dst_data + row * dst_stride + x0 * 4, 0, (x1 - x0) * 4);
++    }
++
++    // Composite each input using source-over (premultiplied alpha)
++    for(int i = 0; i < inputCount; ++i) {
++        const plutovg_surface_t* src = inputs[i];
++        if(!src)
++            continue;
++
++        int src_width = plutovg_surface_get_width(src);
++        int src_height = plutovg_surface_get_height(src);
++        int src_stride = plutovg_surface_get_stride(src);
++        const unsigned char* src_data = plutovg_surface_get_data(src);
++
++        for(int row = y0; row < y1; ++row) {
++            if(row < 0 || row >= src_height)
++                continue;
++            uint32_t* dp = (uint32_t*)(dst_data + row * dst_stride);
++            const uint32_t* sp = (const uint32_t*)(src_data + row * src_stride);
++            for(int col = x0; col < x1; ++col) {
++                if(col < 0 || col >= src_width)
++                    continue;
++                uint32_t s = sp[col];
++                uint32_t d = dp[col];
++
++                uint32_t sa = (s >> 24) & 0xFF;
++                if(sa == 0)
++                    continue;
++                if(sa == 255) {
++                    dp[col] = s;
++                    continue;
++                }
++
++                // source-over: dst = src + dst * (1 - src_alpha)
++                uint32_t sr = (s >> 16) & 0xFF;
++                uint32_t sg = (s >> 8) & 0xFF;
++                uint32_t sb = s & 0xFF;
++                uint32_t da = (d >> 24) & 0xFF;
++                uint32_t dr = (d >> 16) & 0xFF;
++                uint32_t dg = (d >> 8) & 0xFF;
++                uint32_t db = d & 0xFF;
++
++                uint32_t inv_sa = 255 - sa;
++                uint32_t oa = sa + ((da * inv_sa + 127) / 255);
++                uint32_t or_ = sr + ((dr * inv_sa + 127) / 255);
++                uint32_t og = sg + ((dg * inv_sa + 127) / 255);
++                uint32_t ob = sb + ((db * inv_sa + 127) / 255);
++
++                dp[col] = (clamp255(oa) << 24) | (clamp255(or_) << 16) | (clamp255(og) << 8) | clamp255(ob);
++            }
++        }
++    }
++}
++
++// --- Gaussian Blur (box-blur approximation, 3-pass) ---
++
++// Box blur uses a sliding window sum. 3 passes of box blur approximates Gaussian.
++// We compute the box radius from stdDeviation per the SVG spec:
++//   d = floor(s * 3 * sqrt(2*PI) / 4 + 0.5)
++// Then 3 passes of box blur with that radius.
++
++static void box_blur_h(const uint32_t* src, uint32_t* dst, int w, int h, int src_stride, int dst_stride, int radius)
++{
++    if(radius <= 0) {
++        for(int y = 0; y < h; ++y)
++            memcpy(dst + y * dst_stride, src + y * src_stride, w * 4);
++        return;
++    }
++    float iarr = 1.f / (float)(radius + radius + 1);
++    for(int y = 0; y < h; ++y) {
++        const uint32_t* sp = src + y * src_stride;
++        uint32_t* dp = dst + y * dst_stride;
++
++        int ti = 0;
++        int li = 0;
++        int ri = radius;
++
++        uint32_t fv = sp[0];
++        uint32_t lv = sp[w - 1];
++
++        int32_t val_r = (int32_t)((fv >> 16) & 0xFF) * (radius + 1);
++        int32_t val_g = (int32_t)((fv >> 8) & 0xFF) * (radius + 1);
++        int32_t val_b = (int32_t)(fv & 0xFF) * (radius + 1);
++        int32_t val_a = (int32_t)((fv >> 24) & 0xFF) * (radius + 1);
++
++        for(int j = 0; j < radius; ++j) {
++            int idx = j < w ? j : w - 1;
++            uint32_t p = sp[idx];
++            val_r += (int32_t)((p >> 16) & 0xFF);
++            val_g += (int32_t)((p >> 8) & 0xFF);
++            val_b += (int32_t)(p & 0xFF);
++            val_a += (int32_t)((p >> 24) & 0xFF);
++        }
++
++        for(int j = 0; j <= radius; ++j) {
++            int idx = ri < w ? ri : w - 1;
++            uint32_t p = sp[idx];
++            val_r += (int32_t)((p >> 16) & 0xFF) - (int32_t)((fv >> 16) & 0xFF);
++            val_g += (int32_t)((p >> 8) & 0xFF) - (int32_t)((fv >> 8) & 0xFF);
++            val_b += (int32_t)(p & 0xFF) - (int32_t)(fv & 0xFF);
++            val_a += (int32_t)((p >> 24) & 0xFF) - (int32_t)((fv >> 24) & 0xFF);
++            ri++;
++            if(ti < w) {
++                dp[ti] = ((uint32_t)(int32_t)(val_a * iarr + 0.5f) << 24)
++                       | ((uint32_t)(int32_t)(val_r * iarr + 0.5f) << 16)
++                       | ((uint32_t)(int32_t)(val_g * iarr + 0.5f) << 8)
++                       | (uint32_t)(int32_t)(val_b * iarr + 0.5f);
++            }
++            ti++;
++        }
++
++        for(int j = radius + 1; j < w - radius; ++j) {
++            int ri_idx = ri < w ? ri : w - 1;
++            int li_idx = li < w ? li : w - 1;
++            uint32_t rp = sp[ri_idx];
++            uint32_t lp = sp[li_idx];
++            val_r += (int32_t)((rp >> 16) & 0xFF) - (int32_t)((lp >> 16) & 0xFF);
++            val_g += (int32_t)((rp >> 8) & 0xFF) - (int32_t)((lp >> 8) & 0xFF);
++            val_b += (int32_t)(rp & 0xFF) - (int32_t)(lp & 0xFF);
++            val_a += (int32_t)((rp >> 24) & 0xFF) - (int32_t)((lp >> 24) & 0xFF);
++            ri++;
++            li++;
++            if(ti < w) {
++                dp[ti] = ((uint32_t)(int32_t)(val_a * iarr + 0.5f) << 24)
++                       | ((uint32_t)(int32_t)(val_r * iarr + 0.5f) << 16)
++                       | ((uint32_t)(int32_t)(val_g * iarr + 0.5f) << 8)
++                       | (uint32_t)(int32_t)(val_b * iarr + 0.5f);
++            }
++            ti++;
++        }
++
++        for(int j = w - radius; j < w; ++j) {
++            int li_idx = li < w ? li : w - 1;
++            uint32_t lp = sp[li_idx];
++            val_r += (int32_t)((lv >> 16) & 0xFF) - (int32_t)((lp >> 16) & 0xFF);
++            val_g += (int32_t)((lv >> 8) & 0xFF) - (int32_t)((lp >> 8) & 0xFF);
++            val_b += (int32_t)(lv & 0xFF) - (int32_t)(lp & 0xFF);
++            val_a += (int32_t)((lv >> 24) & 0xFF) - (int32_t)((lp >> 24) & 0xFF);
++            li++;
++            if(ti < w) {
++                dp[ti] = ((uint32_t)(int32_t)(val_a * iarr + 0.5f) << 24)
++                       | ((uint32_t)(int32_t)(val_r * iarr + 0.5f) << 16)
++                       | ((uint32_t)(int32_t)(val_g * iarr + 0.5f) << 8)
++                       | (uint32_t)(int32_t)(val_b * iarr + 0.5f);
++            }
++            ti++;
++        }
++    }
++}
++
++static void box_blur_v(const uint32_t* src, uint32_t* dst, int w, int h, int src_stride, int dst_stride, int radius)
++{
++    if(radius <= 0) {
++        for(int y = 0; y < h; ++y)
++            memcpy(dst + y * dst_stride, src + y * src_stride, w * 4);
++        return;
++    }
++    float iarr = 1.f / (float)(radius + radius + 1);
++    for(int x = 0; x < w; ++x) {
++        int ti = 0;
++        int li = 0;
++        int ri = radius;
++
++        uint32_t fv = src[x];
++        uint32_t lv = src[(h - 1) * src_stride + x];
++
++        int32_t val_r = (int32_t)((fv >> 16) & 0xFF) * (radius + 1);
++        int32_t val_g = (int32_t)((fv >> 8) & 0xFF) * (radius + 1);
++        int32_t val_b = (int32_t)(fv & 0xFF) * (radius + 1);
++        int32_t val_a = (int32_t)((fv >> 24) & 0xFF) * (radius + 1);
++
++        for(int j = 0; j < radius; ++j) {
++            int idx = j < h ? j : h - 1;
++            uint32_t p = src[idx * src_stride + x];
++            val_r += (int32_t)((p >> 16) & 0xFF);
++            val_g += (int32_t)((p >> 8) & 0xFF);
++            val_b += (int32_t)(p & 0xFF);
++            val_a += (int32_t)((p >> 24) & 0xFF);
++        }
++
++        for(int j = 0; j <= radius; ++j) {
++            int idx = ri < h ? ri : h - 1;
++            uint32_t p = src[idx * src_stride + x];
++            val_r += (int32_t)((p >> 16) & 0xFF) - (int32_t)((fv >> 16) & 0xFF);
++            val_g += (int32_t)((p >> 8) & 0xFF) - (int32_t)((fv >> 8) & 0xFF);
++            val_b += (int32_t)(p & 0xFF) - (int32_t)(fv & 0xFF);
++            val_a += (int32_t)((p >> 24) & 0xFF) - (int32_t)((fv >> 24) & 0xFF);
++            ri++;
++            if(ti < h) {
++                dst[ti * dst_stride + x] = ((uint32_t)(int32_t)(val_a * iarr + 0.5f) << 24)
++                                         | ((uint32_t)(int32_t)(val_r * iarr + 0.5f) << 16)
++                                         | ((uint32_t)(int32_t)(val_g * iarr + 0.5f) << 8)
++                                         | (uint32_t)(int32_t)(val_b * iarr + 0.5f);
++            }
++            ti++;
++        }
++
++        for(int j = radius + 1; j < h - radius; ++j) {
++            int ri_idx = ri < h ? ri : h - 1;
++            int li_idx = li < h ? li : h - 1;
++            uint32_t rp = src[ri_idx * src_stride + x];
++            uint32_t lp = src[li_idx * src_stride + x];
++            val_r += (int32_t)((rp >> 16) & 0xFF) - (int32_t)((lp >> 16) & 0xFF);
++            val_g += (int32_t)((rp >> 8) & 0xFF) - (int32_t)((lp >> 8) & 0xFF);
++            val_b += (int32_t)(rp & 0xFF) - (int32_t)(lp & 0xFF);
++            val_a += (int32_t)((rp >> 24) & 0xFF) - (int32_t)((lp >> 24) & 0xFF);
++            ri++;
++            li++;
++            if(ti < h) {
++                dst[ti * dst_stride + x] = ((uint32_t)(int32_t)(val_a * iarr + 0.5f) << 24)
++                                         | ((uint32_t)(int32_t)(val_r * iarr + 0.5f) << 16)
++                                         | ((uint32_t)(int32_t)(val_g * iarr + 0.5f) << 8)
++                                         | (uint32_t)(int32_t)(val_b * iarr + 0.5f);
++            }
++            ti++;
++        }
++
++        for(int j = h - radius; j < h; ++j) {
++            int li_idx = li < h ? li : h - 1;
++            uint32_t lp = src[li_idx * src_stride + x];
++            val_r += (int32_t)((lv >> 16) & 0xFF) - (int32_t)((lp >> 16) & 0xFF);
++            val_g += (int32_t)((lv >> 8) & 0xFF) - (int32_t)((lp >> 8) & 0xFF);
++            val_b += (int32_t)(lv & 0xFF) - (int32_t)(lp & 0xFF);
++            val_a += (int32_t)((lv >> 24) & 0xFF) - (int32_t)((lp >> 24) & 0xFF);
++            li++;
++            if(ti < h) {
++                dst[ti * dst_stride + x] = ((uint32_t)(int32_t)(val_a * iarr + 0.5f) << 24)
++                                         | ((uint32_t)(int32_t)(val_r * iarr + 0.5f) << 16)
++                                         | ((uint32_t)(int32_t)(val_g * iarr + 0.5f) << 8)
++                                         | (uint32_t)(int32_t)(val_b * iarr + 0.5f);
++            }
++            ti++;
++        }
++    }
++}
++
++static int box_radius_for_gaussian(float stdDev)
++{
++    // SVG spec: d = floor(stdDev * 3 * sqrt(2*PI) / 4 + 0.5)
++    // For 3-pass box blur, each pass uses radius = (d - 1) / 2
++    if(stdDev <= 0.f)
++        return 0;
++    int d = (int)(stdDev * 3.f * 2.5066f / 4.f + 0.5f);
++    if(d < 1) d = 1;
++    // Make d odd for symmetric kernel
++    if(d % 2 == 0) d++;
++    return (d - 1) / 2;
++}
++
++void plutovg_filter_gaussian_blur(
++    plutovg_surface_t* dst, const plutovg_surface_t* src,
++    float stdDevX, float stdDevY,
++    int x, int y, int width, int height)
++{
++    int w = plutovg_surface_get_width(dst);
++    int h = plutovg_surface_get_height(dst);
++    int dst_stride = plutovg_surface_get_stride(dst) / 4;
++
++    int src_w = plutovg_surface_get_width(src);
++    int src_h = plutovg_surface_get_height(src);
++    int src_stride = plutovg_surface_get_stride(src) / 4;
++
++    // Copy src to dst first
++    unsigned char* dst_data = plutovg_surface_get_data(dst);
++    const unsigned char* src_data = plutovg_surface_get_data(src);
++    int copyW = w < src_w ? w : src_w;
++    int copyH = h < src_h ? h : src_h;
++    memset(dst_data, 0, h * dst_stride * 4);
++    for(int row = 0; row < copyH; ++row) {
++        memcpy(dst_data + row * dst_stride * 4, src_data + row * src_stride * 4, copyW * 4);
++    }
++
++    int radiusX = box_radius_for_gaussian(stdDevX);
++    int radiusY = box_radius_for_gaussian(stdDevY);
++
++    if(radiusX <= 0 && radiusY <= 0)
++        return;
++
++    // Allocate temp buffer
++    uint32_t* tmp = (uint32_t*)malloc(w * h * 4);
++    if(!tmp)
++        return;
++
++    uint32_t* pixels = (uint32_t*)dst_data;
++
++    // 3 passes of box blur
++    for(int pass = 0; pass < 3; ++pass) {
++        if(radiusX > 0) {
++            box_blur_h(pixels, tmp, w, h, dst_stride, w, radiusX);
++            box_blur_v(tmp, pixels, w, h, w, dst_stride, radiusY > 0 ? radiusY : 0);
++        } else {
++            box_blur_v(pixels, tmp, w, h, dst_stride, w, radiusY);
++            // Copy back
++            for(int row = 0; row < h; ++row)
++                memcpy(pixels + row * dst_stride, tmp + row * w, w * 4);
++        }
++    }
++
++    free(tmp);
++}
++
++// --- Blend ---
++
++void plutovg_filter_blend(
++    plutovg_surface_t* dst,
++    const plutovg_surface_t* in1, const plutovg_surface_t* in2,
++    int mode,
++    int x, int y, int width, int height)
++{
++    int dst_w = plutovg_surface_get_width(dst);
++    int dst_h = plutovg_surface_get_height(dst);
++    int dst_stride = plutovg_surface_get_stride(dst) / 4;
++    uint32_t* dst_data = (uint32_t*)plutovg_surface_get_data(dst);
++
++    int in1_w = plutovg_surface_get_width(in1);
++    int in1_h = plutovg_surface_get_height(in1);
++    int in1_stride = plutovg_surface_get_stride(in1) / 4;
++    const uint32_t* in1_data = (const uint32_t*)plutovg_surface_get_data(in1);
++
++    int in2_w = plutovg_surface_get_width(in2);
++    int in2_h = plutovg_surface_get_height(in2);
++    int in2_stride = plutovg_surface_get_stride(in2) / 4;
++    const uint32_t* in2_data = (const uint32_t*)plutovg_surface_get_data(in2);
++
++    int x0 = x < 0 ? 0 : x;
++    int y0 = y < 0 ? 0 : y;
++    int x1 = (x + width) > dst_w ? dst_w : (x + width);
++    int y1 = (y + height) > dst_h ? dst_h : (y + height);
++
++    for(int row = y0; row < y1; ++row) {
++        for(int col = x0; col < x1; ++col) {
++            uint32_t c1 = 0, c2 = 0;
++            if(row < in1_h && col < in1_w)
++                c1 = in1_data[row * in1_stride + col];
++            if(row < in2_h && col < in2_w)
++                c2 = in2_data[row * in2_stride + col];
++
++            // Unpremultiply for blending
++            uint32_t a1 = (c1 >> 24) & 0xFF;
++            uint32_t r1 = a1 ? ((c1 >> 16) & 0xFF) * 255 / a1 : 0;
++            uint32_t g1 = a1 ? ((c1 >> 8) & 0xFF) * 255 / a1 : 0;
++            uint32_t b1 = a1 ? (c1 & 0xFF) * 255 / a1 : 0;
++
++            uint32_t a2 = (c2 >> 24) & 0xFF;
++            uint32_t r2 = a2 ? ((c2 >> 16) & 0xFF) * 255 / a2 : 0;
++            uint32_t g2 = a2 ? ((c2 >> 8) & 0xFF) * 255 / a2 : 0;
++            uint32_t b2 = a2 ? (c2 & 0xFF) * 255 / a2 : 0;
++
++            uint32_t rr, rg, rb;
++            switch(mode) {
++            case 1: // multiply
++                rr = r1 * r2 / 255;
++                rg = g1 * g2 / 255;
++                rb = b1 * b2 / 255;
++                break;
++            case 2: // screen
++                rr = r1 + r2 - r1 * r2 / 255;
++                rg = g1 + g2 - g1 * g2 / 255;
++                rb = b1 + b2 - b1 * b2 / 255;
++                break;
++            case 3: // darken
++                rr = r1 < r2 ? r1 : r2;
++                rg = g1 < g2 ? g1 : g2;
++                rb = b1 < b2 ? b1 : b2;
++                break;
++            case 4: // lighten
++                rr = r1 > r2 ? r1 : r2;
++                rg = g1 > g2 ? g1 : g2;
++                rb = b1 > b2 ? b1 : b2;
++                break;
++            default: // 0 = normal (source-over)
++                rr = r2;
++                rg = g2;
++                rb = b2;
++                break;
++            }
++
++            // Composite: Fa = a1 + a2 - a1*a2/255
++            uint32_t ra = a1 + a2 - a1 * a2 / 255;
++            if(ra > 255) ra = 255;
++
++            // Premultiply result
++            dst_data[row * dst_stride + col] = premultiply_pixel(
++                clamp255(rr), clamp255(rg), clamp255(rb), ra);
++        }
++    }
++}
++
++// --- Color Matrix ---
++
++void plutovg_filter_color_matrix(
++    plutovg_surface_t* dst, const plutovg_surface_t* src,
++    const float matrix[20],
++    int x, int y, int width, int height)
++{
++    int dst_w = plutovg_surface_get_width(dst);
++    int dst_h = plutovg_surface_get_height(dst);
++    int dst_stride = plutovg_surface_get_stride(dst) / 4;
++    uint32_t* dst_data = (uint32_t*)plutovg_surface_get_data(dst);
++
++    int src_w = plutovg_surface_get_width(src);
++    int src_h = plutovg_surface_get_height(src);
++    int src_stride = plutovg_surface_get_stride(src) / 4;
++    const uint32_t* src_data = (const uint32_t*)plutovg_surface_get_data(src);
++
++    int x0 = x < 0 ? 0 : x;
++    int y0 = y < 0 ? 0 : y;
++    int x1 = (x + width) > dst_w ? dst_w : (x + width);
++    int y1 = (y + height) > dst_h ? dst_h : (y + height);
++
++    for(int row = y0; row < y1; ++row) {
++        for(int col = x0; col < x1; ++col) {
++            uint32_t p = 0;
++            if(row < src_h && col < src_w)
++                p = src_data[row * src_stride + col];
++
++            // Unpremultiply
++            uint32_t a = (p >> 24) & 0xFF;
++            float R, G, B, A;
++            if(a == 0) {
++                R = G = B = A = 0.f;
++            } else {
++                R = (float)((p >> 16) & 0xFF) / (float)a;
++                G = (float)((p >> 8) & 0xFF) / (float)a;
++                B = (float)(p & 0xFF) / (float)a;
++                A = (float)a / 255.f;
++            }
++
++            // Apply 4x5 matrix (row-major): [R' G' B' A'] = M * [R G B A 1]
++            float nr = matrix[0]*R + matrix[1]*G + matrix[2]*B + matrix[3]*A + matrix[4];
++            float ng = matrix[5]*R + matrix[6]*G + matrix[7]*B + matrix[8]*A + matrix[9];
++            float nb = matrix[10]*R + matrix[11]*G + matrix[12]*B + matrix[13]*A + matrix[14];
++            float na = matrix[15]*R + matrix[16]*G + matrix[17]*B + matrix[18]*A + matrix[19];
++
++            // Clamp to [0,1]
++            if(nr < 0.f) nr = 0.f; if(nr > 1.f) nr = 1.f;
++            if(ng < 0.f) ng = 0.f; if(ng > 1.f) ng = 1.f;
++            if(nb < 0.f) nb = 0.f; if(nb > 1.f) nb = 1.f;
++            if(na < 0.f) na = 0.f; if(na > 1.f) na = 1.f;
++
++            // Premultiply and store
++            uint32_t ia = clamp255((int)(na * 255.f + 0.5f));
++            uint32_t ir = clamp255((int)(nr * 255.f + 0.5f));
++            uint32_t ig = clamp255((int)(ng * 255.f + 0.5f));
++            uint32_t ib = clamp255((int)(nb * 255.f + 0.5f));
++            dst_data[row * dst_stride + col] = premultiply_pixel(ir, ig, ib, ia);
++        }
++    }
++}
++
++// --- Composite ---
++
++void plutovg_filter_composite(
++    plutovg_surface_t* dst,
++    const plutovg_surface_t* in1, const plutovg_surface_t* in2,
++    int op, float k1, float k2, float k3, float k4,
++    int x, int y, int width, int height)
++{
++    int dst_w = plutovg_surface_get_width(dst);
++    int dst_h = plutovg_surface_get_height(dst);
++    int dst_stride = plutovg_surface_get_stride(dst) / 4;
++    uint32_t* dst_data = (uint32_t*)plutovg_surface_get_data(dst);
++
++    int in1_w = plutovg_surface_get_width(in1);
++    int in1_h = plutovg_surface_get_height(in1);
++    int in1_stride = plutovg_surface_get_stride(in1) / 4;
++    const uint32_t* in1_data = (const uint32_t*)plutovg_surface_get_data(in1);
++
++    int in2_w = plutovg_surface_get_width(in2);
++    int in2_h = plutovg_surface_get_height(in2);
++    int in2_stride = plutovg_surface_get_stride(in2) / 4;
++    const uint32_t* in2_data = (const uint32_t*)plutovg_surface_get_data(in2);
++
++    int x0 = x < 0 ? 0 : x;
++    int y0 = y < 0 ? 0 : y;
++    int x1 = (x + width) > dst_w ? dst_w : (x + width);
++    int y1 = (y + height) > dst_h ? dst_h : (y + height);
++
++    for(int row = y0; row < y1; ++row) {
++        for(int col = x0; col < x1; ++col) {
++            uint32_t c1 = 0, c2 = 0;
++            if(row < in1_h && col < in1_w)
++                c1 = in1_data[row * in1_stride + col];
++            if(row < in2_h && col < in2_w)
++                c2 = in2_data[row * in2_stride + col];
++
++            // All compositing operates on premultiplied values
++            uint32_t r1 = (c1 >> 16) & 0xFF;
++            uint32_t g1 = (c1 >> 8) & 0xFF;
++            uint32_t b1 = c1 & 0xFF;
++            uint32_t a1 = (c1 >> 24) & 0xFF;
++
++            uint32_t r2 = (c2 >> 16) & 0xFF;
++            uint32_t g2 = (c2 >> 8) & 0xFF;
++            uint32_t b2 = c2 & 0xFF;
++            uint32_t a2 = (c2 >> 24) & 0xFF;
++
++            uint32_t rr, rg, rb, ra;
++
++            switch(op) {
++            case 0: // over: in1 over in2
++            {
++                uint32_t inv_a1 = 255 - a1;
++                ra = a1 + ((a2 * inv_a1 + 127) / 255);
++                rr = r1 + ((r2 * inv_a1 + 127) / 255);
++                rg = g1 + ((g2 * inv_a1 + 127) / 255);
++                rb = b1 + ((b2 * inv_a1 + 127) / 255);
++                break;
++            }
++            case 1: // in: in1 in in2
++                ra = (a1 * a2 + 127) / 255;
++                rr = (r1 * a2 + 127) / 255;
++                rg = (g1 * a2 + 127) / 255;
++                rb = (b1 * a2 + 127) / 255;
++                break;
++            case 2: // out: in1 out in2
++            {
++                uint32_t inv_a2 = 255 - a2;
++                ra = (a1 * inv_a2 + 127) / 255;
++                rr = (r1 * inv_a2 + 127) / 255;
++                rg = (g1 * inv_a2 + 127) / 255;
++                rb = (b1 * inv_a2 + 127) / 255;
++                break;
++            }
++            case 3: // atop: in1 atop in2
++            {
++                uint32_t inv_a1 = 255 - a1;
++                ra = a2;
++                rr = (r1 * a2 + r2 * inv_a1 + 127) / 255;
++                rg = (g1 * a2 + g2 * inv_a1 + 127) / 255;
++                rb = (b1 * a2 + b2 * inv_a1 + 127) / 255;
++                break;
++            }
++            case 4: // xor
++            {
++                uint32_t inv_a1 = 255 - a1;
++                uint32_t inv_a2 = 255 - a2;
++                ra = (a1 * inv_a2 + a2 * inv_a1 + 127) / 255;
++                rr = (r1 * inv_a2 + r2 * inv_a1 + 127) / 255;
++                rg = (g1 * inv_a2 + g2 * inv_a1 + 127) / 255;
++                rb = (b1 * inv_a2 + b2 * inv_a1 + 127) / 255;
++                break;
++            }
++            case 5: // arithmetic: k1*i1*i2 + k2*i1 + k3*i2 + k4
++            {
++                uint32_t ur1 = a1 ? r1 * 255 / a1 : 0;
++                uint32_t ug1 = a1 ? g1 * 255 / a1 : 0;
++                uint32_t ub1 = a1 ? b1 * 255 / a1 : 0;
++                uint32_t ur2 = a2 ? r2 * 255 / a2 : 0;
++                uint32_t ug2 = a2 ? g2 * 255 / a2 : 0;
++                uint32_t ub2 = a2 ? b2 * 255 / a2 : 0;
++
++                float fr = k1 * ur1 * ur2 / 255.f + k2 * ur1 + k3 * ur2 + k4 * 255.f;
++                float fg = k1 * ug1 * ug2 / 255.f + k2 * ug1 + k3 * ug2 + k4 * 255.f;
++                float fb = k1 * ub1 * ub2 / 255.f + k2 * ub1 + k3 * ub2 + k4 * 255.f;
++                float fa = k1 * a1 * a2 / 255.f + k2 * a1 + k3 * a2 + k4 * 255.f;
++                ra = clamp255((int)(fa + 0.5f));
++                rr = clamp255((int)(fr + 0.5f));
++                rg = clamp255((int)(fg + 0.5f));
++                rb = clamp255((int)(fb + 0.5f));
++                dst_data[row * dst_stride + col] = premultiply_pixel(rr, rg, rb, ra);
++                continue;
++            }
++            default:
++                ra = rr = rg = rb = 0;
++                break;
++            }
++
++            dst_data[row * dst_stride + col] = (clamp255(ra) << 24) | (clamp255(rr) << 16) | (clamp255(rg) << 8) | clamp255(rb);
++        }
++    }
++}
++
++void plutovg_filter_unpremultiply(uint32_t* pixels, int count)
++{
++    for(int i = 0; i < count; ++i) {
++        uint32_t p = pixels[i];
++        uint32_t a = (p >> 24) & 0xFF;
++        if(a == 0 || a == 255)
++            continue;
++        uint32_t r = ((p >> 16) & 0xFF) * 255 / a;
++        uint32_t g = ((p >> 8) & 0xFF) * 255 / a;
++        uint32_t b = (p & 0xFF) * 255 / a;
++        pixels[i] = (a << 24) | (clamp255(r) << 16) | (clamp255(g) << 8) | clamp255(b);
++    }
++}
++
++void plutovg_filter_premultiply(uint32_t* pixels, int count)
++{
++    for(int i = 0; i < count; ++i) {
++        uint32_t p = pixels[i];
++        uint32_t a = (p >> 24) & 0xFF;
++        if(a == 0 || a == 255)
++            continue;
++        uint32_t r = ((p >> 16) & 0xFF) * a / 255;
++        uint32_t g = ((p >> 8) & 0xFF) * a / 255;
++        uint32_t b = (p & 0xFF) * a / 255;
++        pixels[i] = (a << 24) | (r << 16) | (g << 8) | b;
++    }
++}
++
++// ============================================================
++// Component Transfer, Morphology, Tile
++// ============================================================
++
++static float apply_transfer_func(float value, const plutovg_transfer_func_t* func)
++{
++    if(!func)
++        return value;
++
++    switch(func->type) {
++    case 0: // identity
++        return value;
++    case 1: // table
++    {
++        if(func->tableSize < 2 || !func->tableValues)
++            return value;
++        float scaled = value * (func->tableSize - 1);
++        int k = (int)scaled;
++        if(k < 0) k = 0;
++        if(k >= func->tableSize - 1)
++            return func->tableValues[func->tableSize - 1];
++        float frac = scaled - k;
++        return func->tableValues[k] + frac * (func->tableValues[k + 1] - func->tableValues[k]);
++    }
++    case 2: // discrete
++    {
++        if(func->tableSize < 1 || !func->tableValues)
++            return value;
++        int k = (int)(value * func->tableSize);
++        if(k < 0) k = 0;
++        if(k >= func->tableSize) k = func->tableSize - 1;
++        return func->tableValues[k];
++    }
++    case 3: // linear: C' = slope * C + intercept
++        return func->slope * value + func->intercept;
++    case 4: // gamma: C' = amplitude * pow(C, exponent) + offset
++        return func->amplitude * powf(value, func->exponent) + func->offset;
++    default:
++        return value;
++    }
++}
++
++void plutovg_filter_component_transfer(
++    plutovg_surface_t* dst, const plutovg_surface_t* src,
++    const plutovg_transfer_func_t* funcR,
++    const plutovg_transfer_func_t* funcG,
++    const plutovg_transfer_func_t* funcB,
++    const plutovg_transfer_func_t* funcA,
++    int x, int y, int width, int height)
++{
++    int dst_w = plutovg_surface_get_width(dst);
++    int dst_h = plutovg_surface_get_height(dst);
++    int dst_stride = plutovg_surface_get_stride(dst) / 4;
++    uint32_t* dst_data = (uint32_t*)plutovg_surface_get_data(dst);
++
++    int src_w = plutovg_surface_get_width(src);
++    int src_h = plutovg_surface_get_height(src);
++    int src_stride = plutovg_surface_get_stride(src) / 4;
++    const uint32_t* src_data = (const uint32_t*)plutovg_surface_get_data(src);
++
++    int x0 = x < 0 ? 0 : x;
++    int y0 = y < 0 ? 0 : y;
++    int x1 = (x + width) > dst_w ? dst_w : (x + width);
++    int y1 = (y + height) > dst_h ? dst_h : (y + height);
++
++    for(int row = y0; row < y1; ++row) {
++        for(int col = x0; col < x1; ++col) {
++            uint32_t p = 0;
++            if(row < src_h && col < src_w)
++                p = src_data[row * src_stride + col];
++
++            // Unpremultiply
++            uint32_t a = (p >> 24) & 0xFF;
++            float R, G, B, A;
++            if(a == 0) {
++                R = G = B = A = 0.f;
++            } else {
++                R = (float)((p >> 16) & 0xFF) / (float)a;
++                G = (float)((p >> 8) & 0xFF) / (float)a;
++                B = (float)(p & 0xFF) / (float)a;
++                A = (float)a / 255.f;
++            }
++
++            // Apply transfer functions
++            R = apply_transfer_func(R, funcR);
++            G = apply_transfer_func(G, funcG);
++            B = apply_transfer_func(B, funcB);
++            A = apply_transfer_func(A, funcA);
++
++            // Clamp
++            if(R < 0.f) R = 0.f; if(R > 1.f) R = 1.f;
++            if(G < 0.f) G = 0.f; if(G > 1.f) G = 1.f;
++            if(B < 0.f) B = 0.f; if(B > 1.f) B = 1.f;
++            if(A < 0.f) A = 0.f; if(A > 1.f) A = 1.f;
++
++            // Premultiply and store
++            uint32_t ia = clamp255((int)(A * 255.f + 0.5f));
++            uint32_t ir = clamp255((int)(R * 255.f + 0.5f));
++            uint32_t ig = clamp255((int)(G * 255.f + 0.5f));
++            uint32_t ib = clamp255((int)(B * 255.f + 0.5f));
++            dst_data[row * dst_stride + col] = premultiply_pixel(ir, ig, ib, ia);
++        }
++    }
++}
++
++void plutovg_filter_morphology(
++    plutovg_surface_t* dst, const plutovg_surface_t* src,
++    int op, float radiusX, float radiusY,
++    int x, int y, int width, int height)
++{
++    int dst_w = plutovg_surface_get_width(dst);
++    int dst_h = plutovg_surface_get_height(dst);
++    int dst_stride = plutovg_surface_get_stride(dst) / 4;
++    uint32_t* dst_data = (uint32_t*)plutovg_surface_get_data(dst);
++
++    int src_w = plutovg_surface_get_width(src);
++    int src_h = plutovg_surface_get_height(src);
++    int src_stride = plutovg_surface_get_stride(src) / 4;
++    const uint32_t* src_data = (const uint32_t*)plutovg_surface_get_data(src);
++
++    int rx = (int)(radiusX + 0.5f);
++    int ry = (int)(radiusY + 0.5f);
++    if(rx < 0) rx = 0;
++    if(ry < 0) ry = 0;
++
++    int x0 = x < 0 ? 0 : x;
++    int y0 = y < 0 ? 0 : y;
++    int x1 = (x + width) > dst_w ? dst_w : (x + width);
++    int y1 = (y + height) > dst_h ? dst_h : (y + height);
++
++    for(int row = y0; row < y1; ++row) {
++        for(int col = x0; col < x1; ++col) {
++            uint32_t best_r, best_g, best_b, best_a;
++
++            if(op == 0) { // erode: find minimum
++                best_r = best_g = best_b = best_a = 255;
++            } else { // dilate: find maximum
++                best_r = best_g = best_b = best_a = 0;
++            }
++
++            for(int ky = -ry; ky <= ry; ++ky) {
++                int sy = row + ky;
++                if(sy < 0 || sy >= src_h) continue;
++                for(int kx = -rx; kx <= rx; ++kx) {
++                    int sx = col + kx;
++                    if(sx < 0 || sx >= src_w) continue;
++                    uint32_t p = src_data[sy * src_stride + sx];
++                    uint32_t r = (p >> 16) & 0xFF;
++                    uint32_t g = (p >> 8) & 0xFF;
++                    uint32_t b = p & 0xFF;
++                    uint32_t a = (p >> 24) & 0xFF;
++
++                    if(op == 0) { // erode
++                        if(r < best_r) best_r = r;
++                        if(g < best_g) best_g = g;
++                        if(b < best_b) best_b = b;
++                        if(a < best_a) best_a = a;
++                    } else { // dilate
++                        if(r > best_r) best_r = r;
++                        if(g > best_g) best_g = g;
++                        if(b > best_b) best_b = b;
++                        if(a > best_a) best_a = a;
++                    }
++                }
++            }
++
++            dst_data[row * dst_stride + col] = (best_a << 24) | (best_r << 16) | (best_g << 8) | best_b;
++        }
++    }
++}
++
++void plutovg_filter_tile(
++    plutovg_surface_t* dst, const plutovg_surface_t* src,
++    int srcX, int srcY, int srcW, int srcH,
++    int x, int y, int width, int height)
++{
++    int dst_w = plutovg_surface_get_width(dst);
++    int dst_h = plutovg_surface_get_height(dst);
++    int dst_stride = plutovg_surface_get_stride(dst) / 4;
++    uint32_t* dst_data = (uint32_t*)plutovg_surface_get_data(dst);
++
++    int src_w = plutovg_surface_get_width(src);
++    int src_h = plutovg_surface_get_height(src);
++    int src_stride = plutovg_surface_get_stride(src) / 4;
++    const uint32_t* src_data = (const uint32_t*)plutovg_surface_get_data(src);
++
++    if(srcW <= 0 || srcH <= 0)
++        return;
++
++    int x0 = x < 0 ? 0 : x;
++    int y0 = y < 0 ? 0 : y;
++    int x1 = (x + width) > dst_w ? dst_w : (x + width);
++    int y1 = (y + height) > dst_h ? dst_h : (y + height);
++
++    for(int row = y0; row < y1; ++row) {
++        for(int col = x0; col < x1; ++col) {
++            // Map dst pixel to tiled source pixel
++            int tx = ((col - srcX) % srcW + srcW) % srcW + srcX;
++            int ty = ((row - srcY) % srcH + srcH) % srcH + srcY;
++
++            uint32_t p = 0;
++            if(tx >= 0 && tx < src_w && ty >= 0 && ty < src_h)
++                p = src_data[ty * src_stride + tx];
++
++            dst_data[row * dst_stride + col] = p;
++        }
++    }
++}
++
++// ============================================================
++// Turbulence, Convolve Matrix, Displacement Map
++// ============================================================
++
++// --- Perlin Turbulence (per SVG spec appendix) ---
++
++#define PERLIN_B  0x100
++#define PERLIN_BM 0xFF
++#define PERLIN_N  0x1000
++
++typedef struct {
++    int latticeSelector[PERLIN_B + PERLIN_B + 2];
++    double gradient[4][PERLIN_B + PERLIN_B + 2][2];
++} perlin_noise_t;
++
++static double s_curve(double t)
++{
++    return t * t * (3.0 - 2.0 * t);
++}
++
++static double lerp_d(double t, double a, double b)
++{
++    return a + t * (b - a);
++}
++
++static void perlin_init(perlin_noise_t* pn, float seed)
++{
++    // Initialize with seed
++    // Use a simple LCG seeded from the float seed
++    unsigned int s = (unsigned int)(seed * 2147483647.0f);
++    if(s == 0) s = 1;
++
++    for(int k = 0; k < 4; ++k) {
++        for(int i = 0; i < PERLIN_B; ++i) {
++            pn->latticeSelector[i] = i;
++            for(int j = 0; j < 2; ++j) {
++                s = s * 1103515245u + 12345u;
++                double val = (double)((int)(s >> 1) % (PERLIN_B + PERLIN_B)) - PERLIN_B;
++                pn->gradient[k][i][j] = val / PERLIN_B;
++            }
++            // normalize gradient
++            double s2 = pn->gradient[k][i][0] * pn->gradient[k][i][0]
++                      + pn->gradient[k][i][1] * pn->gradient[k][i][1];
++            if(s2 > 0.0001) {
++                double inv = 1.0 / sqrt(s2);
++                pn->gradient[k][i][0] *= inv;
++                pn->gradient[k][i][1] *= inv;
++            }
++        }
++    }
++
++    // Shuffle lattice selector
++    for(int i = PERLIN_B - 1; i > 0; --i) {
++        s = s * 1103515245u + 12345u;
++        int j = (int)((s >> 1) % (unsigned int)(i + 1));
++        int tmp = pn->latticeSelector[i];
++        pn->latticeSelector[i] = pn->latticeSelector[j];
++        pn->latticeSelector[j] = tmp;
++    }
++
++    // Extend arrays
++    for(int i = 0; i < PERLIN_B + 2; ++i) {
++        pn->latticeSelector[PERLIN_B + i] = pn->latticeSelector[i];
++        for(int k = 0; k < 4; ++k) {
++            pn->gradient[k][PERLIN_B + i][0] = pn->gradient[k][i][0];
++            pn->gradient[k][PERLIN_B + i][1] = pn->gradient[k][i][1];
++        }
++    }
++}
++
++static double perlin_noise2(const perlin_noise_t* pn, int channel, double x, double y)
++{
++    double t = x + PERLIN_N;
++    int bx0 = ((int)t) & PERLIN_BM;
++    int bx1 = (bx0 + 1) & PERLIN_BM;
++    double rx0 = t - (int)t;
++    double rx1 = rx0 - 1.0;
++
++    t = y + PERLIN_N;
++    int by0 = ((int)t) & PERLIN_BM;
++    int by1 = (by0 + 1) & PERLIN_BM;
++    double ry0 = t - (int)t;
++    double ry1 = ry0 - 1.0;
++
++    int i = pn->latticeSelector[bx0];
++    int j = pn->latticeSelector[bx1];
++
++    int b00 = pn->latticeSelector[i + by0];
++    int b10 = pn->latticeSelector[j + by0];
++    int b01 = pn->latticeSelector[i + by1];
++    int b11 = pn->latticeSelector[j + by1];
++
++    double sx = s_curve(rx0);
++    double sy = s_curve(ry0);
++
++    const double* q;
++    double u, v;
++
++    q = pn->gradient[channel][b00]; u = rx0 * q[0] + ry0 * q[1];
++    q = pn->gradient[channel][b10]; v = rx1 * q[0] + ry0 * q[1];
++    double a2 = lerp_d(sx, u, v);
++
++    q = pn->gradient[channel][b01]; u = rx0 * q[0] + ry1 * q[1];
++    q = pn->gradient[channel][b11]; v = rx1 * q[0] + ry1 * q[1];
++    double b2 = lerp_d(sx, u, v);
++
++    return lerp_d(sy, a2, b2);
++}
++
++void plutovg_filter_turbulence(
++    plutovg_surface_t* dst,
++    float baseFreqX, float baseFreqY,
++    int numOctaves, float seed, int stitchTiles, int fractalNoise,
++    int x, int y, int width, int height)
++{
++    int dst_w = plutovg_surface_get_width(dst);
++    int dst_h = plutovg_surface_get_height(dst);
++    int dst_stride = plutovg_surface_get_stride(dst) / 4;
++    uint32_t* dst_data = (uint32_t*)plutovg_surface_get_data(dst);
++
++    perlin_noise_t pn;
++    perlin_init(&pn, seed);
++
++    if(numOctaves < 1) numOctaves = 1;
++    if(numOctaves > 8) numOctaves = 8;
++
++    int x0 = x < 0 ? 0 : x;
++    int y0 = y < 0 ? 0 : y;
++    int x1 = (x + width) > dst_w ? dst_w : (x + width);
++    int y1 = (y + height) > dst_h ? dst_h : (y + height);
++
++    (void)stitchTiles; // TODO: implement tile stitching
++
++    for(int row = y0; row < y1; ++row) {
++        for(int col = x0; col < x1; ++col) {
++            double channelValues[4] = {0, 0, 0, 0};
++
++            for(int ch = 0; ch < 4; ++ch) {
++                double freq_x = baseFreqX;
++                double freq_y = baseFreqY;
++                double amplitude = 1.0;
++                double sum = 0.0;
++
++                for(int oct = 0; oct < numOctaves; ++oct) {
++                    double noise = perlin_noise2(&pn, ch, col * freq_x, row * freq_y);
++                    if(fractalNoise) {
++                        sum += noise * amplitude;
++                    } else {
++                        sum += fabs(noise) * amplitude;
++                    }
++                    freq_x *= 2.0;
++                    freq_y *= 2.0;
++                    amplitude *= 0.5;
++                }
++
++                channelValues[ch] = sum;
++            }
++
++            uint32_t r, g, b, a;
++            if(fractalNoise) {
++                // fractalNoise: result in [-1,1], map to [0,1]
++                r = clamp255((int)((channelValues[0] * 0.5 + 0.5) * 255.0 + 0.5));
++                g = clamp255((int)((channelValues[1] * 0.5 + 0.5) * 255.0 + 0.5));
++                b = clamp255((int)((channelValues[2] * 0.5 + 0.5) * 255.0 + 0.5));
++                a = clamp255((int)((channelValues[3] * 0.5 + 0.5) * 255.0 + 0.5));
++            } else {
++                // turbulence: result in [0,1]
++                r = clamp255((int)(channelValues[0] * 255.0 + 0.5));
++                g = clamp255((int)(channelValues[1] * 255.0 + 0.5));
++                b = clamp255((int)(channelValues[2] * 255.0 + 0.5));
++                a = clamp255((int)(channelValues[3] * 255.0 + 0.5));
++            }
++
++            // Premultiply
++            dst_data[row * dst_stride + col] = premultiply_pixel(r, g, b, a);
++        }
++    }
++}
++
++// --- Convolve Matrix ---
++
++void plutovg_filter_convolve_matrix(
++    plutovg_surface_t* dst, const plutovg_surface_t* src,
++    const float* kernelMatrix, int orderX, int orderY,
++    int targetX, int targetY, float divisor, float bias,
++    int edgeMode, int preserveAlpha,
++    int x, int y, int width, int height)
++{
++    int dst_w = plutovg_surface_get_width(dst);
++    int dst_h = plutovg_surface_get_height(dst);
++    int dst_stride = plutovg_surface_get_stride(dst) / 4;
++    uint32_t* dst_data = (uint32_t*)plutovg_surface_get_data(dst);
++
++    int src_w = plutovg_surface_get_width(src);
++    int src_h = plutovg_surface_get_height(src);
++    int src_stride = plutovg_surface_get_stride(src) / 4;
++    const uint32_t* src_data = (const uint32_t*)plutovg_surface_get_data(src);
++
++    if(!kernelMatrix || orderX <= 0 || orderY <= 0)
++        return;
++
++    if(targetX < 0) targetX = orderX / 2;
++    if(targetY < 0) targetY = orderY / 2;
++
++    // Auto-compute divisor
++    if(divisor == 0.f) {
++        float sum = 0.f;
++        for(int i = 0; i < orderX * orderY; ++i)
++            sum += kernelMatrix[i];
++        divisor = (sum != 0.f) ? sum : 1.f;
++    }
++
++    float invDivisor = 1.f / divisor;
++
++    int x0 = x < 0 ? 0 : x;
++    int y0 = y < 0 ? 0 : y;
++    int x1 = (x + width) > dst_w ? dst_w : (x + width);
++    int y1 = (y + height) > dst_h ? dst_h : (y + height);
++
++    for(int row = y0; row < y1; ++row) {
++        for(int col = x0; col < x1; ++col) {
++            float sumR = 0.f, sumG = 0.f, sumB = 0.f, sumA = 0.f;
++
++            for(int ky = 0; ky < orderY; ++ky) {
++                for(int kx = 0; kx < orderX; ++kx) {
++                    int sx = col + kx - targetX;
++                    int sy = row + ky - targetY;
++
++                    uint32_t p;
++                    if(sx < 0 || sx >= src_w || sy < 0 || sy >= src_h) {
++                        switch(edgeMode) {
++                        case 0: // duplicate
++                            if(sx < 0) sx = 0;
++                            if(sx >= src_w) sx = src_w - 1;
++                            if(sy < 0) sy = 0;
++                            if(sy >= src_h) sy = src_h - 1;
++                            p = src_data[sy * src_stride + sx];
++                            break;
++                        case 1: // wrap
++                            sx = ((sx % src_w) + src_w) % src_w;
++                            sy = ((sy % src_h) + src_h) % src_h;
++                            p = src_data[sy * src_stride + sx];
++                            break;
++                        default: // none
++                            p = 0;
++                            break;
++                        }
++                    } else {
++                        p = src_data[sy * src_stride + sx];
++                    }
++
++                    // SVG spec: kernel index is (orderY-1-ky)*orderX + (orderX-1-kx)
++                    // for the standard flipped convolution
++                    float kv = kernelMatrix[(orderY - 1 - ky) * orderX + (orderX - 1 - kx)];
++
++                    // Unpremultiply for correct math
++                    uint32_t pa = (p >> 24) & 0xFF;
++                    float pr, pg, pb, paf;
++                    if(pa == 0) {
++                        pr = pg = pb = paf = 0.f;
++                    } else {
++                        pr = (float)((p >> 16) & 0xFF) / (float)pa * 255.f;
++                        pg = (float)((p >> 8) & 0xFF) / (float)pa * 255.f;
++                        pb = (float)(p & 0xFF) / (float)pa * 255.f;
++                        paf = (float)pa;
++                    }
++
++                    sumR += pr * kv;
++                    sumG += pg * kv;
++                    sumB += pb * kv;
++                    sumA += paf * kv;
++                }
++            }
++
++            float outR = sumR * invDivisor + bias * 255.f;
++            float outG = sumG * invDivisor + bias * 255.f;
++            float outB = sumB * invDivisor + bias * 255.f;
++            float outA;
++
++            if(preserveAlpha) {
++                // Use original alpha
++                uint32_t origP = 0;
++                if(row < src_h && col < src_w)
++                    origP = src_data[row * src_stride + col];
++                outA = (float)((origP >> 24) & 0xFF);
++            } else {
++                outA = sumA * invDivisor + bias * 255.f;
++            }
++
++            uint32_t ia = clamp255((int)(outA + 0.5f));
++            uint32_t ir = clamp255((int)(outR + 0.5f));
++            uint32_t ig = clamp255((int)(outG + 0.5f));
++            uint32_t ib = clamp255((int)(outB + 0.5f));
++            dst_data[row * dst_stride + col] = premultiply_pixel(ir, ig, ib, ia);
++        }
++    }
++}
++
++// --- Displacement Map ---
++
++void plutovg_filter_displacement_map(
++    plutovg_surface_t* dst,
++    const plutovg_surface_t* in1, const plutovg_surface_t* in2,
++    float scale, int xChannel, int yChannel,
++    int x, int y, int width, int height)
++{
++    int dst_w = plutovg_surface_get_width(dst);
++    int dst_h = plutovg_surface_get_height(dst);
++    int dst_stride = plutovg_surface_get_stride(dst) / 4;
++    uint32_t* dst_data = (uint32_t*)plutovg_surface_get_data(dst);
++
++    int in1_w = plutovg_surface_get_width(in1);
++    int in1_h = plutovg_surface_get_height(in1);
++    int in1_stride = plutovg_surface_get_stride(in1) / 4;
++    const uint32_t* in1_data = (const uint32_t*)plutovg_surface_get_data(in1);
++
++    int in2_w = plutovg_surface_get_width(in2);
++    int in2_h = plutovg_surface_get_height(in2);
++    int in2_stride = plutovg_surface_get_stride(in2) / 4;
++    const uint32_t* in2_data = (const uint32_t*)plutovg_surface_get_data(in2);
++
++    int x0 = x < 0 ? 0 : x;
++    int y0 = y < 0 ? 0 : y;
++    int x1 = (x + width) > dst_w ? dst_w : (x + width);
++    int y1 = (y + height) > dst_h ? dst_h : (y + height);
++
++    // Channel extraction helper: 0=R, 1=G, 2=B, 3=A
++    // Displacement uses unpremultiplied values from in2
++    for(int row = y0; row < y1; ++row) {
++        for(int col = x0; col < x1; ++col) {
++            // Get displacement from in2
++            uint32_t dp = 0;
++            if(row < in2_h && col < in2_w)
++                dp = in2_data[row * in2_stride + col];
++
++            // Unpremultiply displacement pixel
++            uint32_t da = (dp >> 24) & 0xFF;
++            float dr, dg, db;
++            if(da == 0) {
++                dr = dg = db = 0.f;
++            } else {
++                dr = (float)((dp >> 16) & 0xFF) / (float)da;
++                dg = (float)((dp >> 8) & 0xFF) / (float)da;
++                db = (float)(dp & 0xFF) / (float)da;
++            }
++            float daf = (float)da / 255.f;
++
++            // Extract channel values (in [0,1] for RGB, [0,1] for A)
++            float channels[4] = {dr, dg, db, daf};
++
++            // Compute displaced coordinates
++            // SVG formula: P'(x,y) = in1(x + scale*(xChannel-0.5), y + scale*(yChannel-0.5))
++            float dispX = scale * (channels[xChannel] - 0.5f);
++            float dispY = scale * (channels[yChannel] - 0.5f);
++
++            int sx = (int)(col + dispX + 0.5f);
++            int sy = (int)(row + dispY + 0.5f);
++
++            uint32_t p = 0;
++            if(sx >= 0 && sx < in1_w && sy >= 0 && sy < in1_h)
++                p = in1_data[sy * in1_stride + sx];
++
++            dst_data[row * dst_stride + col] = p;
++        }
++    }
++}
++
++// Get alpha value at pixel (x,y), clamped to surface bounds
++static float get_alpha(const plutovg_surface_t* src, int x, int y, int w, int h)
++{
++    if(x < 0) x = 0;
++    if(y < 0) y = 0;
++    if(x >= w) x = w - 1;
++    if(y >= h) y = h - 1;
++    const uint32_t* data = (const uint32_t*)plutovg_surface_get_data(src);
++    int stride = plutovg_surface_get_stride(src) / 4;
++    return (float)((data[y * stride + x] >> 24) & 0xFF) / 255.0f;
++}
++
++// Compute surface normal at pixel (x,y) using Sobel-like operators from SVG spec
++// surfaceScale scales the alpha values to create the bump map height
++static void compute_normal(const plutovg_surface_t* src, int px, int py,
++    int w, int h, float surfaceScale, float* nx, float* ny, float* nz)
++{
++    // SVG spec normal computation using kernel factors
++    // Interior pixels use standard 3x3 Sobel
++    // Edge/corner pixels use modified kernels per spec
++    float factorX, factorY;
++
++    int isLeft = (px == 0);
++    int isRight = (px == w - 1);
++    int isTop = (py == 0);
++    int isBottom = (py == h - 1);
++
++    float dx, dy;
++
++    if(isLeft && isTop) {
++        // Top-left corner
++        float a00 = get_alpha(src, px, py, w, h);
++        float a10 = get_alpha(src, px + 1, py, w, h);
++        float a01 = get_alpha(src, px, py + 1, w, h);
++        float a11 = get_alpha(src, px + 1, py + 1, w, h);
++        dx = (2.0f * (a10 - a00) + (a11 - a01)) / 3.0f;
++        dy = (2.0f * (a01 - a00) + (a11 - a10)) / 3.0f;
++        factorX = 2.0f / 3.0f;
++        factorY = 2.0f / 3.0f;
++    } else if(isRight && isTop) {
++        float a_10 = get_alpha(src, px - 1, py, w, h);
++        float a00 = get_alpha(src, px, py, w, h);
++        float a_11 = get_alpha(src, px - 1, py + 1, w, h);
++        float a01 = get_alpha(src, px, py + 1, w, h);
++        dx = (2.0f * (a00 - a_10) + (a01 - a_11)) / 3.0f;
++        dy = (2.0f * (a01 - a00) + (a_11 - a_10)) / 3.0f;
++        factorX = 2.0f / 3.0f;
++        factorY = 2.0f / 3.0f;
++    } else if(isLeft && isBottom) {
++        float a0_1 = get_alpha(src, px, py - 1, w, h);
++        float a1_1 = get_alpha(src, px + 1, py - 1, w, h);
++        float a00 = get_alpha(src, px, py, w, h);
++        float a10 = get_alpha(src, px + 1, py, w, h);
++        dx = (2.0f * (a10 - a00) + (a1_1 - a0_1)) / 3.0f;
++        dy = (2.0f * (a00 - a0_1) + (a10 - a1_1)) / 3.0f;
++        factorX = 2.0f / 3.0f;
++        factorY = 2.0f / 3.0f;
++    } else if(isRight && isBottom) {
++        float a_1_1 = get_alpha(src, px - 1, py - 1, w, h);
++        float a0_1 = get_alpha(src, px, py - 1, w, h);
++        float a_10 = get_alpha(src, px - 1, py, w, h);
++        float a00 = get_alpha(src, px, py, w, h);
++        dx = (2.0f * (a00 - a_10) + (a0_1 - a_1_1)) / 3.0f;
++        dy = (2.0f * (a00 - a0_1) + (a_10 - a_1_1)) / 3.0f;
++        factorX = 2.0f / 3.0f;
++        factorY = 2.0f / 3.0f;
++    } else if(isTop) {
++        // Top edge (not corner)
++        float a_10 = get_alpha(src, px - 1, py, w, h);
++        float a10 = get_alpha(src, px + 1, py, w, h);
++        float a_11 = get_alpha(src, px - 1, py + 1, w, h);
++        float a01 = get_alpha(src, px, py + 1, w, h);
++        float a11 = get_alpha(src, px + 1, py + 1, w, h);
++        float a00 = get_alpha(src, px, py, w, h);
++        dx = (a10 - a_10 + a11 - a_11) / 2.0f;
++        dy = (2.0f * (a01 - a00) + (a11 - a10) + (a_11 - a_10)) / 4.0f;
++        factorX = 1.0f / 2.0f;
++        factorY = 2.0f / 3.0f;
++    } else if(isBottom) {
++        float a_1_1 = get_alpha(src, px - 1, py - 1, w, h);
++        float a0_1 = get_alpha(src, px, py - 1, w, h);
++        float a1_1 = get_alpha(src, px + 1, py - 1, w, h);
++        float a_10 = get_alpha(src, px - 1, py, w, h);
++        float a00 = get_alpha(src, px, py, w, h);
++        float a10 = get_alpha(src, px + 1, py, w, h);
++        dx = (a10 - a_10 + a1_1 - a_1_1) / 2.0f;
++        dy = (2.0f * (a00 - a0_1) + (a10 - a1_1) + (a_10 - a_1_1)) / 4.0f;
++        factorX = 1.0f / 2.0f;
++        factorY = 2.0f / 3.0f;
++    } else if(isLeft) {
++        float a0_1 = get_alpha(src, px, py - 1, w, h);
++        float a1_1 = get_alpha(src, px + 1, py - 1, w, h);
++        float a00 = get_alpha(src, px, py, w, h);
++        float a10 = get_alpha(src, px + 1, py, w, h);
++        float a01 = get_alpha(src, px, py + 1, w, h);
++        float a11 = get_alpha(src, px + 1, py + 1, w, h);
++        dx = (2.0f * (a10 - a00) + (a11 - a01) + (a1_1 - a0_1)) / 4.0f;
++        dy = (a01 - a0_1 + a11 - a1_1) / 2.0f;
++        factorX = 2.0f / 3.0f;
++        factorY = 1.0f / 2.0f;
++    } else if(isRight) {
++        float a_1_1 = get_alpha(src, px - 1, py - 1, w, h);
++        float a0_1 = get_alpha(src, px, py - 1, w, h);
++        float a_10 = get_alpha(src, px - 1, py, w, h);
++        float a00 = get_alpha(src, px, py, w, h);
++        float a_11 = get_alpha(src, px - 1, py + 1, w, h);
++        float a01 = get_alpha(src, px, py + 1, w, h);
++        dx = (2.0f * (a00 - a_10) + (a01 - a_11) + (a0_1 - a_1_1)) / 4.0f;
++        dy = (a01 - a0_1 + a_11 - a_1_1) / 2.0f;
++        factorX = 2.0f / 3.0f;
++        factorY = 1.0f / 2.0f;
++    } else {
++        // Interior pixel — standard Sobel
++        float a_1_1 = get_alpha(src, px - 1, py - 1, w, h);
++        float a0_1 = get_alpha(src, px, py - 1, w, h);
++        float a1_1 = get_alpha(src, px + 1, py - 1, w, h);
++        float a_10 = get_alpha(src, px - 1, py, w, h);
++        float a10 = get_alpha(src, px + 1, py, w, h);
++        float a_11 = get_alpha(src, px - 1, py + 1, w, h);
++        float a01 = get_alpha(src, px, py + 1, w, h);
++        float a11 = get_alpha(src, px + 1, py + 1, w, h);
++        dx = (-a_1_1 + a1_1 - 2.0f * a_10 + 2.0f * a10 - a_11 + a11) / 4.0f;
++        dy = (-a_1_1 - 2.0f * a0_1 - a1_1 + a_11 + 2.0f * a01 + a_11) / 4.0f;
++        factorX = 1.0f / 4.0f;
++        factorY = 1.0f / 4.0f;
++    }
++
++    (void)factorX;
++    (void)factorY;
++
++    *nx = -surfaceScale * dx;
++    *ny = -surfaceScale * dy;
++    *nz = 1.0f;
++
++    // Normalize
++    float len = sqrtf((*nx) * (*nx) + (*ny) * (*ny) + (*nz) * (*nz));
++    if(len > 0.0f) {
++        *nx /= len;
++        *ny /= len;
++        *nz /= len;
++    }
++}
++
++// Compute light vector at pixel (px, py) with alpha-derived height
++static void compute_light_vector(
++    const plutovg_light_source_t* light, int px, int py, float surfaceZ,
++    float* lx, float* ly, float* lz, float* attenuation)
++{
++    *attenuation = 1.0f;
++
++    if(light->type == PLUTOVG_LIGHT_DISTANT) {
++        float az = light->azimuth * 3.14159265358979f / 180.0f;
++        float el = light->elevation * 3.14159265358979f / 180.0f;
++        *lx = cosf(az) * cosf(el);
++        *ly = sinf(az) * cosf(el);
++        *lz = sinf(el);
++    } else {
++        // Point or Spot: direction from surface point to light
++        float dx = light->x - (float)px;
++        float dy = light->y - (float)py;
++        float dz = light->z - surfaceZ;
++        float len = sqrtf(dx * dx + dy * dy + dz * dz);
++        if(len > 0.0f) {
++            *lx = dx / len;
++            *ly = dy / len;
++            *lz = dz / len;
++        } else {
++            *lx = 0.0f; *ly = 0.0f; *lz = 1.0f;
++        }
++
++        if(light->type == PLUTOVG_LIGHT_SPOT) {
++            // Spot direction: from light to pointsAt
++            float sx = light->pointsAtX - light->x;
++            float sy = light->pointsAtY - light->y;
++            float sz = light->pointsAtZ - light->z;
++            float slen = sqrtf(sx * sx + sy * sy + sz * sz);
++            if(slen > 0.0f) {
++                sx /= slen; sy /= slen; sz /= slen;
++            }
++
++            // Dot product: -L · S (angle between light-to-point and light-to-target)
++            float cosAngle = -(*lx) * sx + -(*ly) * sy + -(*lz) * sz;
++
++            if(light->hasLimitingConeAngle) {
++                float cosLimit = cosf(light->limitingConeAngle * 3.14159265358979f / 180.0f);
++                if(cosAngle < cosLimit) {
++                    *attenuation = 0.0f;
++                    return;
++                }
++            }
++
++            if(cosAngle > 0.0f) {
++                *attenuation = powf(cosAngle, light->specularExponent);
++            } else {
++                *attenuation = 0.0f;
++            }
++        }
++    }
++}
++
++void plutovg_filter_diffuse_lighting(
++    plutovg_surface_t* dst, const plutovg_surface_t* src,
++    float surfaceScale, float diffuseConstant,
++    float lightR, float lightG, float lightB,
++    const plutovg_light_source_t* light,
++    int x, int y, int width, int height)
++{
++    int w = plutovg_surface_get_width(dst);
++    int h = plutovg_surface_get_height(dst);
++    uint32_t* dst_data = (uint32_t*)plutovg_surface_get_data(dst);
++    int dst_stride = plutovg_surface_get_stride(dst) / 4;
++
++    int srcW = plutovg_surface_get_width(src);
++    int srcH = plutovg_surface_get_height(src);
++
++    for(int row = y; row < y + height && row < h; ++row) {
++        for(int col = x; col < x + width && col < w; ++col) {
++            float nx, ny, nz;
++            compute_normal(src, col, row, srcW, srcH, surfaceScale, &nx, &ny, &nz);
++
++            float surfaceZ = surfaceScale * get_alpha(src, col, row, srcW, srcH);
++            float lx, ly, lz, atten;
++            compute_light_vector(light, col, row, surfaceZ, &lx, &ly, &lz, &atten);
++
++            // N · L
++            float NdotL = nx * lx + ny * ly + nz * lz;
++            if(NdotL < 0.0f) NdotL = 0.0f;
++
++            float kd = diffuseConstant * NdotL * atten;
++
++            int cr = (int)(kd * lightR * 255.0f + 0.5f);
++            int cg = (int)(kd * lightG * 255.0f + 0.5f);
++            int cb = (int)(kd * lightB * 255.0f + 0.5f);
++            if(cr > 255) cr = 255;
++            if(cg > 255) cg = 255;
++            if(cb > 255) cb = 255;
++            if(cr < 0) cr = 0;
++            if(cg < 0) cg = 0;
++            if(cb < 0) cb = 0;
++
++            // Alpha = max(R,G,B) for diffuse lighting per spec
++            int ca = cr;
++            if(cg > ca) ca = cg;
++            if(cb > ca) ca = cb;
++
++            // Premultiply
++            if(ca > 0) {
++                cr = cr * ca / 255;
++                cg = cg * ca / 255;
++                cb = cb * ca / 255;
++            }
++
++            dst_data[row * dst_stride + col] = ((uint32_t)ca << 24) | ((uint32_t)cr << 16) | ((uint32_t)cg << 8) | (uint32_t)cb;
++        }
++    }
++}
++
++void plutovg_filter_specular_lighting(
++    plutovg_surface_t* dst, const plutovg_surface_t* src,
++    float surfaceScale, float specularConstant, float specularExponent,
++    float lightR, float lightG, float lightB,
++    const plutovg_light_source_t* light,
++    int x, int y, int width, int height)
++{
++    int w = plutovg_surface_get_width(dst);
++    int h = plutovg_surface_get_height(dst);
++    uint32_t* dst_data = (uint32_t*)plutovg_surface_get_data(dst);
++    int dst_stride = plutovg_surface_get_stride(dst) / 4;
++
++    int srcW = plutovg_surface_get_width(src);
++    int srcH = plutovg_surface_get_height(src);
++
++    // Eye vector (viewer at infinity along Z axis per SVG spec)
++    float ex = 0.0f, ey = 0.0f, ez = 1.0f;
++
++    for(int row = y; row < y + height && row < h; ++row) {
++        for(int col = x; col < x + width && col < w; ++col) {
++            float nx, ny, nz;
++            compute_normal(src, col, row, srcW, srcH, surfaceScale, &nx, &ny, &nz);
++
++            float surfaceZ = surfaceScale * get_alpha(src, col, row, srcW, srcH);
++            float lx, ly, lz, atten;
++            compute_light_vector(light, col, row, surfaceZ, &lx, &ly, &lz, &atten);
++
++            // Half vector H = normalize(L + E)
++            float hx = lx + ex;
++            float hy = ly + ey;
++            float hz = lz + ez;
++            float hlen = sqrtf(hx * hx + hy * hy + hz * hz);
++            if(hlen > 0.0f) {
++                hx /= hlen; hy /= hlen; hz /= hlen;
++            }
++
++            // N · H
++            float NdotH = nx * hx + ny * hy + nz * hz;
++            if(NdotH < 0.0f) NdotH = 0.0f;
++
++            float ks = specularConstant * powf(NdotH, specularExponent) * atten;
++
++            int cr = (int)(ks * lightR * 255.0f + 0.5f);
++            int cg = (int)(ks * lightG * 255.0f + 0.5f);
++            int cb = (int)(ks * lightB * 255.0f + 0.5f);
++            if(cr > 255) cr = 255;
++            if(cg > 255) cg = 255;
++            if(cb > 255) cb = 255;
++            if(cr < 0) cr = 0;
++            if(cg < 0) cg = 0;
++            if(cb < 0) cb = 0;
++
++            // Alpha = max(R,G,B) for specular lighting per spec
++            int ca = cr;
++            if(cg > ca) ca = cg;
++            if(cb > ca) ca = cb;
++
++            // Premultiply
++            if(ca > 0) {
++                cr = cr * ca / 255;
++                cg = cg * ca / 255;
++                cb = cb * ca / 255;
++            }
++
++            dst_data[row * dst_stride + col] = ((uint32_t)ca << 24) | ((uint32_t)cr << 16) | ((uint32_t)cg << 8) | (uint32_t)cb;
++        }
++    }
++}
+diff --git a/plutovg/source/plutovg-filter.h b/plutovg/source/plutovg-filter.h
+new file mode 100644
+index 0000000..3333d32
+--- /dev/null
++++ b/plutovg/source/plutovg-filter.h
+@@ -0,0 +1,149 @@
++#ifndef PLUTOVG_FILTER_H
++#define PLUTOVG_FILTER_H
++
++#include "plutovg-private.h"
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Surface-to-surface filter operations
++// All operate on premultiplied ARGB32 pixel buffers
++// Parameters use device-space coordinates
++
++void plutovg_filter_flood(
++    plutovg_surface_t* dst,
++    float r, float g, float b, float a,
++    int x, int y, int width, int height);
++
++void plutovg_filter_offset(
++    plutovg_surface_t* dst, const plutovg_surface_t* src,
++    int dx, int dy,
++    int x, int y, int width, int height);
++
++void plutovg_filter_merge(
++    plutovg_surface_t* dst,
++    const plutovg_surface_t** inputs, int inputCount,
++    int x, int y, int width, int height);
++
++void plutovg_filter_gaussian_blur(
++    plutovg_surface_t* dst, const plutovg_surface_t* src,
++    float stdDevX, float stdDevY,
++    int x, int y, int width, int height);
++
++void plutovg_filter_blend(
++    plutovg_surface_t* dst,
++    const plutovg_surface_t* in1, const plutovg_surface_t* in2,
++    int mode,
++    int x, int y, int width, int height);
++
++void plutovg_filter_color_matrix(
++    plutovg_surface_t* dst, const plutovg_surface_t* src,
++    const float matrix[20],
++    int x, int y, int width, int height);
++
++void plutovg_filter_composite(
++    plutovg_surface_t* dst,
++    const plutovg_surface_t* in1, const plutovg_surface_t* in2,
++    int op, float k1, float k2, float k3, float k4,
++    int x, int y, int width, int height);
++
++// --- Phase F3 primitives ---
++
++// Component transfer function specification
++typedef struct {
++    int type; // 0=identity, 1=table, 2=discrete, 3=linear, 4=gamma
++    const float* tableValues;
++    int tableSize;
++    float slope;      // for linear
++    float intercept;   // for linear
++    float amplitude;   // for gamma
++    float exponent;    // for gamma
++    float offset;      // for gamma
++} plutovg_transfer_func_t;
++
++void plutovg_filter_component_transfer(
++    plutovg_surface_t* dst, const plutovg_surface_t* src,
++    const plutovg_transfer_func_t* funcR,
++    const plutovg_transfer_func_t* funcG,
++    const plutovg_transfer_func_t* funcB,
++    const plutovg_transfer_func_t* funcA,
++    int x, int y, int width, int height);
++
++void plutovg_filter_morphology(
++    plutovg_surface_t* dst, const plutovg_surface_t* src,
++    int op, float radiusX, float radiusY,
++    int x, int y, int width, int height);
++
++void plutovg_filter_tile(
++    plutovg_surface_t* dst, const plutovg_surface_t* src,
++    int srcX, int srcY, int srcW, int srcH,
++    int x, int y, int width, int height);
++
++// --- Phase F4 primitives ---
++
++void plutovg_filter_turbulence(
++    plutovg_surface_t* dst,
++    float baseFreqX, float baseFreqY,
++    int numOctaves, float seed, int stitchTiles, int fractalNoise,
++    int x, int y, int width, int height);
++
++void plutovg_filter_convolve_matrix(
++    plutovg_surface_t* dst, const plutovg_surface_t* src,
++    const float* kernelMatrix, int orderX, int orderY,
++    int targetX, int targetY, float divisor, float bias,
++    int edgeMode, int preserveAlpha,
++    int x, int y, int width, int height);
++
++void plutovg_filter_displacement_map(
++    plutovg_surface_t* dst,
++    const plutovg_surface_t* in1, const plutovg_surface_t* in2,
++    float scale, int xChannel, int yChannel,
++    int x, int y, int width, int height);
++
++// --- Phase F5: Lighting primitives ---
++
++// Light source type identifiers
++#define PLUTOVG_LIGHT_DISTANT 0
++#define PLUTOVG_LIGHT_POINT   1
++#define PLUTOVG_LIGHT_SPOT    2
++
++typedef struct {
++    int type; // PLUTOVG_LIGHT_DISTANT, POINT, or SPOT
++    // Distant light
++    float azimuth;   // degrees
++    float elevation;  // degrees
++    // Point/Spot light position
++    float x, y, z;
++    // Spot light target & params
++    float pointsAtX, pointsAtY, pointsAtZ;
++    float specularExponent; // spot exponent (cone falloff)
++    float limitingConeAngle; // degrees, <=0 means no limit
++    int hasLimitingConeAngle;
++} plutovg_light_source_t;
++
++void plutovg_filter_diffuse_lighting(
++    plutovg_surface_t* dst, const plutovg_surface_t* src,
++    float surfaceScale, float diffuseConstant,
++    float lightR, float lightG, float lightB,
++    const plutovg_light_source_t* light,
++    int x, int y, int width, int height);
++
++void plutovg_filter_specular_lighting(
++    plutovg_surface_t* dst, const plutovg_surface_t* src,
++    float surfaceScale, float specularConstant, float specularExponent,
++    float lightR, float lightG, float lightB,
++    const plutovg_light_source_t* light,
++    int x, int y, int width, int height);
++
++// Helper: premultiply/unpremultiply for filters that need linear RGB
++void plutovg_filter_unpremultiply(uint32_t* pixels, int count);
++void plutovg_filter_premultiply(uint32_t* pixels, int count);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif // PLUTOVG_FILTER_H
+diff --git a/source/svgelement.cpp b/source/svgelement.cpp
+index 7d62cc6..7831480 100644
+--- a/source/svgelement.cpp
++++ b/source/svgelement.cpp
+@@ -2,6 +2,7 @@
+ #include "svgpaintelement.h"
+ #include "svggeometryelement.h"
+ #include "svgtextelement.h"
++#include "svgfilterelement.h"
+ #include "svgproperty.h"
+ #include "svglayoutstate.h"
+ #include "svgrenderstate.h"
+@@ -21,6 +22,31 @@ ElementID elementid(std::string_view name)
+         {"clipPath", ElementID::ClipPath},
+         {"defs", ElementID::Defs},
+         {"ellipse", ElementID::Ellipse},
++        {"feBlend", ElementID::FeBlend},
++        {"feColorMatrix", ElementID::FeColorMatrix},
++        {"feComponentTransfer", ElementID::FeComponentTransfer},
++        {"feComposite", ElementID::FeComposite},
++        {"feConvolveMatrix", ElementID::FeConvolveMatrix},
++        {"feDiffuseLighting", ElementID::FeDiffuseLighting},
++        {"feDisplacementMap", ElementID::FeDisplacementMap},
++        {"feDistantLight", ElementID::FeDistantLight},
++        {"feFlood", ElementID::FeFlood},
++        {"feFuncA", ElementID::FeFuncA},
++        {"feFuncB", ElementID::FeFuncB},
++        {"feFuncG", ElementID::FeFuncG},
++        {"feFuncR", ElementID::FeFuncR},
++        {"feGaussianBlur", ElementID::FeGaussianBlur},
++        {"feImage", ElementID::FeImage},
++        {"feMerge", ElementID::FeMerge},
++        {"feMergeNode", ElementID::FeMergeNode},
++        {"feMorphology", ElementID::FeMorphology},
++        {"feOffset", ElementID::FeOffset},
++        {"fePointLight", ElementID::FePointLight},
++        {"feSpecularLighting", ElementID::FeSpecularLighting},
++        {"feSpotLight", ElementID::FeSpotLight},
++        {"feTile", ElementID::FeTile},
++        {"feTurbulence", ElementID::FeTurbulence},
++        {"filter", ElementID::Filter},
+         {"g", ElementID::G},
+         {"image", ElementID::Image},
+         {"line", ElementID::Line},
+@@ -116,8 +142,55 @@ std::unique_ptr<SVGElement> SVGElement::create(Document* document, ElementID id)
+         return std::make_unique<SVGTextElement>(document);
+     case ElementID::Tspan:
+         return std::make_unique<SVGTSpanElement>(document);
++    case ElementID::Filter:
++        return std::make_unique<SVGFilterElement>(document);
++    case ElementID::FeFlood:
++        return std::make_unique<SVGFeFloodElement>(document);
++    case ElementID::FeOffset:
++        return std::make_unique<SVGFeOffsetElement>(document);
++    case ElementID::FeMerge:
++        return std::make_unique<SVGFeMergeElement>(document);
++    case ElementID::FeMergeNode:
++        return std::make_unique<SVGFeMergeNodeElement>(document);
++    case ElementID::FeGaussianBlur:
++        return std::make_unique<SVGFeGaussianBlurElement>(document);
++    case ElementID::FeBlend:
++        return std::make_unique<SVGFeBlendElement>(document);
++    case ElementID::FeColorMatrix:
++        return std::make_unique<SVGFeColorMatrixElement>(document);
++    case ElementID::FeComposite:
++        return std::make_unique<SVGFeCompositeElement>(document);
++    case ElementID::FeComponentTransfer:
++        return std::make_unique<SVGFeComponentTransferElement>(document);
++    case ElementID::FeFuncR:
++    case ElementID::FeFuncG:
++    case ElementID::FeFuncB:
++    case ElementID::FeFuncA:
++        return std::make_unique<SVGFeFuncElement>(document, id);
++    case ElementID::FeMorphology:
++        return std::make_unique<SVGFeMorphologyElement>(document);
++    case ElementID::FeTile:
++        return std::make_unique<SVGFeTileElement>(document);
++    case ElementID::FeImage:
++        return std::make_unique<SVGFeImageElement>(document);
++    case ElementID::FeTurbulence:
++        return std::make_unique<SVGFeTurbulenceElement>(document);
++    case ElementID::FeConvolveMatrix:
++        return std::make_unique<SVGFeConvolveMatrixElement>(document);
++    case ElementID::FeDisplacementMap:
++        return std::make_unique<SVGFeDisplacementMapElement>(document);
++    case ElementID::FeDistantLight:
++        return std::make_unique<SVGFeDistantLightElement>(document);
++    case ElementID::FePointLight:
++        return std::make_unique<SVGFePointLightElement>(document);
++    case ElementID::FeSpotLight:
++        return std::make_unique<SVGFeSpotLightElement>(document);
++    case ElementID::FeDiffuseLighting:
++        return std::make_unique<SVGFeDiffuseLightingElement>(document);
++    case ElementID::FeSpecularLighting:
++        return std::make_unique<SVGFeSpecularLightingElement>(document);
+     default:
+-        assert(false);
++        break;
+     }
+ 
+     return nullptr;
+@@ -350,6 +423,14 @@ SVGMaskElement* SVGElement::getMasker(std::string_view id) const
+     return nullptr;
+ }
+ 
++SVGFilterElement* SVGElement::getFilter(std::string_view id) const
++{
++    auto element = rootElement()->getElementById(id);
++    if(element && element->id() == ElementID::Filter)
++        return static_cast<SVGFilterElement*>(element);
++    return nullptr;
++}
++
+ SVGPaintElement* SVGElement::getPainter(std::string_view id) const
+ {
+     auto element = rootElement()->getElementById(id);
+@@ -454,6 +535,7 @@ void SVGElement::layoutElement(const SVGLayoutState& state)
+     m_paintBoundingBox = Rect::Invalid;
+     m_clipper = getClipper(state.clip_path());
+     m_masker = getMasker(state.mask());
++    m_filter = getFilter(state.filter());
+     m_opacity = state.opacity();
+ 
+     m_font_size = state.font_size();
+@@ -506,6 +588,31 @@ bool SVGElement::isHiddenElement() const
+     case ElementID::RadialGradient:
+     case ElementID::Pattern:
+     case ElementID::Stop:
++    case ElementID::Filter:
++    case ElementID::FeBlend:
++    case ElementID::FeColorMatrix:
++    case ElementID::FeComponentTransfer:
++    case ElementID::FeComposite:
++    case ElementID::FeConvolveMatrix:
++    case ElementID::FeDiffuseLighting:
++    case ElementID::FeDisplacementMap:
++    case ElementID::FeDistantLight:
++    case ElementID::FeFlood:
++    case ElementID::FeFuncA:
++    case ElementID::FeFuncB:
++    case ElementID::FeFuncG:
++    case ElementID::FeFuncR:
++    case ElementID::FeGaussianBlur:
++    case ElementID::FeImage:
++    case ElementID::FeMerge:
++    case ElementID::FeMergeNode:
++    case ElementID::FeMorphology:
++    case ElementID::FeOffset:
++    case ElementID::FePointLight:
++    case ElementID::FeSpecularLighting:
++    case ElementID::FeSpotLight:
++    case ElementID::FeTile:
++    case ElementID::FeTurbulence:
+         return true;
+     default:
+         return false;
+diff --git a/source/svgelement.h b/source/svgelement.h
+index ff5d008..f18c89e 100644
+--- a/source/svgelement.h
++++ b/source/svgelement.h
+@@ -87,6 +87,31 @@ enum class ElementID : uint8_t {
+     ClipPath,
+     Defs,
+     Ellipse,
++    FeBlend,
++    FeColorMatrix,
++    FeComponentTransfer,
++    FeComposite,
++    FeConvolveMatrix,
++    FeDiffuseLighting,
++    FeDisplacementMap,
++    FeDistantLight,
++    FeFlood,
++    FeFuncA,
++    FeFuncB,
++    FeFuncG,
++    FeFuncR,
++    FeGaussianBlur,
++    FeImage,
++    FeMerge,
++    FeMergeNode,
++    FeMorphology,
++    FeOffset,
++    FePointLight,
++    FeSpecularLighting,
++    FeSpotLight,
++    FeTile,
++    FeTurbulence,
++    Filter,
+     G,
+     Image,
+     Line,
+@@ -116,6 +141,7 @@ using SVGPropertyList = std::forward_list<SVGProperty*>;
+ class SVGMarkerElement;
+ class SVGClipPathElement;
+ class SVGMaskElement;
++class SVGFilterElement;
+ class SVGPaintElement;
+ class SVGLayoutState;
+ class SVGRenderState;
+@@ -162,6 +188,7 @@ class SVGElement : public SVGNode {
+     SVGMarkerElement* getMarker(std::string_view id) const;
+     SVGClipPathElement* getClipper(std::string_view id) const;
+     SVGMaskElement* getMasker(std::string_view id) const;
++    SVGFilterElement* getFilter(std::string_view id) const;
+     SVGPaintElement* getPainter(std::string_view id) const;
+ 
+     SVGElement* elementFromPoint(float x, float y);
+@@ -195,6 +222,7 @@ class SVGElement : public SVGNode {
+ 
+     const SVGClipPathElement* clipper() const { return m_clipper; }
+     const SVGMaskElement* masker() const { return m_masker; }
++    const SVGFilterElement* filter() const { return m_filter; }
+     float opacity() const { return m_opacity; }
+ 
+     bool isElement() const final { return true; }
+@@ -203,6 +231,7 @@ class SVGElement : public SVGNode {
+     mutable Rect m_paintBoundingBox = Rect::Invalid;
+     const SVGClipPathElement* m_clipper = nullptr;
+     const SVGMaskElement* m_masker = nullptr;
++    const SVGFilterElement* m_filter = nullptr;
+     float m_opacity = 1.f;
+ 
+     float m_font_size = 12.f;
+diff --git a/source/svgfilterelement.cpp b/source/svgfilterelement.cpp
+new file mode 100644
+index 0000000..5dee49c
+--- /dev/null
++++ b/source/svgfilterelement.cpp
+@@ -0,0 +1,1099 @@
++#include "svgfilterelement.h"
++#include "svglayoutstate.h"
++#include "svgrenderstate.h"
++
++#include <cmath>
++#include <cstring>
++
++extern "C" {
++#include "plutovg-filter.h"
++}
++
++namespace lunasvg {
++
++// --- SVGFilterContext ---
++
++SVGFilterContext::SVGFilterContext(const Canvas& sourceGraphic, const Rect& filterRegion)
++    : m_sourceGraphic(sourceGraphic.surface())
++    , m_filterRegion(filterRegion)
++{
++    plutovg_surface_reference(m_sourceGraphic);
++}
++
++SVGFilterContext::~SVGFilterContext()
++{
++    plutovg_surface_destroy(m_sourceGraphic);
++    if(m_sourceAlpha)
++        plutovg_surface_destroy(m_sourceAlpha);
++    for(auto* s : m_ownedSurfaces)
++        plutovg_surface_destroy(s);
++}
++
++plutovg_surface_t* SVGFilterContext::getInput(const std::string& name) const
++{
++    if(name.empty()) {
++        return m_lastResult ? m_lastResult : m_sourceGraphic;
++    }
++
++    if(name == "SourceGraphic")
++        return m_sourceGraphic;
++    if(name == "SourceAlpha")
++        return const_cast<SVGFilterContext*>(this)->sourceAlpha();
++
++    auto it = m_buffers.find(name);
++    if(it != m_buffers.end())
++        return it->second;
++    return m_lastResult ? m_lastResult : m_sourceGraphic;
++}
++
++void SVGFilterContext::setOutput(const std::string& name, plutovg_surface_t* surface)
++{
++    m_lastResult = surface;
++    if(!name.empty()) {
++        m_buffers[name] = surface;
++    }
++}
++
++plutovg_surface_t* SVGFilterContext::sourceAlpha()
++{
++    if(m_sourceAlpha)
++        return m_sourceAlpha;
++
++    int w = plutovg_surface_get_width(m_sourceGraphic);
++    int h = plutovg_surface_get_height(m_sourceGraphic);
++    m_sourceAlpha = plutovg_surface_create(w, h);
++
++    const uint32_t* src = (const uint32_t*)plutovg_surface_get_data(m_sourceGraphic);
++    uint32_t* dst = (uint32_t*)plutovg_surface_get_data(m_sourceAlpha);
++    int src_stride = plutovg_surface_get_stride(m_sourceGraphic) / 4;
++    int dst_stride = plutovg_surface_get_stride(m_sourceAlpha) / 4;
++
++    for(int y = 0; y < h; ++y) {
++        for(int x = 0; x < w; ++x) {
++            uint32_t alpha = (src[y * src_stride + x] >> 24) & 0xFF;
++            dst[y * dst_stride + x] = alpha << 24; // premultiplied black with same alpha
++        }
++    }
++
++    return m_sourceAlpha;
++}
++
++plutovg_surface_t* SVGFilterContext::createSurface() const
++{
++    int w = plutovg_surface_get_width(m_sourceGraphic);
++    int h = plutovg_surface_get_height(m_sourceGraphic);
++    auto* surface = plutovg_surface_create(w, h);
++    const_cast<SVGFilterContext*>(this)->m_ownedSurfaces.push_back(surface);
++    return surface;
++}
++
++// --- SVGFilterElement ---
++
++SVGFilterElement::SVGFilterElement(Document* document)
++    : SVGElement(document, ElementID::Filter)
++    , m_filterUnits(PropertyID::FilterUnits, Units::ObjectBoundingBox)
++    , m_primitiveUnits(PropertyID::PrimitiveUnits, Units::UserSpaceOnUse)
++    , m_x(PropertyID::X, LengthDirection::Horizontal, LengthNegativeMode::Allow, -10.f, LengthUnits::Percent)
++    , m_y(PropertyID::Y, LengthDirection::Vertical, LengthNegativeMode::Allow, -10.f, LengthUnits::Percent)
++    , m_width(PropertyID::Width, LengthDirection::Horizontal, LengthNegativeMode::Forbid, 120.f, LengthUnits::Percent)
++    , m_height(PropertyID::Height, LengthDirection::Vertical, LengthNegativeMode::Forbid, 120.f, LengthUnits::Percent)
++{
++    addProperty(m_filterUnits);
++    addProperty(m_primitiveUnits);
++    addProperty(m_x);
++    addProperty(m_y);
++    addProperty(m_width);
++    addProperty(m_height);
++}
++
++Rect SVGFilterElement::filterRegion(const SVGElement* target) const
++{
++    LengthContext lengthContext(this, m_filterUnits.value());
++    auto x = lengthContext.valueForLength(m_x);
++    auto y = lengthContext.valueForLength(m_y);
++    auto w = lengthContext.valueForLength(m_width);
++    auto h = lengthContext.valueForLength(m_height);
++
++    if(m_filterUnits.value() == Units::ObjectBoundingBox) {
++        auto bbox = target->fillBoundingBox();
++        x = bbox.x + x * bbox.w;
++        y = bbox.y + y * bbox.h;
++        w = w * bbox.w;
++        h = h * bbox.h;
++    }
++
++    return Rect(x, y, w, h);
++}
++
++void SVGFilterElement::layoutElement(const SVGLayoutState& state)
++{
++    SVGElement::layoutElement(state);
++}
++
++void SVGFilterElement::applyFilter(SVGRenderState& state) const
++{
++    auto& canvas = *state.canvas();
++    auto region = filterRegion(state.element());
++    auto deviceRegion = state.currentTransform().mapRect(region);
++    deviceRegion.intersect(canvas.extents());
++
++    if(deviceRegion.isEmpty())
++        return;
++
++    SVGFilterContext context(canvas, deviceRegion);
++
++    // Execute each filter primitive child in document order
++    for(auto& child : children()) {
++        auto element = toSVGElement(child);
++        if(!element)
++            continue;
++        auto primitive = dynamic_cast<const SVGFilterPrimitiveElement*>(element);
++        if(!primitive)
++            continue;
++        primitive->apply(context);
++    }
++
++    // Replace canvas content with filter result
++    auto* result = context.lastResult();
++    if(!result)
++        return;
++
++    auto* dst = canvas.surface();
++    int dst_width = plutovg_surface_get_width(dst);
++    int dst_height = plutovg_surface_get_height(dst);
++    int dst_stride = plutovg_surface_get_stride(dst);
++
++    int src_width = plutovg_surface_get_width(result);
++    int src_height = plutovg_surface_get_height(result);
++    int src_stride = plutovg_surface_get_stride(result);
++
++    auto* dst_data = plutovg_surface_get_data(dst);
++    auto* src_data = plutovg_surface_get_data(result);
++
++    // Clear the canvas
++    memset(dst_data, 0, dst_height * dst_stride);
++
++    // Copy result back: both surfaces have the same dimensions (filter region = canvas extents intersection)
++    int copyW = (std::min)(dst_width, src_width);
++    int copyH = (std::min)(dst_height, src_height);
++    for(int y = 0; y < copyH; ++y) {
++        memcpy(dst_data + y * dst_stride, src_data + y * src_stride, copyW * 4);
++    }
++}
++
++// --- SVGFilterPrimitiveElement ---
++
++SVGFilterPrimitiveElement::SVGFilterPrimitiveElement(Document* document, ElementID id)
++    : SVGElement(document, id)
++    , m_in(PropertyID::In)
++    , m_result(PropertyID::Result)
++{
++    addProperty(m_in);
++    addProperty(m_result);
++}
++
++// --- SVGFeFloodElement ---
++
++SVGFeFloodElement::SVGFeFloodElement(Document* document)
++    : SVGFilterPrimitiveElement(document, ElementID::FeFlood)
++{
++}
++
++void SVGFeFloodElement::layoutElement(const SVGLayoutState& state)
++{
++    SVGElement::layoutElement(state);
++    for(const auto& attribute : attributes()) {
++        if(attribute.id() == PropertyID::Flood_Color) {
++            // Parse flood-color: try currentColor first, then color value
++            std::string_view input(attribute.value());
++            plutovg_color_t color;
++            int length = plutovg_color_parse(&color, input.data(), input.length());
++            if(length > 0) {
++                m_floodColor = Color(plutovg_color_to_argb32(&color));
++            }
++        } else if(attribute.id() == PropertyID::Flood_Opacity) {
++            std::string_view input(attribute.value());
++            float value = 1.f;
++            // Simple float parse
++            char* end;
++            value = strtof(std::string(input).c_str(), &end);
++            m_floodOpacity = std::clamp(value, 0.f, 1.f);
++        }
++    }
++}
++
++void SVGFeFloodElement::apply(SVGFilterContext& context) const
++{
++    auto* output = context.createSurface();
++    auto r = m_floodColor.redF();
++    auto g = m_floodColor.greenF();
++    auto b = m_floodColor.blueF();
++    auto a = m_floodColor.alphaF() * m_floodOpacity;
++
++    int w = plutovg_surface_get_width(output);
++    int h = plutovg_surface_get_height(output);
++    plutovg_filter_flood(output, r, g, b, a, 0, 0, w, h);
++    context.setOutput(result(), output);
++}
++
++// --- SVGFeOffsetElement ---
++
++SVGFeOffsetElement::SVGFeOffsetElement(Document* document)
++    : SVGFilterPrimitiveElement(document, ElementID::FeOffset)
++    , m_dx(PropertyID::Dx, LengthDirection::Horizontal, LengthNegativeMode::Allow, 0.f, LengthUnits::None)
++    , m_dy(PropertyID::Dy, LengthDirection::Vertical, LengthNegativeMode::Allow, 0.f, LengthUnits::None)
++{
++    addProperty(m_dx);
++    addProperty(m_dy);
++}
++
++void SVGFeOffsetElement::apply(SVGFilterContext& context) const
++{
++    auto* input = context.getInput(in());
++    auto* output = context.createSurface();
++
++    LengthContext lengthContext(this);
++    int dx = (int)lengthContext.valueForLength(m_dx);
++    int dy = (int)lengthContext.valueForLength(m_dy);
++
++    int w = plutovg_surface_get_width(output);
++    int h = plutovg_surface_get_height(output);
++    plutovg_filter_offset(output, input, dx, dy, 0, 0, w, h);
++    context.setOutput(result(), output);
++}
++
++// --- SVGFeMergeElement ---
++
++SVGFeMergeElement::SVGFeMergeElement(Document* document)
++    : SVGFilterPrimitiveElement(document, ElementID::FeMerge)
++{
++}
++
++void SVGFeMergeElement::apply(SVGFilterContext& context) const
++{
++    std::vector<const plutovg_surface_t*> inputs;
++    for(auto& child : children()) {
++        auto element = toSVGElement(child);
++        if(!element)
++            continue;
++        if(element->id() != ElementID::FeMergeNode)
++            continue;
++        auto mergeNode = static_cast<const SVGFeMergeNodeElement*>(element);
++        auto* surface = context.getInput(mergeNode->in());
++        if(surface) {
++            inputs.push_back(surface);
++        }
++    }
++
++    auto* output = context.createSurface();
++    int w = plutovg_surface_get_width(output);
++    int h = plutovg_surface_get_height(output);
++
++    if(!inputs.empty()) {
++        plutovg_filter_merge(output, inputs.data(), (int)inputs.size(), 0, 0, w, h);
++    }
++
++    context.setOutput(result(), output);
++}
++
++// --- SVGFeMergeNodeElement ---
++
++SVGFeMergeNodeElement::SVGFeMergeNodeElement(Document* document)
++    : SVGElement(document, ElementID::FeMergeNode)
++    , m_in(PropertyID::In)
++{
++    addProperty(m_in);
++}
++
++// --- SVGFeGaussianBlurElement ---
++
++SVGFeGaussianBlurElement::SVGFeGaussianBlurElement(Document* document)
++    : SVGFilterPrimitiveElement(document, ElementID::FeGaussianBlur)
++{
++}
++
++void SVGFeGaussianBlurElement::layoutElement(const SVGLayoutState& state)
++{
++    SVGElement::layoutElement(state);
++    for(const auto& attribute : attributes()) {
++        if(attribute.id() == PropertyID::StdDeviation) {
++            std::string_view input(attribute.value());
++            // Parse one or two float values
++            char* end;
++            m_stdDeviationX = strtof(std::string(input).c_str(), &end);
++            if(m_stdDeviationX < 0.f) m_stdDeviationX = 0.f;
++            // Skip whitespace/comma
++            const char* p = end;
++            while(*p == ' ' || *p == ',' || *p == '\t') ++p;
++            if(*p != '\0') {
++                m_stdDeviationY = strtof(p, &end);
++                if(m_stdDeviationY < 0.f) m_stdDeviationY = 0.f;
++            } else {
++                m_stdDeviationY = m_stdDeviationX;
++            }
++        }
++    }
++}
++
++void SVGFeGaussianBlurElement::apply(SVGFilterContext& context) const
++{
++    auto* input = context.getInput(in());
++    auto* output = context.createSurface();
++
++    int w = plutovg_surface_get_width(output);
++    int h = plutovg_surface_get_height(output);
++    plutovg_filter_gaussian_blur(output, input, m_stdDeviationX, m_stdDeviationY, 0, 0, w, h);
++    context.setOutput(result(), output);
++}
++
++// --- SVGFeBlendElement ---
++
++SVGFeBlendElement::SVGFeBlendElement(Document* document)
++    : SVGFilterPrimitiveElement(document, ElementID::FeBlend)
++    , m_in2(PropertyID::In2)
++{
++    addProperty(m_in2);
++}
++
++void SVGFeBlendElement::layoutElement(const SVGLayoutState& state)
++{
++    SVGElement::layoutElement(state);
++    for(const auto& attribute : attributes()) {
++        if(attribute.id() == PropertyID::Mode) {
++            auto val = attribute.value();
++            if(val == "multiply") m_mode = 1;
++            else if(val == "screen") m_mode = 2;
++            else if(val == "darken") m_mode = 3;
++            else if(val == "lighten") m_mode = 4;
++            else m_mode = 0; // normal
++        }
++    }
++}
++
++void SVGFeBlendElement::apply(SVGFilterContext& context) const
++{
++    auto* in1 = context.getInput(in());
++    auto* in2 = context.getInput(m_in2.value());
++    auto* output = context.createSurface();
++
++    int w = plutovg_surface_get_width(output);
++    int h = plutovg_surface_get_height(output);
++    plutovg_filter_blend(output, in1, in2, m_mode, 0, 0, w, h);
++    context.setOutput(result(), output);
++}
++
++// --- SVGFeColorMatrixElement ---
++
++SVGFeColorMatrixElement::SVGFeColorMatrixElement(Document* document)
++    : SVGFilterPrimitiveElement(document, ElementID::FeColorMatrix)
++{
++    // Default to identity matrix
++    memset(m_matrix, 0, sizeof(m_matrix));
++    m_matrix[0] = 1.f;  // R->R
++    m_matrix[6] = 1.f;  // G->G
++    m_matrix[12] = 1.f; // B->B
++    m_matrix[18] = 1.f; // A->A
++}
++
++void SVGFeColorMatrixElement::layoutElement(const SVGLayoutState& state)
++{
++    SVGElement::layoutElement(state);
++    float rawValue = 0.f;
++    bool hasValues = false;
++    for(const auto& attribute : attributes()) {
++        if(attribute.id() == PropertyID::Type) {
++            auto val = attribute.value();
++            if(val == "saturate") m_type = 1;
++            else if(val == "hueRotate") m_type = 2;
++            else if(val == "luminanceToAlpha") m_type = 3;
++            else m_type = 0; // matrix
++        } else if(attribute.id() == PropertyID::Values) {
++            hasValues = true;
++            std::string_view input(attribute.value());
++            std::string str(input);
++            const char* p = str.c_str();
++            float vals[20];
++            int nvals = 0;
++            while(*p && nvals < 20) {
++                while(*p == ' ' || *p == ',' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
++                if(*p == '\0') break;
++                char* end;
++                vals[nvals++] = strtof(p, &end);
++                p = end;
++            }
++            if(nvals >= 20) {
++                memcpy(m_matrix, vals, 20 * sizeof(float));
++            } else if(nvals >= 1) {
++                rawValue = vals[0];
++            }
++        }
++    }
++
++    // Build the actual matrix based on type
++    if(m_type == 1) {
++        // saturate: values="<number>" in [0,1]
++        float s = hasValues ? rawValue : 1.f;
++        memset(m_matrix, 0, sizeof(m_matrix));
++        m_matrix[0]  = 0.213f + 0.787f * s;
++        m_matrix[1]  = 0.715f - 0.715f * s;
++        m_matrix[2]  = 0.072f - 0.072f * s;
++        m_matrix[5]  = 0.213f - 0.213f * s;
++        m_matrix[6]  = 0.715f + 0.285f * s;
++        m_matrix[7]  = 0.072f - 0.072f * s;
++        m_matrix[10] = 0.213f - 0.213f * s;
++        m_matrix[11] = 0.715f - 0.715f * s;
++        m_matrix[12] = 0.072f + 0.928f * s;
++        m_matrix[18] = 1.f;
++    } else if(m_type == 2) {
++        // hueRotate: values="<angle>" in degrees
++        float angle = (hasValues ? rawValue : 0.f) * 3.14159265358979f / 180.f;
++        float cosA = std::cos(angle);
++        float sinA = std::sin(angle);
++        memset(m_matrix, 0, sizeof(m_matrix));
++        m_matrix[0]  = 0.213f + 0.787f * cosA - 0.213f * sinA;
++        m_matrix[1]  = 0.715f - 0.715f * cosA - 0.715f * sinA;
++        m_matrix[2]  = 0.072f - 0.072f * cosA + 0.928f * sinA;
++        m_matrix[5]  = 0.213f - 0.213f * cosA + 0.143f * sinA;
++        m_matrix[6]  = 0.715f + 0.285f * cosA + 0.140f * sinA;
++        m_matrix[7]  = 0.072f - 0.072f * cosA - 0.283f * sinA;
++        m_matrix[10] = 0.213f - 0.213f * cosA - 0.787f * sinA;
++        m_matrix[11] = 0.715f - 0.715f * cosA + 0.715f * sinA;
++        m_matrix[12] = 0.072f + 0.928f * cosA + 0.072f * sinA;
++        m_matrix[18] = 1.f;
++    } else if(m_type == 3) {
++        // luminanceToAlpha
++        memset(m_matrix, 0, sizeof(m_matrix));
++        m_matrix[15] = 0.2126f;
++        m_matrix[16] = 0.7152f;
++        m_matrix[17] = 0.0722f;
++    }
++    // else m_type == 0: m_matrix was already filled from values
++}
++
++void SVGFeColorMatrixElement::apply(SVGFilterContext& context) const
++{
++    auto* input = context.getInput(in());
++    auto* output = context.createSurface();
++
++    int w = plutovg_surface_get_width(output);
++    int h = plutovg_surface_get_height(output);
++    plutovg_filter_color_matrix(output, input, m_matrix, 0, 0, w, h);
++    context.setOutput(result(), output);
++}
++
++// --- SVGFeCompositeElement ---
++
++SVGFeCompositeElement::SVGFeCompositeElement(Document* document)
++    : SVGFilterPrimitiveElement(document, ElementID::FeComposite)
++    , m_in2(PropertyID::In2)
++{
++    addProperty(m_in2);
++}
++
++void SVGFeCompositeElement::layoutElement(const SVGLayoutState& state)
++{
++    SVGElement::layoutElement(state);
++    for(const auto& attribute : attributes()) {
++        if(attribute.id() == PropertyID::Operator) {
++            auto val = attribute.value();
++            if(val == "in") m_operator = 1;
++            else if(val == "out") m_operator = 2;
++            else if(val == "atop") m_operator = 3;
++            else if(val == "xor") m_operator = 4;
++            else if(val == "arithmetic") m_operator = 5;
++            else m_operator = 0; // over
++        } else if(attribute.id() == PropertyID::K1) {
++            m_k1 = strtof(std::string(attribute.value()).c_str(), nullptr);
++        } else if(attribute.id() == PropertyID::K2) {
++            m_k2 = strtof(std::string(attribute.value()).c_str(), nullptr);
++        } else if(attribute.id() == PropertyID::K3) {
++            m_k3 = strtof(std::string(attribute.value()).c_str(), nullptr);
++        } else if(attribute.id() == PropertyID::K4) {
++            m_k4 = strtof(std::string(attribute.value()).c_str(), nullptr);
++        }
++    }
++}
++
++void SVGFeCompositeElement::apply(SVGFilterContext& context) const
++{
++    auto* in1 = context.getInput(in());
++    auto* in2 = context.getInput(m_in2.value());
++    auto* output = context.createSurface();
++
++    int w = plutovg_surface_get_width(output);
++    int h = plutovg_surface_get_height(output);
++    plutovg_filter_composite(output, in1, in2, m_operator, m_k1, m_k2, m_k3, m_k4, 0, 0, w, h);
++    context.setOutput(result(), output);
++}
++
++// --- SVGFeComponentTransferElement ---
++
++SVGFeComponentTransferElement::SVGFeComponentTransferElement(Document* document)
++    : SVGFilterPrimitiveElement(document, ElementID::FeComponentTransfer)
++{
++}
++
++void SVGFeComponentTransferElement::apply(SVGFilterContext& context) const
++{
++    auto* input = context.getInput(in());
++    auto* output = context.createSurface();
++
++    // Build identity defaults
++    plutovg_transfer_func_t funcR = {0, nullptr, 0, 1.f, 0.f, 1.f, 1.f, 0.f};
++    plutovg_transfer_func_t funcG = funcR;
++    plutovg_transfer_func_t funcB = funcR;
++    plutovg_transfer_func_t funcA = funcR;
++
++    // Find feFuncR/G/B/A children
++    for(auto& child : children()) {
++        auto element = toSVGElement(child);
++        if(!element)
++            continue;
++        auto func = dynamic_cast<const SVGFeFuncElement*>(element);
++        if(!func)
++            continue;
++        plutovg_transfer_func_t tf;
++        tf.type = func->funcType();
++        tf.tableValues = func->tableValues().empty() ? nullptr : func->tableValues().data();
++        tf.tableSize = (int)func->tableValues().size();
++        tf.slope = func->slope();
++        tf.intercept = func->intercept();
++        tf.amplitude = func->amplitude();
++        tf.exponent = func->exponent();
++        tf.offset = func->offset();
++
++        switch(element->id()) {
++        case ElementID::FeFuncR: funcR = tf; break;
++        case ElementID::FeFuncG: funcG = tf; break;
++        case ElementID::FeFuncB: funcB = tf; break;
++        case ElementID::FeFuncA: funcA = tf; break;
++        default: break;
++        }
++    }
++
++    int w = plutovg_surface_get_width(output);
++    int h = plutovg_surface_get_height(output);
++    plutovg_filter_component_transfer(output, input, &funcR, &funcG, &funcB, &funcA, 0, 0, w, h);
++    context.setOutput(result(), output);
++}
++
++// --- SVGFeFuncElement ---
++
++SVGFeFuncElement::SVGFeFuncElement(Document* document, ElementID id)
++    : SVGElement(document, id)
++{
++}
++
++static int parseFuncType(const std::string& val)
++{
++    if(val == "table") return 1;
++    if(val == "discrete") return 2;
++    if(val == "linear") return 3;
++    if(val == "gamma") return 4;
++    return 0; // identity
++}
++
++static std::vector<float> parseFloatList(const std::string& val)
++{
++    std::vector<float> result;
++    const char* p = val.c_str();
++    while(*p) {
++        while(*p == ' ' || *p == ',' || *p == '\t' || *p == '\n' || *p == '\r') ++p;
++        if(*p == '\0') break;
++        char* end;
++        float v = strtof(p, &end);
++        if(end == p) break;
++        result.push_back(v);
++        p = end;
++    }
++    return result;
++}
++
++void SVGFeFuncElement::layoutElement(const SVGLayoutState& state)
++{
++    SVGElement::layoutElement(state);
++    for(const auto& attribute : attributes()) {
++        switch(attribute.id()) {
++        case PropertyID::Type:
++            m_funcType = parseFuncType(attribute.value());
++            break;
++        case PropertyID::TableValues:
++            m_tableValues = parseFloatList(attribute.value());
++            break;
++        case PropertyID::Slope:
++            m_slope = strtof(std::string(attribute.value()).c_str(), nullptr);
++            break;
++        case PropertyID::Intercept:
++            m_intercept = strtof(std::string(attribute.value()).c_str(), nullptr);
++            break;
++        case PropertyID::Amplitude:
++            m_amplitude = strtof(std::string(attribute.value()).c_str(), nullptr);
++            break;
++        case PropertyID::Exponent:
++            m_exponent = strtof(std::string(attribute.value()).c_str(), nullptr);
++            break;
++        case PropertyID::Offset:
++            m_offset = strtof(std::string(attribute.value()).c_str(), nullptr);
++            break;
++        default: break;
++        }
++    }
++}
++
++// --- SVGFeMorphologyElement ---
++
++SVGFeMorphologyElement::SVGFeMorphologyElement(Document* document)
++    : SVGFilterPrimitiveElement(document, ElementID::FeMorphology)
++{
++}
++
++void SVGFeMorphologyElement::layoutElement(const SVGLayoutState& state)
++{
++    SVGElement::layoutElement(state);
++    for(const auto& attribute : attributes()) {
++        if(attribute.id() == PropertyID::Operator) {
++            auto val = attribute.value();
++            m_operator = (val == "dilate") ? 1 : 0;
++        } else if(attribute.id() == PropertyID::Radius) {
++            std::string str(attribute.value());
++            char* end;
++            m_radiusX = strtof(str.c_str(), &end);
++            if(m_radiusX < 0.f) m_radiusX = 0.f;
++            const char* p = end;
++            while(*p == ' ' || *p == ',' || *p == '\t') ++p;
++            if(*p != '\0') {
++                m_radiusY = strtof(p, &end);
++                if(m_radiusY < 0.f) m_radiusY = 0.f;
++            } else {
++                m_radiusY = m_radiusX;
++            }
++        }
++    }
++}
++
++void SVGFeMorphologyElement::apply(SVGFilterContext& context) const
++{
++    auto* input = context.getInput(in());
++    auto* output = context.createSurface();
++
++    int w = plutovg_surface_get_width(output);
++    int h = plutovg_surface_get_height(output);
++    plutovg_filter_morphology(output, input, m_operator, m_radiusX, m_radiusY, 0, 0, w, h);
++    context.setOutput(result(), output);
++}
++
++// --- SVGFeTileElement ---
++
++SVGFeTileElement::SVGFeTileElement(Document* document)
++    : SVGFilterPrimitiveElement(document, ElementID::FeTile)
++{
++}
++
++void SVGFeTileElement::apply(SVGFilterContext& context) const
++{
++    auto* input = context.getInput(in());
++    auto* output = context.createSurface();
++
++    int w = plutovg_surface_get_width(output);
++    int h = plutovg_surface_get_height(output);
++    // Use full input dimensions as source tile region
++    int srcW = plutovg_surface_get_width(input);
++    int srcH = plutovg_surface_get_height(input);
++    plutovg_filter_tile(output, input, 0, 0, srcW, srcH, 0, 0, w, h);
++    context.setOutput(result(), output);
++}
++
++// --- SVGFeImageElement (stub) ---
++
++SVGFeImageElement::SVGFeImageElement(Document* document)
++    : SVGFilterPrimitiveElement(document, ElementID::FeImage)
++{
++}
++
++void SVGFeImageElement::apply(SVGFilterContext& context) const
++{
++    // Stub: no external image loading support
++    // Just pass through SourceGraphic
++    auto* input = context.getInput(in());
++    auto* output = context.createSurface();
++
++    int w = plutovg_surface_get_width(output);
++    int h = plutovg_surface_get_height(output);
++    int srcW = plutovg_surface_get_width(input);
++    int srcH = plutovg_surface_get_height(input);
++    int copyW = (std::min)(w, srcW);
++    int copyH = (std::min)(h, srcH);
++    int dstStride = plutovg_surface_get_stride(output);
++    int srcStride = plutovg_surface_get_stride(input);
++    auto* dstData = plutovg_surface_get_data(output);
++    auto* srcData = plutovg_surface_get_data(input);
++    for(int y = 0; y < copyH; ++y) {
++        memcpy(dstData + y * dstStride, srcData + y * srcStride, copyW * 4);
++    }
++    context.setOutput(result(), output);
++}
++
++// --- SVGFeTurbulenceElement ---
++
++SVGFeTurbulenceElement::SVGFeTurbulenceElement(Document* document)
++    : SVGFilterPrimitiveElement(document, ElementID::FeTurbulence)
++{
++}
++
++void SVGFeTurbulenceElement::layoutElement(const SVGLayoutState& state)
++{
++    SVGElement::layoutElement(state);
++    for(const auto& attribute : attributes()) {
++        if(attribute.id() == PropertyID::BaseFrequency) {
++            std::string str(attribute.value());
++            char* end;
++            m_baseFrequencyX = strtof(str.c_str(), &end);
++            const char* p = end;
++            while(*p == ' ' || *p == ',' || *p == '\t') ++p;
++            if(*p != '\0') {
++                m_baseFrequencyY = strtof(p, &end);
++            } else {
++                m_baseFrequencyY = m_baseFrequencyX;
++            }
++        } else if(attribute.id() == PropertyID::NumOctaves) {
++            m_numOctaves = (int)strtol(std::string(attribute.value()).c_str(), nullptr, 10);
++            if(m_numOctaves < 1) m_numOctaves = 1;
++        } else if(attribute.id() == PropertyID::Seed) {
++            m_seed = strtof(std::string(attribute.value()).c_str(), nullptr);
++        } else if(attribute.id() == PropertyID::StitchTiles) {
++            m_stitchTiles = (attribute.value() == "stitch") ? 1 : 0;
++        } else if(attribute.id() == PropertyID::Type) {
++            m_type = (attribute.value() == "fractalNoise") ? 1 : 0;
++        }
++    }
++}
++
++void SVGFeTurbulenceElement::apply(SVGFilterContext& context) const
++{
++    auto* output = context.createSurface();
++
++    int w = plutovg_surface_get_width(output);
++    int h = plutovg_surface_get_height(output);
++    plutovg_filter_turbulence(output, m_baseFrequencyX, m_baseFrequencyY,
++        m_numOctaves, m_seed, m_stitchTiles, m_type, 0, 0, w, h);
++    context.setOutput(result(), output);
++}
++
++// --- SVGFeConvolveMatrixElement ---
++
++SVGFeConvolveMatrixElement::SVGFeConvolveMatrixElement(Document* document)
++    : SVGFilterPrimitiveElement(document, ElementID::FeConvolveMatrix)
++{
++}
++
++void SVGFeConvolveMatrixElement::layoutElement(const SVGLayoutState& state)
++{
++    SVGElement::layoutElement(state);
++    for(const auto& attribute : attributes()) {
++        if(attribute.id() == PropertyID::Order) {
++            std::string str(attribute.value());
++            char* end;
++            m_orderX = (int)strtol(str.c_str(), &end, 10);
++            if(m_orderX < 1) m_orderX = 3;
++            const char* p = end;
++            while(*p == ' ' || *p == ',' || *p == '\t') ++p;
++            if(*p != '\0') {
++                m_orderY = (int)strtol(p, &end, 10);
++                if(m_orderY < 1) m_orderY = 3;
++            } else {
++                m_orderY = m_orderX;
++            }
++        } else if(attribute.id() == PropertyID::KernelMatrix) {
++            m_kernelMatrix = parseFloatList(attribute.value());
++        } else if(attribute.id() == PropertyID::TargetX) {
++            m_targetX = (int)strtol(std::string(attribute.value()).c_str(), nullptr, 10);
++        } else if(attribute.id() == PropertyID::TargetY) {
++            m_targetY = (int)strtol(std::string(attribute.value()).c_str(), nullptr, 10);
++        } else if(attribute.id() == PropertyID::Divisor) {
++            m_divisor = strtof(std::string(attribute.value()).c_str(), nullptr);
++        } else if(attribute.id() == PropertyID::Bias) {
++            m_bias = strtof(std::string(attribute.value()).c_str(), nullptr);
++        } else if(attribute.id() == PropertyID::EdgeMode) {
++            auto val = attribute.value();
++            if(val == "wrap") m_edgeMode = 1;
++            else if(val == "none") m_edgeMode = 2;
++            else m_edgeMode = 0; // duplicate
++        } else if(attribute.id() == PropertyID::PreserveAlpha) {
++            m_preserveAlpha = (attribute.value() == "true");
++        }
++    }
++}
++
++void SVGFeConvolveMatrixElement::apply(SVGFilterContext& context) const
++{
++    auto* input = context.getInput(in());
++    auto* output = context.createSurface();
++
++    int w = plutovg_surface_get_width(output);
++    int h = plutovg_surface_get_height(output);
++
++    // Use defaults if targetX/Y not set
++    int tx = (m_targetX >= 0) ? m_targetX : m_orderX / 2;
++    int ty = (m_targetY >= 0) ? m_targetY : m_orderY / 2;
++
++    const float* kernel = m_kernelMatrix.empty() ? nullptr : m_kernelMatrix.data();
++    plutovg_filter_convolve_matrix(output, input, kernel, m_orderX, m_orderY,
++        tx, ty, m_divisor, m_bias, m_edgeMode, m_preserveAlpha ? 1 : 0, 0, 0, w, h);
++    context.setOutput(result(), output);
++}
++
++// --- SVGFeDisplacementMapElement ---
++
++SVGFeDisplacementMapElement::SVGFeDisplacementMapElement(Document* document)
++    : SVGFilterPrimitiveElement(document, ElementID::FeDisplacementMap)
++    , m_in2(PropertyID::In2)
++{
++    addProperty(m_in2);
++}
++
++static int parseChannelSelector(const std::string& val)
++{
++    if(val == "R") return 0;
++    if(val == "G") return 1;
++    if(val == "B") return 2;
++    return 3; // A (default)
++}
++
++void SVGFeDisplacementMapElement::layoutElement(const SVGLayoutState& state)
++{
++    SVGElement::layoutElement(state);
++    for(const auto& attribute : attributes()) {
++        if(attribute.id() == PropertyID::Scale) {
++            m_scale = strtof(std::string(attribute.value()).c_str(), nullptr);
++        } else if(attribute.id() == PropertyID::XChannelSelector) {
++            m_xChannelSelector = parseChannelSelector(attribute.value());
++        } else if(attribute.id() == PropertyID::YChannelSelector) {
++            m_yChannelSelector = parseChannelSelector(attribute.value());
++        }
++    }
++}
++
++void SVGFeDisplacementMapElement::apply(SVGFilterContext& context) const
++{
++    auto* in1 = context.getInput(in());
++    auto* in2 = context.getInput(m_in2.value());
++    auto* output = context.createSurface();
++
++    int w = plutovg_surface_get_width(output);
++    int h = plutovg_surface_get_height(output);
++    plutovg_filter_displacement_map(output, in1, in2, m_scale, m_xChannelSelector, m_yChannelSelector, 0, 0, w, h);
++    context.setOutput(result(), output);
++}
++
++// --- SVGFeDistantLightElement ---
++
++SVGFeDistantLightElement::SVGFeDistantLightElement(Document* document)
++    : SVGElement(document, ElementID::FeDistantLight)
++{
++}
++
++void SVGFeDistantLightElement::layoutElement(const SVGLayoutState& state)
++{
++    SVGElement::layoutElement(state);
++    for(const auto& attribute : attributes()) {
++        if(attribute.id() == PropertyID::Azimuth) {
++            m_azimuth = strtof(std::string(attribute.value()).c_str(), nullptr);
++        } else if(attribute.id() == PropertyID::Elevation) {
++            m_elevation = strtof(std::string(attribute.value()).c_str(), nullptr);
++        }
++    }
++}
++
++// --- SVGFePointLightElement ---
++
++SVGFePointLightElement::SVGFePointLightElement(Document* document)
++    : SVGElement(document, ElementID::FePointLight)
++{
++}
++
++void SVGFePointLightElement::layoutElement(const SVGLayoutState& state)
++{
++    SVGElement::layoutElement(state);
++    for(const auto& attribute : attributes()) {
++        if(attribute.id() == PropertyID::X) {
++            m_x = strtof(std::string(attribute.value()).c_str(), nullptr);
++        } else if(attribute.id() == PropertyID::Y) {
++            m_y = strtof(std::string(attribute.value()).c_str(), nullptr);
++        } else if(attribute.id() == PropertyID::Z) {
++            m_z = strtof(std::string(attribute.value()).c_str(), nullptr);
++        }
++    }
++}
++
++// --- SVGFeSpotLightElement ---
++
++SVGFeSpotLightElement::SVGFeSpotLightElement(Document* document)
++    : SVGElement(document, ElementID::FeSpotLight)
++{
++}
++
++void SVGFeSpotLightElement::layoutElement(const SVGLayoutState& state)
++{
++    SVGElement::layoutElement(state);
++    for(const auto& attribute : attributes()) {
++        if(attribute.id() == PropertyID::X) {
++            m_x = strtof(std::string(attribute.value()).c_str(), nullptr);
++        } else if(attribute.id() == PropertyID::Y) {
++            m_y = strtof(std::string(attribute.value()).c_str(), nullptr);
++        } else if(attribute.id() == PropertyID::Z) {
++            m_z = strtof(std::string(attribute.value()).c_str(), nullptr);
++        } else if(attribute.id() == PropertyID::PointsAtX) {
++            m_pointsAtX = strtof(std::string(attribute.value()).c_str(), nullptr);
++        } else if(attribute.id() == PropertyID::PointsAtY) {
++            m_pointsAtY = strtof(std::string(attribute.value()).c_str(), nullptr);
++        } else if(attribute.id() == PropertyID::PointsAtZ) {
++            m_pointsAtZ = strtof(std::string(attribute.value()).c_str(), nullptr);
++        } else if(attribute.id() == PropertyID::SpecularExponent) {
++            m_specularExponent = strtof(std::string(attribute.value()).c_str(), nullptr);
++        } else if(attribute.id() == PropertyID::LimitingConeAngle) {
++            m_limitingConeAngle = strtof(std::string(attribute.value()).c_str(), nullptr);
++            m_hasLimitingConeAngle = true;
++        }
++    }
++}
++
++// Helper: find light source child and fill plutovg_light_source_t
++static bool findLightSource(const SVGElement* parent, plutovg_light_source_t& light)
++{
++    memset(&light, 0, sizeof(light));
++    light.specularExponent = 1.0f;
++
++    for(auto& child : parent->children()) {
++        auto element = toSVGElement(child);
++        if(!element)
++            continue;
++        if(element->id() == ElementID::FeDistantLight) {
++            auto dl = static_cast<const SVGFeDistantLightElement*>(element);
++            light.type = PLUTOVG_LIGHT_DISTANT;
++            light.azimuth = dl->azimuth();
++            light.elevation = dl->elevation();
++            return true;
++        } else if(element->id() == ElementID::FePointLight) {
++            auto pl = static_cast<const SVGFePointLightElement*>(element);
++            light.type = PLUTOVG_LIGHT_POINT;
++            light.x = pl->x();
++            light.y = pl->y();
++            light.z = pl->z();
++            return true;
++        } else if(element->id() == ElementID::FeSpotLight) {
++            auto sl = static_cast<const SVGFeSpotLightElement*>(element);
++            light.type = PLUTOVG_LIGHT_SPOT;
++            light.x = sl->x();
++            light.y = sl->y();
++            light.z = sl->z();
++            light.pointsAtX = sl->pointsAtX();
++            light.pointsAtY = sl->pointsAtY();
++            light.pointsAtZ = sl->pointsAtZ();
++            light.specularExponent = sl->spotExponent();
++            light.limitingConeAngle = sl->limitingConeAngle();
++            light.hasLimitingConeAngle = sl->hasLimitingConeAngle() ? 1 : 0;
++            return true;
++        }
++    }
++    return false;
++}
++
++// --- SVGFeDiffuseLightingElement ---
++
++SVGFeDiffuseLightingElement::SVGFeDiffuseLightingElement(Document* document)
++    : SVGFilterPrimitiveElement(document, ElementID::FeDiffuseLighting)
++{
++}
++
++void SVGFeDiffuseLightingElement::layoutElement(const SVGLayoutState& state)
++{
++    SVGElement::layoutElement(state);
++    for(const auto& attribute : attributes()) {
++        if(attribute.id() == PropertyID::SurfaceScale) {
++            m_surfaceScale = strtof(std::string(attribute.value()).c_str(), nullptr);
++        } else if(attribute.id() == PropertyID::DiffuseConstant) {
++            m_diffuseConstant = strtof(std::string(attribute.value()).c_str(), nullptr);
++            if(m_diffuseConstant < 0.f) m_diffuseConstant = 0.f;
++        } else if(attribute.id() == PropertyID::Lighting_Color) {
++            std::string_view input(attribute.value());
++            plutovg_color_t color;
++            int length = plutovg_color_parse(&color, input.data(), input.length());
++            if(length > 0) {
++                m_lightingColor = Color(plutovg_color_to_argb32(&color));
++            }
++        }
++    }
++}
++
++void SVGFeDiffuseLightingElement::apply(SVGFilterContext& context) const
++{
++    auto* input = context.getInput(in());
++    auto* output = context.createSurface();
++
++    plutovg_light_source_t light;
++    if(!findLightSource(this, light)) {
++        // No light source — output black
++        context.setOutput(result(), output);
++        return;
++    }
++
++    int w = plutovg_surface_get_width(output);
++    int h = plutovg_surface_get_height(output);
++    plutovg_filter_diffuse_lighting(output, input,
++        m_surfaceScale, m_diffuseConstant,
++        m_lightingColor.redF(), m_lightingColor.greenF(), m_lightingColor.blueF(),
++        &light, 0, 0, w, h);
++    context.setOutput(result(), output);
++}
++
++// --- SVGFeSpecularLightingElement ---
++
++SVGFeSpecularLightingElement::SVGFeSpecularLightingElement(Document* document)
++    : SVGFilterPrimitiveElement(document, ElementID::FeSpecularLighting)
++{
++}
++
++void SVGFeSpecularLightingElement::layoutElement(const SVGLayoutState& state)
++{
++    SVGElement::layoutElement(state);
++    for(const auto& attribute : attributes()) {
++        if(attribute.id() == PropertyID::SurfaceScale) {
++            m_surfaceScale = strtof(std::string(attribute.value()).c_str(), nullptr);
++        } else if(attribute.id() == PropertyID::SpecularConstant) {
++            m_specularConstant = strtof(std::string(attribute.value()).c_str(), nullptr);
++            if(m_specularConstant < 0.f) m_specularConstant = 0.f;
++        } else if(attribute.id() == PropertyID::SpecularExponent) {
++            m_specularExponent = strtof(std::string(attribute.value()).c_str(), nullptr);
++            m_specularExponent = std::clamp(m_specularExponent, 1.f, 128.f);
++        } else if(attribute.id() == PropertyID::Lighting_Color) {
++            std::string_view input(attribute.value());
++            plutovg_color_t color;
++            int length = plutovg_color_parse(&color, input.data(), input.length());
++            if(length > 0) {
++                m_lightingColor = Color(plutovg_color_to_argb32(&color));
++            }
++        }
++    }
++}
++
++void SVGFeSpecularLightingElement::apply(SVGFilterContext& context) const
++{
++    auto* input = context.getInput(in());
++    auto* output = context.createSurface();
++
++    plutovg_light_source_t light;
++    if(!findLightSource(this, light)) {
++        context.setOutput(result(), output);
++        return;
++    }
++
++    int w = plutovg_surface_get_width(output);
++    int h = plutovg_surface_get_height(output);
++    plutovg_filter_specular_lighting(output, input,
++        m_surfaceScale, m_specularConstant, m_specularExponent,
++        m_lightingColor.redF(), m_lightingColor.greenF(), m_lightingColor.blueF(),
++        &light, 0, 0, w, h);
++    context.setOutput(result(), output);
++}
++
++} // namespace lunasvg
+diff --git a/source/svgfilterelement.h b/source/svgfilterelement.h
+new file mode 100644
+index 0000000..7d8fb84
+--- /dev/null
++++ b/source/svgfilterelement.h
+@@ -0,0 +1,356 @@
++#ifndef LUNASVG_SVGFILTERELEMENT_H
++#define LUNASVG_SVGFILTERELEMENT_H
++
++#include "svgelement.h"
++
++#include <vector>
++#include <map>
++
++namespace lunasvg {
++
++class SVGFilterElement;
++class SVGFilterPrimitiveElement;
++
++// Named filter buffer management
++class SVGFilterContext {
++public:
++    SVGFilterContext(const Canvas& sourceGraphic, const Rect& filterRegion);
++    ~SVGFilterContext();
++
++    plutovg_surface_t* getInput(const std::string& name) const;
++    void setOutput(const std::string& name, plutovg_surface_t* surface);
++    plutovg_surface_t* lastResult() const { return m_lastResult; }
++
++    plutovg_surface_t* sourceGraphic() const { return m_sourceGraphic; }
++    plutovg_surface_t* sourceAlpha();
++    const Rect& filterRegion() const { return m_filterRegion; }
++
++    // Allocate temporary surface matching filter region dimensions
++    plutovg_surface_t* createSurface() const;
++
++private:
++    std::map<std::string, plutovg_surface_t*> m_buffers;
++    plutovg_surface_t* m_sourceGraphic;
++    plutovg_surface_t* m_sourceAlpha = nullptr;
++    plutovg_surface_t* m_lastResult = nullptr;
++    Rect m_filterRegion;
++    std::vector<plutovg_surface_t*> m_ownedSurfaces; // for cleanup
++};
++
++// <filter> container element
++class SVGFilterElement final : public SVGElement {
++public:
++    SVGFilterElement(Document* document);
++
++    void applyFilter(SVGRenderState& state) const;
++
++    Rect filterRegion(const SVGElement* target) const;
++
++    void layoutElement(const SVGLayoutState& state) override;
++
++private:
++    SVGEnumeration<Units> m_filterUnits;        // default: objectBoundingBox
++    SVGEnumeration<Units> m_primitiveUnits;     // default: userSpaceOnUse
++    SVGLength m_x;   // default: -10%
++    SVGLength m_y;   // default: -10%
++    SVGLength m_width;  // default: 120%
++    SVGLength m_height; // default: 120%
++};
++
++// Base class for all <fe*> elements
++class SVGFilterPrimitiveElement : public SVGElement {
++public:
++    SVGFilterPrimitiveElement(Document* document, ElementID id);
++
++    virtual void apply(SVGFilterContext& context) const = 0;
++
++    const std::string& in() const { return m_in.value(); }
++    const std::string& result() const { return m_result.value(); }
++
++protected:
++    SVGString m_in;
++    SVGString m_result;
++};
++
++// <feFlood>
++class SVGFeFloodElement final : public SVGFilterPrimitiveElement {
++public:
++    SVGFeFloodElement(Document* document);
++    void apply(SVGFilterContext& context) const override;
++    void layoutElement(const SVGLayoutState& state) override;
++
++private:
++    Color m_floodColor = Color::Black;
++    float m_floodOpacity = 1.f;
++};
++
++// <feOffset>
++class SVGFeOffsetElement final : public SVGFilterPrimitiveElement {
++public:
++    SVGFeOffsetElement(Document* document);
++    void apply(SVGFilterContext& context) const override;
++
++private:
++    SVGLength m_dx;
++    SVGLength m_dy;
++};
++
++// <feMerge>
++class SVGFeMergeElement final : public SVGFilterPrimitiveElement {
++public:
++    SVGFeMergeElement(Document* document);
++    void apply(SVGFilterContext& context) const override;
++};
++
++// <feMergeNode>
++class SVGFeMergeNodeElement final : public SVGElement {
++public:
++    SVGFeMergeNodeElement(Document* document);
++    const std::string& in() const { return m_in.value(); }
++
++private:
++    SVGString m_in;
++};
++
++// <feGaussianBlur>
++class SVGFeGaussianBlurElement final : public SVGFilterPrimitiveElement {
++public:
++    SVGFeGaussianBlurElement(Document* document);
++    void apply(SVGFilterContext& context) const override;
++    void layoutElement(const SVGLayoutState& state) override;
++
++private:
++    float m_stdDeviationX = 0.f;
++    float m_stdDeviationY = 0.f;
++};
++
++// <feBlend>
++class SVGFeBlendElement final : public SVGFilterPrimitiveElement {
++public:
++    SVGFeBlendElement(Document* document);
++    void apply(SVGFilterContext& context) const override;
++    void layoutElement(const SVGLayoutState& state) override;
++
++private:
++    SVGString m_in2;
++    int m_mode = 0; // 0=normal, 1=multiply, 2=screen, 3=darken, 4=lighten
++};
++
++// <feColorMatrix>
++class SVGFeColorMatrixElement final : public SVGFilterPrimitiveElement {
++public:
++    SVGFeColorMatrixElement(Document* document);
++    void apply(SVGFilterContext& context) const override;
++    void layoutElement(const SVGLayoutState& state) override;
++
++private:
++    int m_type = 0; // 0=matrix, 1=saturate, 2=hueRotate, 3=luminanceToAlpha
++    float m_matrix[20];
++};
++
++// <feComposite>
++class SVGFeCompositeElement final : public SVGFilterPrimitiveElement {
++public:
++    SVGFeCompositeElement(Document* document);
++    void apply(SVGFilterContext& context) const override;
++    void layoutElement(const SVGLayoutState& state) override;
++
++private:
++    SVGString m_in2;
++    int m_operator = 0; // 0=over, 1=in, 2=out, 3=atop, 4=xor, 5=arithmetic
++    float m_k1 = 0.f, m_k2 = 0.f, m_k3 = 0.f, m_k4 = 0.f;
++};
++
++// --- Phase F3 classes ---
++
++// <feComponentTransfer>
++class SVGFeComponentTransferElement final : public SVGFilterPrimitiveElement {
++public:
++    SVGFeComponentTransferElement(Document* document);
++    void apply(SVGFilterContext& context) const override;
++};
++
++// <feFuncR>, <feFuncG>, <feFuncB>, <feFuncA>
++class SVGFeFuncElement final : public SVGElement {
++public:
++    SVGFeFuncElement(Document* document, ElementID id);
++    void layoutElement(const SVGLayoutState& state) override;
++
++    int funcType() const { return m_funcType; }
++    const std::vector<float>& tableValues() const { return m_tableValues; }
++    float slope() const { return m_slope; }
++    float intercept() const { return m_intercept; }
++    float amplitude() const { return m_amplitude; }
++    float exponent() const { return m_exponent; }
++    float offset() const { return m_offset; }
++
++private:
++    int m_funcType = 0; // 0=identity, 1=table, 2=discrete, 3=linear, 4=gamma
++    std::vector<float> m_tableValues;
++    float m_slope = 1.f;
++    float m_intercept = 0.f;
++    float m_amplitude = 1.f;
++    float m_exponent = 1.f;
++    float m_offset = 0.f;
++};
++
++// <feMorphology>
++class SVGFeMorphologyElement final : public SVGFilterPrimitiveElement {
++public:
++    SVGFeMorphologyElement(Document* document);
++    void apply(SVGFilterContext& context) const override;
++    void layoutElement(const SVGLayoutState& state) override;
++
++private:
++    int m_operator = 0; // 0=erode, 1=dilate
++    float m_radiusX = 0.f;
++    float m_radiusY = 0.f;
++};
++
++// <feTile>
++class SVGFeTileElement final : public SVGFilterPrimitiveElement {
++public:
++    SVGFeTileElement(Document* document);
++    void apply(SVGFilterContext& context) const override;
++};
++
++// <feImage> (stub - no external image loading support)
++class SVGFeImageElement final : public SVGFilterPrimitiveElement {
++public:
++    SVGFeImageElement(Document* document);
++    void apply(SVGFilterContext& context) const override;
++};
++
++// --- Phase F4 classes ---
++
++// <feTurbulence>
++class SVGFeTurbulenceElement final : public SVGFilterPrimitiveElement {
++public:
++    SVGFeTurbulenceElement(Document* document);
++    void apply(SVGFilterContext& context) const override;
++    void layoutElement(const SVGLayoutState& state) override;
++
++private:
++    float m_baseFrequencyX = 0.f;
++    float m_baseFrequencyY = 0.f;
++    int m_numOctaves = 1;
++    float m_seed = 0.f;
++    int m_stitchTiles = 0; // 0=noStitch, 1=stitch
++    int m_type = 0; // 0=turbulence, 1=fractalNoise
++};
++
++// <feConvolveMatrix>
++class SVGFeConvolveMatrixElement final : public SVGFilterPrimitiveElement {
++public:
++    SVGFeConvolveMatrixElement(Document* document);
++    void apply(SVGFilterContext& context) const override;
++    void layoutElement(const SVGLayoutState& state) override;
++
++private:
++    std::vector<float> m_kernelMatrix;
++    int m_orderX = 3, m_orderY = 3;
++    int m_targetX = -1, m_targetY = -1; // -1 = floor(orderX/2)
++    float m_divisor = 0.f; // 0 = auto (sum of kernel)
++    float m_bias = 0.f;
++    int m_edgeMode = 0; // 0=duplicate, 1=wrap, 2=none
++    bool m_preserveAlpha = false;
++};
++
++// <feDisplacementMap>
++class SVGFeDisplacementMapElement final : public SVGFilterPrimitiveElement {
++public:
++    SVGFeDisplacementMapElement(Document* document);
++    void apply(SVGFilterContext& context) const override;
++    void layoutElement(const SVGLayoutState& state) override;
++
++private:
++    SVGString m_in2;
++    float m_scale = 0.f;
++    int m_xChannelSelector = 3; // 0=R, 1=G, 2=B, 3=A
++    int m_yChannelSelector = 3;
++};
++
++// --- Phase F5 classes ---
++
++// <feDistantLight>
++class SVGFeDistantLightElement final : public SVGElement {
++public:
++    SVGFeDistantLightElement(Document* document);
++    void layoutElement(const SVGLayoutState& state) override;
++
++    float azimuth() const { return m_azimuth; }
++    float elevation() const { return m_elevation; }
++
++private:
++    float m_azimuth = 0.f;
++    float m_elevation = 0.f;
++};
++
++// <fePointLight>
++class SVGFePointLightElement final : public SVGElement {
++public:
++    SVGFePointLightElement(Document* document);
++    void layoutElement(const SVGLayoutState& state) override;
++
++    float x() const { return m_x; }
++    float y() const { return m_y; }
++    float z() const { return m_z; }
++
++private:
++    float m_x = 0.f, m_y = 0.f, m_z = 0.f;
++};
++
++// <feSpotLight>
++class SVGFeSpotLightElement final : public SVGElement {
++public:
++    SVGFeSpotLightElement(Document* document);
++    void layoutElement(const SVGLayoutState& state) override;
++
++    float x() const { return m_x; }
++    float y() const { return m_y; }
++    float z() const { return m_z; }
++    float pointsAtX() const { return m_pointsAtX; }
++    float pointsAtY() const { return m_pointsAtY; }
++    float pointsAtZ() const { return m_pointsAtZ; }
++    float spotExponent() const { return m_specularExponent; }
++    float limitingConeAngle() const { return m_limitingConeAngle; }
++    bool hasLimitingConeAngle() const { return m_hasLimitingConeAngle; }
++
++private:
++    float m_x = 0.f, m_y = 0.f, m_z = 0.f;
++    float m_pointsAtX = 0.f, m_pointsAtY = 0.f, m_pointsAtZ = 0.f;
++    float m_specularExponent = 1.f;
++    float m_limitingConeAngle = 0.f;
++    bool m_hasLimitingConeAngle = false;
++};
++
++// <feDiffuseLighting>
++class SVGFeDiffuseLightingElement final : public SVGFilterPrimitiveElement {
++public:
++    SVGFeDiffuseLightingElement(Document* document);
++    void apply(SVGFilterContext& context) const override;
++    void layoutElement(const SVGLayoutState& state) override;
++
++private:
++    float m_surfaceScale = 1.f;
++    float m_diffuseConstant = 1.f;
++    Color m_lightingColor{0xFFFFFFFF}; // white default
++};
++
++// <feSpecularLighting>
++class SVGFeSpecularLightingElement final : public SVGFilterPrimitiveElement {
++public:
++    SVGFeSpecularLightingElement(Document* document);
++    void apply(SVGFilterContext& context) const override;
++    void layoutElement(const SVGLayoutState& state) override;
++
++private:
++    float m_surfaceScale = 1.f;
++    float m_specularConstant = 1.f;
++    float m_specularExponent = 1.f;
++    Color m_lightingColor{0xFFFFFFFF}; // white default
++};
++
++} // namespace lunasvg
++
++#endif // LUNASVG_SVGFILTERELEMENT_H
+diff --git a/source/svglayoutstate.cpp b/source/svglayoutstate.cpp
+index bf5b92d..517670b 100644
+--- a/source/svglayoutstate.cpp
++++ b/source/svglayoutstate.cpp
+@@ -554,6 +554,9 @@ SVGLayoutState::SVGLayoutState(const SVGLayoutState& parent, const SVGElement* e
+         case PropertyID::Clip_Path:
+             m_clip_path = parseUrl(input);
+             break;
++        case PropertyID::Filter:
++            m_filter = parseUrl(input);
++            break;
+         case PropertyID::Marker_Start:
+             m_marker_start = parseUrl(input);
+             break;
+diff --git a/source/svglayoutstate.h b/source/svglayoutstate.h
+index 4d08ad9..a5d89fb 100644
+--- a/source/svglayoutstate.h
++++ b/source/svglayoutstate.h
+@@ -60,6 +60,7 @@ class SVGLayoutState {
+ 
+     const std::string& mask() const { return m_mask; }
+     const std::string& clip_path() const { return m_clip_path; }
++    const std::string& filter() const { return m_filter; }
+     const std::string& marker_start() const { return m_marker_start; }
+     const std::string& marker_mid() const { return m_marker_mid; }
+     const std::string& marker_end() const { return m_marker_end; }
+@@ -118,6 +119,7 @@ class SVGLayoutState {
+ 
+     std::string m_mask;
+     std::string m_clip_path;
++    std::string m_filter;
+     std::string m_marker_start;
+     std::string m_marker_mid;
+     std::string m_marker_end;
+diff --git a/source/svgproperty.cpp b/source/svgproperty.cpp
+index 51c7ecc..8916f2d 100644
+--- a/source/svgproperty.cpp
++++ b/source/svgproperty.cpp
+@@ -12,13 +12,25 @@ PropertyID propertyid(std::string_view name)
+         std::string_view name;
+         PropertyID value;
+     } table[] = {
++        {"amplitude", PropertyID::Amplitude},
++        {"azimuth", PropertyID::Azimuth},
++        {"baseFrequency", PropertyID::BaseFrequency},
++        {"bias", PropertyID::Bias},
+         {"class", PropertyID::Class},
+         {"clipPathUnits", PropertyID::ClipPathUnits},
+         {"cx", PropertyID::Cx},
+         {"cy", PropertyID::Cy},
+         {"d", PropertyID::D},
++        {"diffuseConstant", PropertyID::DiffuseConstant},
++        {"divisor", PropertyID::Divisor},
+         {"dx", PropertyID::Dx},
+         {"dy", PropertyID::Dy},
++        {"edgeMode", PropertyID::EdgeMode},
++        {"elevation", PropertyID::Elevation},
++        {"exponent", PropertyID::Exponent},
++        {"filterUnits", PropertyID::FilterUnits},
++        {"flood-color", PropertyID::Flood_Color},
++        {"flood-opacity", PropertyID::Flood_Opacity},
+         {"fx", PropertyID::Fx},
+         {"fy", PropertyID::Fy},
+         {"gradientTransform", PropertyID::GradientTransform},
+@@ -26,39 +38,76 @@ PropertyID propertyid(std::string_view name)
+         {"height", PropertyID::Height},
+         {"href", PropertyID::Href},
+         {"id", PropertyID::Id},
++        {"in", PropertyID::In},
++        {"in2", PropertyID::In2},
++        {"intercept", PropertyID::Intercept},
++        {"k1", PropertyID::K1},
++        {"k2", PropertyID::K2},
++        {"k3", PropertyID::K3},
++        {"k4", PropertyID::K4},
++        {"kernelMatrix", PropertyID::KernelMatrix},
+         {"lengthAdjust", PropertyID::LengthAdjust},
++        {"lighting-color", PropertyID::Lighting_Color},
++        {"limitingConeAngle", PropertyID::LimitingConeAngle},
+         {"markerHeight", PropertyID::MarkerHeight},
+         {"markerUnits", PropertyID::MarkerUnits},
+         {"markerWidth", PropertyID::MarkerWidth},
+         {"maskContentUnits", PropertyID::MaskContentUnits},
+         {"maskUnits", PropertyID::MaskUnits},
++        {"mode", PropertyID::Mode},
++        {"numOctaves", PropertyID::NumOctaves},
+         {"offset", PropertyID::Offset},
++        {"operator", PropertyID::Operator},
++        {"order", PropertyID::Order},
+         {"orient", PropertyID::Orient},
+         {"patternContentUnits", PropertyID::PatternContentUnits},
+         {"patternTransform", PropertyID::PatternTransform},
+         {"patternUnits", PropertyID::PatternUnits},
+         {"points", PropertyID::Points},
++        {"pointsAtX", PropertyID::PointsAtX},
++        {"pointsAtY", PropertyID::PointsAtY},
++        {"pointsAtZ", PropertyID::PointsAtZ},
++        {"preserveAlpha", PropertyID::PreserveAlpha},
+         {"preserveAspectRatio", PropertyID::PreserveAspectRatio},
++        {"primitiveUnits", PropertyID::PrimitiveUnits},
+         {"r", PropertyID::R},
++        {"radius", PropertyID::Radius},
+         {"refX", PropertyID::RefX},
+         {"refY", PropertyID::RefY},
++        {"result", PropertyID::Result},
+         {"rotate", PropertyID::Rotate},
+         {"rx", PropertyID::Rx},
+         {"ry", PropertyID::Ry},
++        {"scale", PropertyID::Scale},
++        {"seed", PropertyID::Seed},
++        {"slope", PropertyID::Slope},
++        {"specularConstant", PropertyID::SpecularConstant},
++        {"specularExponent", PropertyID::SpecularExponent},
+         {"spreadMethod", PropertyID::SpreadMethod},
++        {"stdDeviation", PropertyID::StdDeviation},
++        {"stitchTiles", PropertyID::StitchTiles},
+         {"style", PropertyID::Style},
++        {"surfaceScale", PropertyID::SurfaceScale},
++        {"tableValues", PropertyID::TableValues},
++        {"targetX", PropertyID::TargetX},
++        {"targetY", PropertyID::TargetY},
+         {"textLength", PropertyID::TextLength},
+         {"transform", PropertyID::Transform},
++        {"type", PropertyID::Type},
++        {"values", PropertyID::Values},
+         {"viewBox", PropertyID::ViewBox},
+         {"width", PropertyID::Width},
+         {"x", PropertyID::X},
+         {"x1", PropertyID::X1},
+         {"x2", PropertyID::X2},
++        {"xChannelSelector", PropertyID::XChannelSelector},
+         {"xlink:href", PropertyID::Href},
+         {"xml:space", PropertyID::White_Space},
+         {"y", PropertyID::Y},
+         {"y1", PropertyID::Y1},
+-        {"y2", PropertyID::Y2}
++        {"y2", PropertyID::Y2},
++        {"yChannelSelector", PropertyID::YChannelSelector},
++        {"z", PropertyID::Z}
+     };
+ 
+     auto it = std::lower_bound(table, std::end(table), name, [](const auto& item, const auto& name) { return item.name < name; });
+@@ -84,11 +133,15 @@ PropertyID csspropertyid(std::string_view name)
+         {"fill", PropertyID::Fill},
+         {"fill-opacity", PropertyID::Fill_Opacity},
+         {"fill-rule", PropertyID::Fill_Rule},
++        {"filter", PropertyID::Filter},
++        {"flood-color", PropertyID::Flood_Color},
++        {"flood-opacity", PropertyID::Flood_Opacity},
+         {"font-family", PropertyID::Font_Family},
+         {"font-size", PropertyID::Font_Size},
+         {"font-style", PropertyID::Font_Style},
+         {"font-weight", PropertyID::Font_Weight},
+         {"letter-spacing", PropertyID::Letter_Spacing},
++        {"lighting-color", PropertyID::Lighting_Color},
+         {"marker-end", PropertyID::Marker_End},
+         {"marker-mid", PropertyID::Marker_Mid},
+         {"marker-start", PropertyID::Marker_Start},
+diff --git a/source/svgproperty.h b/source/svgproperty.h
+index 74a23a8..8cfc5d0 100644
+--- a/source/svgproperty.h
++++ b/source/svgproperty.h
+@@ -10,7 +10,11 @@ namespace lunasvg {
+ enum class PropertyID : uint8_t {
+     Unknown = 0,
+     Alignment_Baseline,
++    Amplitude,
++    Azimuth,
++    BaseFrequency,
+     Baseline_Shift,
++    Bias,
+     Class,
+     Clip_Path,
+     Clip_Rule,
+@@ -21,12 +25,21 @@ enum class PropertyID : uint8_t {
+     D,
+     Direction,
+     Display,
++    DiffuseConstant,
++    Divisor,
+     Dominant_Baseline,
+     Dx,
+     Dy,
++    EdgeMode,
++    Elevation,
++    Exponent,
+     Fill,
+     Fill_Opacity,
+     Fill_Rule,
++    Filter,
++    FilterUnits,
++    Flood_Color,
++    Flood_Opacity,
+     Font_Family,
+     Font_Size,
+     Font_Style,
+@@ -38,7 +51,17 @@ enum class PropertyID : uint8_t {
+     Height,
+     Href,
+     Id,
++    In,
++    In2,
++    Intercept,
++    K1,
++    K2,
++    K3,
++    K4,
++    KernelMatrix,
+     LengthAdjust,
++    LimitingConeAngle,
++    Lighting_Color,
+     Letter_Spacing,
+     Marker_End,
+     Marker_Mid,
+@@ -50,24 +73,44 @@ enum class PropertyID : uint8_t {
+     Mask_Type,
+     MaskContentUnits,
+     MaskUnits,
++    Mode,
++    NumOctaves,
+     Offset,
+     Opacity,
++    Operator,
++    Order,
+     Orient,
++
+     Overflow,
+     PatternContentUnits,
+     PatternTransform,
+     PatternUnits,
+     Pointer_Events,
+     Points,
++    PointsAtX,
++    PointsAtY,
++    PointsAtZ,
++    PreserveAlpha,
+     PreserveAspectRatio,
++    PrimitiveUnits,
+     R,
++    Radius,
+     RefX,
+     RefY,
++    Result,
+     Rotate,
+     Rx,
+     Ry,
++    Scale,
++    Seed,
++    Slope,
++    SpecularConstant,
++    SpecularExponent,
+     SpreadMethod,
++    StdDeviation,
++    StitchTiles,
+     Stop_Color,
++    SurfaceScale,
+     Stop_Opacity,
+     Stroke,
+     Stroke_Dasharray,
+@@ -81,7 +124,12 @@ enum class PropertyID : uint8_t {
+     Text_Anchor,
+     Text_Orientation,
+     TextLength,
++    TableValues,
++    TargetX,
++    TargetY,
+     Transform,
++    Type,
++    Values,
+     ViewBox,
+     Visibility,
+     White_Space,
+@@ -91,9 +139,12 @@ enum class PropertyID : uint8_t {
+     X,
+     X1,
+     X2,
++    XChannelSelector,
+     Y,
+     Y1,
+-    Y2
++    Y2,
++    YChannelSelector,
++    Z
+ };
+ 
+ PropertyID propertyid(std::string_view name);
+diff --git a/source/svgrenderstate.cpp b/source/svgrenderstate.cpp
+index 550d389..67118c9 100644
+--- a/source/svgrenderstate.cpp
++++ b/source/svgrenderstate.cpp
+@@ -1,17 +1,19 @@
+ #include "svgrenderstate.h"
++#include "svgfilterelement.h"
+ 
+ namespace lunasvg {
+ 
+ SVGBlendInfo::SVGBlendInfo(const SVGElement* element)
+     : m_clipper(element->clipper())
+     , m_masker(element->masker())
++    , m_filter(element->filter())
+     , m_opacity(element->opacity())
+ {
+ }
+ 
+ bool SVGBlendInfo::requiresCompositing(SVGRenderMode mode) const
+ {
+-    return (m_clipper && m_clipper->requiresMasking()) || (mode == SVGRenderMode::Painting && (m_masker || m_opacity < 1.f));
++    return (m_clipper && m_clipper->requiresMasking()) || (mode == SVGRenderMode::Painting && (m_masker || m_filter || m_opacity < 1.f));
+ }
+ 
+ bool SVGRenderState::hasCycleReference(const SVGElement* element) const
+@@ -55,6 +57,10 @@ void SVGRenderState::endGroup(const SVGBlendInfo& blendInfo)
+         blendInfo.masker()->applyMask(*this);
+     }
+ 
++    if(m_mode == SVGRenderMode::Painting && blendInfo.filter()) {
++        blendInfo.filter()->applyFilter(*this);
++    }
++
+     m_parent->m_canvas->blendCanvas(*m_canvas, BlendMode::Src_Over, opacity);
+ }
+ 
+diff --git a/source/svgrenderstate.h b/source/svgrenderstate.h
+index 1e0d434..35d026b 100644
+--- a/source/svgrenderstate.h
++++ b/source/svgrenderstate.h
+@@ -13,18 +13,20 @@ enum class SVGRenderMode {
+ class SVGBlendInfo {
+ public:
+     explicit SVGBlendInfo(const SVGElement* element);
+-    SVGBlendInfo(const SVGClipPathElement* clipper, const SVGMaskElement* masker, float opacity)
+-        : m_clipper(clipper), m_masker(masker), m_opacity(opacity)
++    SVGBlendInfo(const SVGClipPathElement* clipper, const SVGMaskElement* masker, const SVGFilterElement* filter, float opacity)
++        : m_clipper(clipper), m_masker(masker), m_filter(filter), m_opacity(opacity)
+     {}
+ 
+     bool requiresCompositing(SVGRenderMode mode) const;
+     const SVGClipPathElement* clipper() const { return m_clipper; }
+     const SVGMaskElement* masker() const { return m_masker; }
++    const SVGFilterElement* filter() const { return m_filter; }
+     float opacity() const { return m_opacity; }
+ 
+ private:
+     const SVGClipPathElement* m_clipper;
+     const SVGMaskElement* m_masker;
++    const SVGFilterElement* m_filter;
+     const float m_opacity;
+ };
+ 

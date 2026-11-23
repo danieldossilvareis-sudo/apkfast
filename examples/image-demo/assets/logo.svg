@@ -5,8 +5,28 @@
       <stop offset="0" stop-color="#35d0ff"/>
       <stop offset="1" stop-color="#7b3cff"/>
     </linearGradient>
+    <pattern id="dots" width="12" height="12" patternUnits="userSpaceOnUse">
+      <circle cx="3" cy="3" r="2" fill="#ffffff" fill-opacity="0.25"/>
+    </pattern>
+    <clipPath id="round">
+      <circle cx="64" cy="64" r="52"/>
+    </clipPath>
+    <mask id="fade">
+      <rect width="128" height="128" fill="white"/>
+      <circle cx="64" cy="100" r="26" fill="black"/>
+    </mask>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="3" stdDeviation="2" flood-color="#000000" flood-opacity="0.6"/>
+    </filter>
+    <style>
+      .title { font-family: 'DejaVu Sans', sans-serif; font-size: 20px; fill: #ffd84a; }
+      .accent { fill: #ffffff !important; }
+    </style>
   </defs>
-  <circle cx="64" cy="64" r="52" fill="url(#g)"/>
-  <path d="M36 80 L64 30 L92 80 Z" fill="#ffffff" fill-opacity="0.92"/>
-  <rect x="48" y="80" width="32" height="12" rx="4" fill="#ffd84a"/>
+  <g clip-path="url(#round)" mask="url(#fade)">
+    <rect width="128" height="128" fill="url(#g)"/>
+    <rect width="128" height="128" fill="url(#dots)"/>
+    <path class="accent" d="M36 74 L64 30 L92 74 Z"/>
+  </g>
+  <text class="title" x="64" y="112" text-anchor="middle" filter="url(#shadow)">SVG</text>
 </svg>

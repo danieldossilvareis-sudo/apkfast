@@ -669,14 +669,21 @@ public:
 
     void draw(const MeshData& data, const Material& material,
               const float* model = nullptr) override {
+        draw_with_texture(data, material, model, nullptr);
+    }
+
+    /// Desenha com uma Texture externa (ex.: frame de WebP animado).
+    void draw_with_texture(const MeshData& data, const Material& material,
+                           const float* model, const Texture* texture_override) {
         if (!initialized_) return;
         egl_.make_current();
         temporary_mesh_.upload(data);
-        draw_mesh(temporary_mesh_, material, model);
+        draw_mesh(temporary_mesh_, material, model, texture_override);
     }
 
     void draw_mesh(const Mesh& mesh, const Material& material,
-                   const float* model = nullptr) {
+                   const float* model = nullptr,
+                   const Texture* texture_override = nullptr) {
         Shader& shader = shader_override_ ? *shader_override_ : shader_;
         shader.use();
         shader.set_uniform_mat4("u_projection", projection_.data());
@@ -684,9 +691,14 @@ public:
         shader.set_uniform_mat4("u_model", model ? model : identity.data());
         shader.set_uniform("u_color", material.color[0], material.color[1],
                            material.color[2], material.color[3]);
-        shader.set_uniform("u_use_texture", material.texture.empty() ? 0 : 1);
+        shader.set_uniform(
+            "u_use_texture",
+            (texture_override || !material.texture.empty()) ? 1 : 0);
 
-        if (!material.texture.empty()) {
+        if (texture_override) {
+            texture_override->bind(0);
+            shader.set_uniform("u_texture", 0);
+        } else if (!material.texture.empty()) {
             auto it = textures_.find(material.texture);
             if (it == textures_.end()) {
                 auto texture = std::make_unique<Texture>();

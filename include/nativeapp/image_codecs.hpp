@@ -74,8 +74,17 @@ inline ImageFormat detect_image_format(const uint8_t* data, size_t size) {
 
 // Definidos em src/nativeapp_impl.cpp e nativeapp_impl_no_image.cpp.
 bool decode_webp_jni(const uint8_t* data, size_t size, DecodedImage& out);
+bool decode_webp_full(const uint8_t* data, size_t size, DecodedImage& out);
 bool decode_svg_nano(const uint8_t* data, size_t size, DecodedImage& out,
                      int width, int height);
+bool decode_svg_full(const uint8_t* data, size_t size, DecodedImage& out,
+                     int width, int height);
+bool decode_svg_auto(const uint8_t* data, size_t size, DecodedImage& out,
+                     int width, int height);
+
+/// Registra uma fonte TTF/OTF de assets/ para texto em SVG (LunaSVG).
+bool svg_register_font_asset(const char* family, const std::string& asset,
+                             bool bold = false, bool italic = false);
 
 /// Decodifica bytes em RGBA. `svg_w`/`svg_h` controlam a rasterização SVG:
 /// se ambos forem 0, usa o tamanho natural do documento.
@@ -85,9 +94,15 @@ inline bool decode_image_bytes(const uint8_t* data, size_t size,
     if (!data || size == 0) return false;
     const ImageFormat format = detect_image_format(data, size);
     if (format == ImageFormat::Unknown) return false;
-    if (format == ImageFormat::Webp) return decode_webp_jni(data, size, out);
+    if (format == ImageFormat::Webp) {
+#ifdef APKFAST_WEBP_FULL
+        return decode_webp_full(data, size, out);
+#else
+        return decode_webp_jni(data, size, out);
+#endif
+    }
     if (format == ImageFormat::Svg) {
-        return decode_svg_nano(data, size, out, svg_w, svg_h);
+        return decode_svg_auto(data, size, out, svg_w, svg_h);
     }
 
     int width = 0, height = 0, channels = 0;

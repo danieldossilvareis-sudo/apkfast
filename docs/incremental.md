@@ -1,86 +1,98 @@
-# Build incremental — v2.2.0
+# Build incremental — v2.3.0
 
-O apkfast agora recompila apenas o que mudou. O cache é por **ABI**, por
-**projeto** e por **build dir**, e fica fora do diretório de build (que é
-apagado a cada execução).
+O cache foi reescrito no **schema 2** para ser portável entre checkouts,
+máquinas e diretórios de build. O schema 1 (v2.2.0) é invalidado uma vez.
 
 ## Onde o cache fica
 
-```text
-<build-dir>/../.apkfast-cache/<hash-do-projeto>/<abi>/
-├── cache.json
-├── obj_<hash>.o
-├── obj_<hash>.d
-└── lib<name>.so
-```
-
-Com o build dir padrão:
+Padrão:
 
 ```text
-meu-projeto/build/.apkfast-cache/<hash>/arm64-v8a/
+~/.cache/apkfast/                 # ou $XDG_CACHE_HOME/apkfast
+├── .locks/<projectId>/<abi>.lockdir/
+├── <projectId>/
+│   └── <abi>/
+│       ├── cache.json
+│       └── dep_<key>.d
+└── blobs/<aa>/<sha256>           # .o e .so, sem extensão
 ```
 
-Como `.apkfast-cache` fica ao lado de `build/`, ele sobrevive ao `_clean()`.
-`DEFAULT_IGNORED_DIRS` já ignora `build/` e `.apkfast/`, então nenhum artefato
-é coletado como fonte.
-
-## O que entra na chave
-
-Cada unidade de compilação é identificada por:
-
-- caminho absoluto da fonte
-- comando exato do compilador (flags, includes, std, otimização)
-- identidade do compilador (`--version`, NDK, sysroot, glue)
-- hash de todos os headers do `nativeapp/`
-- hash do conteúdo da fonte
-- estado dos headers do depfile (`-MD -MF`) — caminho + hash do conteúdo
-
-Se um header muda, todas as TUs que o incluem são recompiladas. Se a toolchain,
-as flags ou a ABI mudam, a chave muda.
-
-A linkagem também é cacheada: a chave inclui o comando do linker, os objetos,
-`.a`/`.so` de entrada, libs do projeto, nome da lib e modo de strip. Num build
-sem mudanças, **nenhum clang/llvm-strip é chamado**.
-
-## Uso
+O diretório é configurável:
 
 ```sh
-# cache ligado (padrão)
-python3 apkfast.py build .
-
-# desligar (recompila tudo)
-python3 apkfast.py build . --no-incremental
-
-# apagar só o cache e reconstruir
-python3 apkfast.py build . --clean-cache
+python3 apkfast.py build . --cache-dir /mnt/nfs/apkfast-cache
+python3 apkfast.py build . --cache-mode verify
 ```
-
-`apkfast.json`:
 
 ```json
 {
   "incremental": true,
-  "cleanCache": false
+  "cleanCache": false,
+  "cacheDir": "/mnt/nfs/apkfast-cache",
+  "cacheMode": "verify",
+  "cacheNamespace": "meu-monorepo",
+  "requireCacheSignature": false
 }
 ```
 
-Flags de CLI têm precedência sobre o JSON.
+Precedência: CLI > `apkfast.json` > padrão.
+
+## Chaves portáveis
+
+As chaves **não** contêm caminhos absolutos. Cada caminho é mapeado para um
+token lógico:
+
+```text
+<project>/...   <apkfast>/...   <ndk>/...   <sysroot>/...
+<glue>/...      <work>/...      <cache>/... <vendor>/...
+```
+
+Além disso, o compilador recebe `-ffile-prefix-map` para `__FILE__`/debug info,
+então o objeto gerado numa máquina é byte-idêntico ao de outra com o mesmo
+código e toolchain.
+
+Entram na chave de cada TU:
+
+- caminho lógico e hash da fonte
+- flags canônicas
+- fingerprint da toolchain (`--version`, revisão do NDK, ABI/API, glue)
+- hash de todos os headers do `nativeapp/`
+- estado dos headers do depfile (`-MD -MF`), por caminho lógico + hash
+
+A linkagem também é cacheada por comando canônico, objetos, `.a`/`.so` de
+entrada, libs do projeto, nome da lib e modo de strip.
+
+## Comandos
+
+```sh
+# build normal (cache ligado)
+python3 apkfast.py build .
+
+# ignora leitura/escrita do cache (não apaga nada)
+python3 apkfast.py build . --no-incremental
+
+# apaga somente o cache desta ABI/projeto
+python3 apkfast.py build . --clean-cache
+
+# transporte entre máquinas
+python3 apkfast.py cache-export . -o cache.tar.gz --abi all
+python3 apkfast.py cache-import . cache.tar.gz --cache-dir /mnt/nfs/apkfast
+```
+
+## Cache compartilhado e segurança
+
+Ver [cache-remote.md](cache-remote.md) para `trusted` vs `verify`, HMAC e
+detalhes do formato do bundle.
+
+Resumo:
+
+- `--cache-dir` explícito → modo `verify` por padrão
+- cache local padrão → modo `trusted`
+- `cache-export`/`cache-import` usam `tar.gz` com `manifest.json` + blobs
+- `APKFAST_CACHE_HMAC` assina o manifest; `--require-cache-signature` exige
+- locks por `(projectId, ABI)` funcionam em NFS/sshfs (`mkdir` + TTL)
 
 ## O que continua rodando
 
-`aapt2`, empacotamento do APK, `zipalign` e `apksigner` ainda executam a cada
-build. O ganho está em evitar o compilador C/C++ e o linker, que dominam o
-tempo em projetos grandes.
-
-## Fallback seguro
-
-Cache corrompido, schema diferente, objeto faltando ou header removido causam
-recompilação — nunca falham o build. Escrita de `cache.json` é atômica
-(`tmp` + `os.replace`).
-
-## Limitações
-
-- O cache é local; não há cache remoto/distribuído.
-- Um `.a` próprio alterado invalida a linkagem, mas não as TUs que apenas o
-  declaram via `extern` (o compilador não depende dele).
-- Trocar de `--build-dir` cria outro cache.
+`aapt2`, D8/R8, empacotamento, `zipalign` e `apksigner` executam a cada build.
+O ganho é evitar clang e llvm-strip, que dominam o tempo em projetos grandes.

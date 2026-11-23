@@ -32,6 +32,7 @@
 #pragma once
 
 #include "app.hpp"
+#include "animated_image.hpp"
 
 // Tipos base primeiro (app.hpp e os backends também os incluem, mas a
 // umbrella deve ser autossuficiente mesmo se a ordem interna mudar).

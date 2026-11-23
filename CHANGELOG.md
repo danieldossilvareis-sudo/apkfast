@@ -1,5 +1,36 @@
 # Changelog
 
+## [2.3.0] - 2026-11-23 — Limitações removidas
+
+### Adicionado
+- **WebP animado completo** via libwebp 1.6.0 (`webp-install`, `setup-libs`):
+  `AnimatedImage` com todos os frames, duração, loop, blend/dispose e
+  `update(dt_ms)`; `draw_with_texture()` para texturas externas
+- **SVG completo** via LunaSVG 3.5.0 + patch de filtros (`lunasvg-install`):
+  CSS, texto com TTF de assets, clipPath, mask, pattern e filtros SVG 1.1;
+  NanoSVG permanece como fallback para ícones simples
+- `svg_register_font_asset()`, `decode_svg_full()`, `decode_svg_auto()`
+- **Cache remoto real**: schema 2 com chaves portáveis (paths lógicos,
+  `-ffile-prefix-map`), raiz configurável `--cache-dir`/`cacheDir`,
+  modos `trusted`/`verify`, locks por `(projectId, ABI)` e comandos
+  `cache-export`/`cache-import` com bundle `tar.gz`, HMAC e validação de ELF
+- `docs/cache-remote.md`; `docs/incremental.md` reescrito
+
+### Corrigido
+- `MeshData::quad()` usava V invertido: texturas apareciam de cabeça para baixo.
+  Agora stb/libwebp/LunaSVG renderizam na orientação correta.
+
+### Invalidado
+- Cache da v2.2.0 (schema 1) é descartado uma única vez pelo schema 2.
+
+### Validado
+- dispositivo: `webp=OK 64x64 svg=OK 256x256 font=OK anim=OK frames=3 loop=0`
+- frames do WebP animado avançando (1/3 → 2/3 → 3/3), `0 FATAL`
+- SVG com `<style>`, `!important`, `<text>`, clipPath, mask, pattern e
+  `feDropShadow` renderizado corretamente
+- cache exportado num root e importado noutro reaproveita TUs e link sem chamar
+  clang/llvm-strip
+
 ## [2.2.0] - 2026-11-23 — Build incremental + WebP/SVG
 
 ### Adicionado

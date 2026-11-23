@@ -512,6 +512,7 @@ def create_project(target: Path, config: ProjectConfig) -> None:
                 "libsDir": "libs",
                 "incremental": True,
                 "cleanCache": False,
+                "cacheNamespace": "",
             },
             indent=2,
         )

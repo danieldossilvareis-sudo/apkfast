@@ -30,7 +30,8 @@ armadilhas encontradas em testes reais.
 | [audio-codecs.md](audio-codecs.md) | WAV/OGG/MP3, decode completo e streaming `Music` |
 | [image-formats.md](image-formats.md) | PNG/JPEG, WebP via Android e SVG via NanoSVG |
 | [libraries.md](libraries.md) | Bibliotecas `.a`/`.so` próprias por ABI |
-| [incremental.md](incremental.md) | Cache incremental por hash de fonte/headers |
+| [incremental.md](incremental.md) | Cache incremental portável (schema 2) |
+| [cache-remote.md](cache-remote.md) | Cache compartilhado, bundles e HMAC |
 | [permissions.md](permissions.md) | Permissões runtime, callbacks, estados, todas as engines |
 | [input-helpers.md](input-helpers.md) | Mouse, gamepad analógico, estado de teclas |
 | [sensors.md](sensors.md) | Acelerômetro/giroscópio via callbacks no looper |

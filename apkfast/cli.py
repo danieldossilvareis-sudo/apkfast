@@ -66,6 +66,22 @@ def _add_build_args(parser: argparse.ArgumentParser) -> None:
         help="apaga o cache incremental antes do build",
     )
     parser.add_argument(
+        "--cache-dir",
+        help="raiz do cache (padrão: ~/.cache/apkfast; pode ser NFS/sshfs)",
+    )
+    parser.add_argument(
+        "--cache-mode", choices=("trusted", "verify"), default=None,
+        help="modo de verificação do cache (padrão: trusted local, verify se --cache-dir)",
+    )
+    parser.add_argument(
+        "--cache-namespace", default="",
+        help="isola projetos com o mesmo package (ex.: monorepo)",
+    )
+    parser.add_argument(
+        "--require-cache-signature", action="store_true", default=None,
+        help="exige assinatura HMAC em bundles importados",
+    )
+    parser.add_argument(
         "--abi",
         default="arm64-v8a",
         help="ABI alvo: arm64-v8a, armeabi-v7a, x86, x86_64 ou all (default: arm64-v8a)",
@@ -153,6 +169,10 @@ def _cmd_build(args: argparse.Namespace) -> int:
         assets_dir=Path(args.assets) if args.assets else None,
         incremental=args.incremental,
         clean_cache=args.clean_cache,
+        cache_dir=Path(args.cache_dir) if args.cache_dir else None,
+        cache_mode=args.cache_mode,
+        cache_namespace=args.cache_namespace or "",
+        require_cache_signature=args.require_cache_signature,
         verbose=args.verbose,
         quiet=_quiet(args),
         log=log,
@@ -288,6 +308,8 @@ def _cmd_setup_libs(args: argparse.Namespace) -> int:
     """Baixa/compila raylib + SDL2 + SDL3 para as ABIs pedidas."""
     from .raylib import RaylibError, install as raylib_install
     from .sdl import SDLError, install as sdl_install
+    from .lunasvg import LunaSVGError, install as lunasvg_install
+    from .webp import WebPError, install as webp_install
 
     if args.abis.strip() == "all":
         from .builder import ALL_ABIS
@@ -295,15 +317,20 @@ def _cmd_setup_libs(args: argparse.Namespace) -> int:
         abis = list(ALL_ABIS)
     else:
         abis = [a.strip() for a in args.abis.split(",") if a.strip()] or ["arm64-v8a"]
+    try:
+        lunasvg_install(quiet=_quiet(args))
+    except (LunaSVGError, OSError) as exc:
+        return _fail(f"LunaSVG: {exc}")
     for abi in abis:
         for name, fn in (
             ("raylib", lambda: raylib_install(abi, api=36, quiet=_quiet(args))),
             ("SDL2", lambda: sdl_install(2, abi, api=21, quiet=_quiet(args))),
             ("SDL3", lambda: sdl_install(3, abi, api=21, quiet=_quiet(args))),
+            ("libwebp", lambda: webp_install(abi, api=21, quiet=_quiet(args))),
         ):
             try:
                 fn()
-            except (RaylibError, SDLError, RuntimeError, OSError) as exc:
+            except (RaylibError, SDLError, WebPError, LunaSVGError, RuntimeError, OSError) as exc:
                 return _fail(f"{name} ({abi}): {exc}")
     _say(args, "[✓] Bibliotecas prontas.")
     return 0
@@ -325,6 +352,26 @@ def _cmd_raylib_install(args: argparse.Namespace) -> int:
     try:
         install(abi=args.abi, api=args.api, quiet=_quiet(args))
     except (RaylibError, RuntimeError, OSError) as exc:
+        return _fail(str(exc))
+    return 0
+
+
+def _cmd_lunasvg_install(args: argparse.Namespace) -> int:
+    from .lunasvg import LunaSVGError, install
+
+    try:
+        install(quiet=_quiet(args))
+    except (LunaSVGError, OSError) as exc:
+        return _fail(str(exc))
+    return 0
+
+
+def _cmd_webp_install(args: argparse.Namespace) -> int:
+    from .webp import WebPError, install
+
+    try:
+        install(abi=args.abi, api=args.api, quiet=_quiet(args))
+    except (WebPError, RuntimeError, OSError) as exc:
         return _fail(str(exc))
     return 0
 
@@ -391,6 +438,112 @@ def _cmd_info(args: argparse.Namespace) -> int:
     if result.returncode != 0:
         return _fail(f"aapt2 dump badging falhou ({result.returncode})")
     return 0
+
+
+def _cache_transport_context(args: argparse.Namespace) -> tuple[object, list[str]]:
+    """Resolve projeto/manifesto/cache para cache-export/import (sem toolchain)."""
+    from . import cache as cache_mod
+    from .builder import ALL_ABIS, _native_lib_name, _read_project_config
+    from .manifest import parse_manifest
+
+    project = Path(args.project).expanduser().resolve()
+    manifest_path = project / "AndroidManifest.xml"
+    if not manifest_path.is_file():
+        raise ValueError(f"AndroidManifest.xml não encontrado em {project}")
+    manifest = parse_manifest(manifest_path)
+    config = _read_project_config(project)
+
+    raw_abis = [a.strip() for a in args.abis.split(",") if a.strip()]
+    if args.abi == "all" and not raw_abis:
+        abis = list(ALL_ABIS)
+    elif raw_abis:
+        abis = raw_abis
+    else:
+        abis = [args.abi]
+    invalid = [abi for abi in abis if abi not in ALL_ABIS]
+    if invalid:
+        raise ValueError(f"ABI(s) inválida(s): {', '.join(invalid)}")
+
+    cache_dir = Path(args.cache_dir) if getattr(args, "cache_dir", None) else None
+    if cache_dir is None and config.get("cacheDir"):
+        cache_dir = Path(config["cacheDir"])
+    cache_mode = getattr(args, "cache_mode", None) or config.get("cacheMode")
+    namespace = getattr(args, "cache_namespace", "") or config.get("cacheNamespace", "")
+    require_sig = getattr(args, "require_cache_signature", None)
+    if require_sig is None:
+        require_sig = config.get("requireCacheSignature", False)
+
+    ctx = cache_mod.resolve_context(
+        project,
+        package=manifest.package,
+        lib_name=_native_lib_name(manifest, project),
+        abis=abis,
+        cache_dir=cache_dir,
+        cache_mode=cache_mode,
+        namespace=namespace or "",
+        require_signature=bool(require_sig),
+    )
+    return ctx, abis
+
+
+def _cmd_cache_export(args: argparse.Namespace) -> int:
+    from . import cache as cache_mod
+
+    try:
+        ctx, abis = _cache_transport_context(args)
+        locks = cache_mod.acquire_all(ctx, abis)
+        try:
+            manifest = cache_mod.export_bundle(ctx, Path(args.output), abis)
+        finally:
+            cache_mod.release_all(locks)
+    except (ValueError, cache_mod.CacheError, OSError) as exc:
+        return _fail(f"Falha ao exportar cache: {exc}")
+    print(
+        f"[✓] Bundle: {args.output} "
+        f"({len(manifest['blobs'])} blobs, ABIs: {', '.join(sorted(abis))})"
+    )
+    return 0
+
+
+def _cmd_cache_import(args: argparse.Namespace) -> int:
+    from . import cache as cache_mod
+
+    try:
+        ctx, abis = _cache_transport_context(args)
+        locks = cache_mod.acquire_all(ctx, abis)
+        try:
+            stats = cache_mod.import_bundle(
+                ctx,
+                Path(args.bundle),
+                abis=abis,
+                force=args.force,
+                require_signature=args.require_cache_signature,
+            )
+        finally:
+            cache_mod.release_all(locks)
+    except (ValueError, cache_mod.CacheError, OSError) as exc:
+        return _fail(f"Falha ao importar cache: {exc}")
+    print(
+        f"[✓] Cache importado: {stats['imported']} novo(s), "
+        f"{stats['skipped']} já existente(s), {stats['rejected']} rejeitado(s)"
+    )
+    return 0
+
+
+def _add_cache_transport_args(parser: argparse.ArgumentParser, *, export: bool) -> None:
+    parser.add_argument("project", nargs="?", default=".", help="diretório do projeto")
+    if export:
+        parser.add_argument("-o", "--output", required=True, help="arquivo .tar.gz de saída")
+    else:
+        parser.add_argument("bundle", help="arquivo .tar.gz de entrada")
+        parser.add_argument("--force", action="store_true", help="aceita projectId diferente")
+    parser.add_argument("--cache-dir", help="raiz do cache (sobrescreve apkfast.json)")
+    parser.add_argument("--cache-mode", choices=("trusted", "verify"), default=None)
+    parser.add_argument("--cache-namespace", default="")
+    parser.add_argument("--require-cache-signature", action="store_true", default=None)
+    parser.add_argument("--abi", default="arm64-v8a", help="ABI alvo ou all")
+    parser.add_argument("--abis", default="", help="lista de ABIs separadas por vírgula")
+    _add_quiet(parser)
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -488,6 +641,24 @@ def create_parser() -> argparse.ArgumentParser:
     p_ray.add_argument("--api", type=int, default=36, help="API Android (default: 36)")
     _add_quiet(p_ray)
     p_ray.set_defaults(func=_cmd_raylib_install)
+
+    p_cache_export = sub.add_parser("cache-export", help="exporta o cache para .tar.gz")
+    _add_cache_transport_args(p_cache_export, export=True)
+    p_cache_export.set_defaults(func=_cmd_cache_export)
+
+    p_cache_import = sub.add_parser("cache-import", help="importa cache de .tar.gz")
+    _add_cache_transport_args(p_cache_import, export=False)
+    p_cache_import.set_defaults(func=_cmd_cache_import)
+
+    p_luna = sub.add_parser("lunasvg-install", help="prepara LunaSVG (SVG completo)")
+    _add_quiet(p_luna)
+    p_luna.set_defaults(func=_cmd_lunasvg_install)
+
+    p_webp = sub.add_parser("webp-install", help="compila libwebp (WebP animado) para Android")
+    p_webp.add_argument("--abi", default="arm64-v8a", help="ABI alvo (default: arm64-v8a)")
+    p_webp.add_argument("--api", type=int, default=21, help="API Android (default: 21)")
+    _add_quiet(p_webp)
+    p_webp.set_defaults(func=_cmd_webp_install)
 
     p_logs = sub.add_parser("logs", help="mostra logs/crash do dispositivo")
     p_logs.add_argument("--adb", help="caminho explícito do adb")

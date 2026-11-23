@@ -13,10 +13,13 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import cache as cache_mod
 from .manifest import ManifestInfo, is_native_activity, parse_manifest
 from .toolchain import NDK_ARCH_DIR, Toolchain, detect
 
-DEFAULT_IGNORED_DIRS = {".git", "build", "obj", ".apkfast", "gradle", ".gradle"}
+DEFAULT_IGNORED_DIRS = {
+    ".git", "build", "obj", ".apkfast", ".apkfast-cache", "gradle", ".gradle"
+}
 ALL_ABIS = ("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
 CPP_SUFFIXES = (".cpp", ".cc", ".cxx", ".c++", ".C")
 # zipalign antigos rejeitam -P com uma destas mensagens; qualquer outra falha
@@ -92,6 +95,11 @@ class BuildOptions:
     assets_dir: Path | None = None
     incremental: bool | None = None  # None = usar apkfast.json (default: true)
     clean_cache: bool = False
+    cache_dir: Path | None = None
+    cache_mode: str | None = None
+    cache_namespace: str = ""
+    require_cache_signature: bool | None = None
+    cache_ctx: cache_mod.CacheContext | None = None  # resolvido em build()
     verbose: bool = False
     quiet: bool = False
     log: Logger | None = None
@@ -169,116 +177,6 @@ def _clean(path: Path) -> None:
         raise BuildError(f"Falha ao criar {path}: {exc}") from exc
 
 
-_CACHE_SCHEMA = 1
-
-
-def _sha256_file(path: Path) -> str:
-    """Hash de arquivo em streaming (headers NDK podem ser grandes)."""
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(65536), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
-
-
-def _cache_dir(work: Path, project: Path, abi: str) -> Path:
-    """Cache fora de `work`, que é apagado por `_clean()` a cada build."""
-    project_key = _sha256_text(str(project))[:12]
-    return work.parent / ".apkfast-cache" / project_key / abi
-
-
-def _read_cache(path: Path) -> dict:
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        data = {}
-    if not isinstance(data, dict) or data.get("schema") != _CACHE_SCHEMA:
-        return {"schema": _CACHE_SCHEMA, "objects": {}}
-    if not isinstance(data.get("objects"), dict):
-        data["objects"] = {}
-    return data
-
-
-def _write_cache(path: Path, cache: dict) -> None:
-    """Escrita atômica: um build interrompido não corrompe o cache."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    try:
-        tmp.write_text(json.dumps(cache, sort_keys=True))
-        os.replace(tmp, path)
-    except OSError:
-        # Cache é otimização: falhar ao gravar nunca deve quebrar o build.
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-
-
-def _parse_depfile(path: Path) -> list[Path]:
-    """Lê o Makefile gerado por clang -MD (-MF) e devolve os headers."""
-    try:
-        text = path.read_text(errors="ignore")
-    except OSError:
-        return []
-    # Continuações de linha viram espaço antes da tokenização.
-    text = text.replace("\\\n", " ")
-    if ":" not in text:
-        return []
-    body = text.split(":", 1)[1]
-    tokens: list[str] = []
-    current: list[str] = []
-    index = 0
-    while index < len(body):
-        char = body[index]
-        if char == "\\" and index + 1 < len(body):
-            current.append(body[index + 1])
-            index += 2
-            continue
-        if char.isspace():
-            if current:
-                tokens.append("".join(current))
-                current = []
-            index += 1
-            continue
-        current.append(char)
-        index += 1
-    if current:
-        tokens.append("".join(current))
-    return [Path(token) for token in tokens if Path(token).is_file()]
-
-
-def _dep_state(paths: list[str]) -> list[list[str]]:
-    """Estado atual dos headers de um depfile: [caminho, hash do conteúdo]."""
-    state: list[list[str]] = []
-    for raw in paths:
-        path = Path(raw)
-        if not path.is_file():
-            return []
-        state.append([raw, _sha256_file(path)])
-    return state
-
-
-def _compiler_key(compiler: Path, tc: "Toolchain", log: Logger) -> str:
-    """Identifica o compilador de forma barata, sem poluir a saída."""
-    result = _execute([compiler, "--version"], log, capture=True)
-    version = result.stdout if result.returncode == 0 else ""
-    return _sha256_text(
-        "|".join(
-            str(part)
-            for part in (
-                compiler,
-                version,
-                tc.ndk_dir,
-                tc.sysroot,
-                tc.native_app_glue_dir(),
-            )
-        )
-    )
-
-
 def _api_headers_key(api_include: Path) -> str:
     """Hash de todos os headers/impls do nativeapp (invalidam a detecção)."""
     if not api_include.is_dir():
@@ -288,7 +186,7 @@ def _api_headers_key(api_include: Path) -> str:
         if path.suffix not in (".h", ".hpp", ".c", ".cpp"):
             continue
         digest.update(str(path.relative_to(api_include)).encode("utf-8", "replace"))
-        digest.update(_sha256_file(path).encode("ascii"))
+        digest.update(cache_mod.sha256_file(path).encode("ascii"))
     return digest.hexdigest()
 
 
@@ -570,29 +468,53 @@ def _native_build(
             sources.append(injected)
             log.detail(f"[*] TU third-party do nativeapp injetado ({impl_name}).")
 
+    # LunaSVG: 2 TUs amalgamadas (C + C++) quando preparadas por lunasvg-install.
+    luna_dir = Path(__file__).resolve().parent.parent / "vendor" / "lunasvg"
+    luna_c = luna_dir / "unity" / "plutovg_all.c"
+    luna_cpp = luna_dir / "unity" / "lunasvg_all.cpp"
+    use_svg_full = (
+        options.use_nativeapp and luna_c.is_file() and luna_cpp.is_file()
+    )
+    if use_svg_full:
+        sources += [luna_c, luna_cpp]
+        log.detail("[*] LunaSVG injetado (SVG com CSS/texto/clip/mask/pattern).")
+
     native_dir = work / "native" / NDK_ARCH_DIR[tc.abi]
     native_dir.mkdir(parents=True, exist_ok=True)
     objects: list[Path] = []
 
-    # Cache incremental vive FORA de work (que é apagado por _clean()).
-    cache_dir = _cache_dir(work, project, tc.abi)
-    if options.clean_cache or options.incremental is False:
-        if cache_dir.is_dir():
-            shutil.rmtree(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = cache_dir / "cache.json"
-    cache = _read_cache(cache_file)
+    ctx = options.cache_ctx
+    if ctx is None:
+        raise BuildError("Contexto de cache não foi resolvido")
+    abi = tc.abi
+    root = Path(__file__).resolve().parent.parent
+    api_include = root / "include"
+    roots = cache_mod.make_roots(
+        project=project, apkfast_root=root, tc=tc, work=work, cache_root=ctx.root
+    )
+    api_key = _api_headers_key(api_include) if options.use_nativeapp else ""
+    cache_data = cache_mod.read_cache(ctx, abi)
 
     def save_cache() -> None:
-        _write_cache(cache_file, cache)
+        cache_mod.write_cache(ctx, abi, cache_data)
 
-    compiler_keys: dict[str, str] = {}
+    compiler_fps: dict[str, str] = {}
 
-    def compiler_key_for(compiler: Path) -> str:
+    def compiler_fp(compiler: Path) -> str:
         key = str(compiler)
-        if key not in compiler_keys:
-            compiler_keys[key] = _compiler_key(compiler, tc, log)
-        return compiler_keys[key]
+        if key not in compiler_fps:
+            glue_source = tc.native_app_glue_dir() / "android_native_app_glue.c"
+            compiler_fps[key] = cache_mod.compiler_fingerprint(
+                compiler,
+                abi=abi,
+                api=tc.api,
+                target_flags=tc.clang_target_flags(
+                    explicit_target=compiler.name.startswith("clang")
+                ),
+                glue_source=glue_source,
+                roots=roots,
+            )
+        return compiler_fps[key]
 
     def compile_unit(
         source: Path,
@@ -601,50 +523,66 @@ def _native_build(
         flags: list[str],
         extra_key: str = "",
     ) -> Path:
-        """Compila uma TU com cache por hash de fonte, flags e headers."""
-        base_cmd = [compiler, "-c", str(source), *flags]
-        cmd_key = _sha256_text(json.dumps([str(part) for part in base_cmd]))
-        key = _sha256_text(
-            "|".join(
-                (
-                    str(source.resolve()),
-                    cmd_key,
-                    compiler_key_for(compiler),
-                    api_key,
-                    extra_key,
-                )
-            )
+        """Compila uma TU com chave portável por fonte/flags/headers."""
+        source_hash = cache_mod.sha256_file(source)
+        key = cache_mod.object_key(
+            source=source,
+            flags=flags,
+            compiler_fp=compiler_fp(compiler),
+            api_key=api_key,
+            abi=abi,
+            api=tc.api,
+            project_key=ctx.project_id,
+            roots=roots,
+            extra_key=extra_key,
         )
-        obj = cache_dir / f"obj_{key[:20]}.o"
-        dep = cache_dir / f"obj_{key[:20]}.d"
-        entry = cache["objects"].get(key)
+        dep = ctx.depfile(abi, key)
+        dep.parent.mkdir(parents=True, exist_ok=True)
+        entry = cache_data["objects"].get(key)
         reused = False
-        if (
-            options.incremental is not False
-            and isinstance(entry, dict)
-            and entry.get("src_hash") == _sha256_file(source)
-            and obj.is_file()
-        ):
-            old_state = entry.get("dep_state")
-            new_state = _dep_state(entry.get("deps", []))
-            reused = bool(old_state) and old_state == new_state
-        if reused:
+        obj_path: Path | None = None
+        if options.incremental is not False and isinstance(entry, dict):
+            try:
+                obj_path = cache_mod.ensure_blob(
+                    ctx, entry.get("obj_blob"), abi=abi, check_elf=False
+                )
+                state = cache_mod.verify_dep_state(entry.get("deps_state", []), roots)
+                digest_state = cache_mod.sha256_text(
+                    json.dumps(state, sort_keys=True, separators=(",", ":"))
+                )
+                reused = (
+                    entry.get("src_hash") == source_hash
+                    and entry.get("deps_digest") == digest_state
+                )
+            except (cache_mod.CacheError, OSError):
+                reused = False
+                obj_path = None
+        if reused and obj_path is not None:
             log.detail(f"[cache] reuso: {source.name}")
-            return obj
+            return obj_path
 
-        cmd = base_cmd[:2] + ["-o", str(obj), "-MD", "-MF", str(dep)] + base_cmd[2:]
+        obj_tmp = ctx.abi_dir(abi) / f"obj_{key[:20]}.o"
+        cmd = [compiler, "-c", str(source), "-o", str(obj_tmp),
+               "-MD", "-MF", str(dep), *flags]
         _run(cmd, log)
-        deps = [str(path) for path in _parse_depfile(dep)]
-        cache["objects"][key] = {
-            "src": str(source),
-            "src_hash": _sha256_file(source),
-            "cmd_key": cmd_key,
+        obj_path = ctx.blob_path(cache_mod.write_blob(ctx, obj_tmp.read_bytes()))
+        obj_tmp.unlink(missing_ok=True)
+
+        deps = cache_mod.parse_depfile(dep)
+        state = cache_mod.dep_state(deps, roots)
+        cache_data["objects"][key] = {
+            "src": cache_mod.logical_path(source, roots),
+            "src_hash": source_hash,
             "deps": deps,
-            "dep_state": _dep_state(deps),
-            "obj": obj.name,
+            "deps_state": state,
+            "deps_digest": cache_mod.sha256_text(
+                json.dumps(state, sort_keys=True, separators=(",", ":"))
+            ),
+            "obj_blob": obj_path.name,
+            "abi": abi,
         }
         save_cache()
-        return obj
+        return obj_path
 
     optimization = {
         "none": "-O0 -g",
@@ -692,11 +630,15 @@ def _native_build(
         return tc.clang_target_flags(explicit_target=compiler.name.startswith("clang"))
 
     # Diretório da API nativeapp (headers ficam em <raiz do apkfast>/include).
-    root = Path(__file__).resolve().parent.parent
-    api_include = root / "include"
-    api_key = _api_headers_key(api_include) if options.use_nativeapp else ""
     raylib_dir = root / "vendor" / "raylib"
     raylib_static = raylib_dir / "lib" / f"libraylib-{tc.abi}.a"
+    webp_dir = root / "vendor" / "webp"
+    webp_inc = webp_dir / "include"
+    webp_demux = webp_dir / "lib" / f"libwebpdemux-{tc.abi}.a"
+    webp_decoder = webp_dir / "lib" / f"libwebpdecoder-{tc.abi}.a"
+    use_webp_full = (
+        options.use_nativeapp and webp_demux.is_file() and webp_decoder.is_file()
+    )
 
     common_flags = [
         *optimization.split(),
@@ -706,11 +648,33 @@ def _native_build(
         f"-I{project / 'src' / 'main' / 'cpp'}",
         f"-I{tc.native_app_glue_dir()}",
         *( [f"-I{api_include}"] if options.use_nativeapp and api_include.is_dir() else [] ),
+        *( [f"-I{webp_inc}", "-DAPKFAST_WEBP_FULL=1"] if use_webp_full else [] ),
+        *(
+            [
+                "-DAPKFAST_SVG_FULL=1",
+                "-DLUNASVG_BUILD", "-DLUNASVG_BUILD_STATIC",
+                "-DLUNASVG_DISABLE_LOAD_SYSTEM_FONTS",
+                "-DLUNASVG_DISABLE_EXTERNAL_RESOURCES",
+                "-DPLUTOVG_BUILD", "-DPLUTOVG_BUILD_STATIC",
+                "-DPLUTOVG_DISABLE_FONT_FACE_CACHE_LOAD",
+                f"-I{luna_dir / 'include'}",
+                f"-I{luna_dir / 'src' / 'include'}",
+                f"-I{luna_dir / 'src' / 'source'}",
+                f"-I{luna_dir / 'src' / 'plutovg' / 'include'}",
+                f"-I{luna_dir / 'src' / 'plutovg' / 'source'}",
+            ] if use_svg_full else []
+        ),
         *( [f"-I{raylib_dir / 'include'}"] if uses_raylib and raylib_dir.is_dir() else [] ),
         *( [f"-I{root / 'vendor' / 'sdl2' / 'include'}"]
            if uses_sdl2 and (root / 'vendor' / 'sdl2' / 'include').is_dir() else [] ),
         *( [f"-I{root / 'vendor' / 'sdl3' / 'include'}"]
            if uses_sdl3 and (root / 'vendor' / 'sdl3' / 'include').is_dir() else [] ),
+        # Caminhos determinísticos em __FILE__/debug info: essencial para um
+        # objeto compilado numa máquina ser reaproveitado noutra.
+        f"-ffile-prefix-map={project}=<project>",
+        f"-ffile-prefix-map={root}=<apkfast>",
+        f"-ffile-prefix-map={tc.ndk_dir}=<ndk>",
+        "-fdebug-compilation-dir=<project>",
         *options.extra_cflags,
     ]
 
@@ -748,10 +712,10 @@ def _native_build(
 
     lib_name = _native_lib_name(manifest, project)
     output = native_dir / f"lib{lib_name}.so"
-    cached_so = cache_dir / f"lib{lib_name}.so"
+    so_tmp = ctx.abi_dir(abi) / f"lib{lib_name}.link.so"
     has_cpp = any(s.suffix in CPP_SUFFIXES for s in sources)
     linker = tc.clang(cpp=has_cpp)
-    cmd = [linker, "-shared", "-o", str(cached_so)]
+    cmd = [linker, "-shared", "-o", str(so_tmp)]
     cmd += compiler_flags(linker)
     cmd += [
         "-Wl,--gc-sections",
@@ -770,6 +734,8 @@ def _native_build(
         # Bibliotecas estáticas do projeto: antes das libs do sistema para
         # que os símbolos sejam resolvidos na ordem correta.
         *[str(lib) for lib in project_statics],
+        # libwebp (WebP animado): demux depende do decoder, nessa ordem.
+        *([str(webp_demux), str(webp_decoder)] if use_webp_full else []),
         "-lm",
         "-ldl",
         "-landroid",
@@ -833,44 +799,52 @@ def _native_build(
         # falha com "cannot locate symbol vkCreateInstance". Forçamos o
         # DT_NEEDED com --no-as-needed.
         cmd += ["-Wl,--no-as-needed", "-lvulkan", "-Wl,--as-needed"]
-    # O link também é cacheado: inclui flags, objetos, .a/.so de entrada e
-    # modo de strip; assim um build sem mudanças não chama clang nem llvm-strip.
+    # Link cacheado com chave portável e blob verificado.
     strip = tc.ndk_toolchain_bin / "llvm-strip"
     strip_mode = ""
     if (options.optimize != "none" or options.obfuscate) and strip.is_file():
         strip_mode = "--strip-all" if options.obfuscate else "--strip-unneeded"
 
-    link_files = objects + [
+    link_files = list(objects) + [
         Path(part) for part in cmd
-        # O próprio -o não é input: ele ainda não existia no link anterior.
-        if part != str(cached_so)
+        if part != str(so_tmp)
         and Path(part).is_file()
         and Path(part).suffix in (".a", ".so")
     ] + list(extra_libs)
-    link_state = (
-        [str(part) for part in cmd]
-        + [compiler_key_for(linker), strip_mode, lib_name]
-        + [_sha256_file(lib) for lib in dict.fromkeys(link_files) if lib.is_file()]
+    key = cache_mod.link_key(
+        command=cmd,
+        inputs=link_files,
+        compiler_fp=compiler_fp(linker),
+        strip_mode=strip_mode,
+        lib_name=lib_name,
+        abi=abi,
+        project_key=ctx.project_id,
+        roots=roots,
     )
-    link_key = _sha256_text(json.dumps(link_state))
-    link_entry = cache.get("link")
-    reuse_link = (
-        options.incremental is not False
-        and isinstance(link_entry, dict)
-        and link_entry.get("key") == link_key
-        and cached_so.is_file()
-        and link_entry.get("so_hash") == _sha256_file(cached_so)
-    )
-    if reuse_link:
+    link_entry = cache_data.get("link")
+    cached_so: Path | None = None
+    reuse_link = False
+    if options.incremental is not False and isinstance(link_entry, dict):
+        try:
+            if link_entry.get("key") == key:
+                cached_so = cache_mod.ensure_blob(ctx, link_entry.get("so_blob"), abi=abi)
+                reuse_link = True
+        except (cache_mod.CacheError, OSError):
+            cached_so = None
+    if reuse_link and cached_so is not None:
         log.detail(f"[cache] reuso: lib{lib_name}.so")
     else:
+        log.detail(f"[cache] link miss: salvo={link_entry.get('key') if isinstance(link_entry, dict) else None} novo={key}")
         _run(cmd, log)
         if strip_mode:
-            _run([strip, strip_mode, str(cached_so)], log)
-        cache["link"] = {
-            "key": link_key,
-            "so": cached_so.name,
-            "so_hash": _sha256_file(cached_so),
+            _run([strip, strip_mode, str(so_tmp)], log)
+        cached_so = ctx.blob_path(cache_mod.write_blob(ctx, so_tmp.read_bytes()))
+        so_tmp.unlink(missing_ok=True)
+        cache_data["link"] = {
+            "key": key,
+            "lib": lib_name,
+            "so_blob": cached_so.name,
+            "abi": abi,
         }
         save_cache()
 
@@ -1263,6 +1237,26 @@ def build(options: BuildOptions) -> Path:
         if not isinstance(config["cleanCache"], bool):
             raise BuildError("'cleanCache' em apkfast.json deve ser true ou false.")
         options.clean_cache = options.clean_cache or config["cleanCache"]
+    if options.cache_dir is None and config.get("cacheDir"):
+        raw = config["cacheDir"]
+        if not isinstance(raw, str) or not raw.strip():
+            raise BuildError("'cacheDir' em apkfast.json deve ser um texto não vazio.")
+        options.cache_dir = Path(raw)
+    if options.cache_mode is None and config.get("cacheMode"):
+        raw = config["cacheMode"]
+        if not isinstance(raw, str) or raw.lower() not in ("trusted", "verify"):
+            raise BuildError("'cacheMode' deve ser 'trusted' ou 'verify'.")
+        options.cache_mode = raw.lower()
+    if not options.cache_namespace and config.get("cacheNamespace"):
+        raw = config["cacheNamespace"]
+        if not isinstance(raw, str):
+            raise BuildError("'cacheNamespace' deve ser um texto.")
+        options.cache_namespace = raw
+    if options.require_cache_signature is None and "requireCacheSignature" in config:
+        raw = config["requireCacheSignature"]
+        if not isinstance(raw, bool):
+            raise BuildError("'requireCacheSignature' deve ser true ou false.")
+        options.require_cache_signature = raw
 
     abis = options.selected_abis()
     if not abis:
@@ -1291,45 +1285,75 @@ def build(options: BuildOptions) -> Path:
         raise BuildError(
             f"--build-dir não pode ser o projeto nem um ancestral dele: {work}"
         )
-    # Validações e detecção da toolchain terminaram antes de qualquer limpeza.
-    lock = _acquire_build_lock(work)
+    # Cache compartilhado precisa de locks próprios, adquiridos antes do lock
+    # de work (que protege apenas _clean()).
     try:
-        _clean(work)
-        (work / "apk").mkdir(parents=True, exist_ok=True)
+        ctx = cache_mod.resolve_context(
+            project,
+            package=manifest.package,
+            lib_name=_native_lib_name(manifest, project),
+            abis=abis,
+            cache_dir=options.cache_dir,
+            cache_mode=options.cache_mode,
+            namespace=options.cache_namespace,
+            require_signature=bool(options.require_cache_signature),
+        )
+    except cache_mod.CacheError as exc:
+        raise BuildError(str(exc)) from exc
+    if ctx.root == work or work in ctx.root.parents:
+        raise BuildError(
+            f"--cache-dir não pode ficar dentro de --build-dir: {ctx.root} dentro de {work}"
+        )
+    options.cache_ctx = ctx
+    if not ctx.writable:
+        log.warn(f"[!] Cache somente leitura ({ctx.root}); usando modo verify sem gravação.")
 
-        log.info("[*] Toolchain:")
-        for line in tc.summary().splitlines():
-            log.detail(f"    {line}")
-
-        flats = _compile_resources(tc, project, work / "res", work, log)
-        dex = _compile_java(tc, options, work, log)
-
-        for abi in abis:
-            abi_tc = tc.for_abi(abi)
-            lib, extra_libs = _native_build(abi_tc, options, project, work, manifest)
-            _stage_native_lib(work, abi, lib, extra_libs)
-
-        log.info("[*] Empacotando APK...")
-        unsigned = _link_apk(tc, options, work, manifest_path, manifest, flats, dex)
-        _add_extra_files_with_zip(unsigned, work / "apk")
-
-        log.info("[*] Alinhando e assinando...")
-        signed = _align_and_sign(tc, options, work, unsigned)
-
-        suffix = "all" if len(abis) > 1 else abis[0]
-        if options.release:
-            suffix += "-release"
-        output = options.output or (project / "dist" / f"{manifest.package.split('.')[-1]}-{suffix}.apk")
-        output = output.expanduser().resolve()
-        if output == project or output in project.parents:
-            raise BuildError(f"--output não pode ser o projeto nem um ancestral dele: {output}")
+    cache_locks = cache_mod.acquire_all(ctx, abis)
+    try:
+        if options.clean_cache:
+            for abi in abis:
+                cache_mod.clear_abi(ctx, abi)
+        # Validações e detecção da toolchain terminaram antes de qualquer limpeza.
+        lock = _acquire_build_lock(work)
         try:
-            output.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(signed, output)
-        except OSError as exc:
-            raise BuildError(f"Falha ao gravar APK final {output}: {exc}") from exc
-        size = output.stat().st_size / 1024
-        log.info(f"[✓] APK final: {output} ({size:.1f} KiB)")
-        return output
+            _clean(work)
+            (work / "apk").mkdir(parents=True, exist_ok=True)
+
+            log.info("[*] Toolchain:")
+            for line in tc.summary().splitlines():
+                log.detail(f"    {line}")
+
+            flats = _compile_resources(tc, project, work / "res", work, log)
+            dex = _compile_java(tc, options, work, log)
+
+            for abi in abis:
+                abi_tc = tc.for_abi(abi)
+                lib, extra_libs = _native_build(abi_tc, options, project, work, manifest)
+                _stage_native_lib(work, abi, lib, extra_libs)
+
+            log.info("[*] Empacotando APK...")
+            unsigned = _link_apk(tc, options, work, manifest_path, manifest, flats, dex)
+            _add_extra_files_with_zip(unsigned, work / "apk")
+
+            log.info("[*] Alinhando e assinando...")
+            signed = _align_and_sign(tc, options, work, unsigned)
+
+            suffix = "all" if len(abis) > 1 else abis[0]
+            if options.release:
+                suffix += "-release"
+            output = options.output or (project / "dist" / f"{manifest.package.split('.')[-1]}-{suffix}.apk")
+            output = output.expanduser().resolve()
+            if output == project or output in project.parents:
+                raise BuildError(f"--output não pode ser o projeto nem um ancestral dele: {output}")
+            try:
+                output.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(signed, output)
+            except OSError as exc:
+                raise BuildError(f"Falha ao gravar APK final {output}: {exc}") from exc
+            size = output.stat().st_size / 1024
+            log.info(f"[✓] APK final: {output} ({size:.1f} KiB)")
+            return output
+        finally:
+            _release_build_lock(lock)
     finally:
-        _release_build_lock(lock)
+        cache_mod.release_all(cache_locks)

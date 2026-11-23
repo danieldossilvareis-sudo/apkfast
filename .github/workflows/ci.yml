@@ -20,6 +20,12 @@ jobs:
           python3 apkfast.py --help
           python3 apkfast.py build --help
           python3 apkfast.py setup-libs --help
+          python3 apkfast.py cache-export --help
+          python3 apkfast.py cache-import --help
+          python3 apkfast.py webp-install --help
+          python3 apkfast.py lunasvg-install --help
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
 
   examples:
     runs-on: ubuntu-latest

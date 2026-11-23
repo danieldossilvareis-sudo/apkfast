@@ -1,7 +1,7 @@
 # apkfast
 
 [![CI](https://github.com/danieldossilvareis-sudo/apkfast/actions/workflows/ci.yml/badge.svg)](https://github.com/danieldossilvareis-sudo/apkfast/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-2.2.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.3.0-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 CLI para **montar, compilar, otimizar e entregar APKs sem Gradle**, com suporte
@@ -35,7 +35,7 @@ python3 apkfast.py setup-sdk --list-versions
 # Verifica o ambiente
 python3 apkfast.py doctor
 
-# (Opcional) Bibliotecas pré-compiladas: raylib + SDL2 + SDL3
+# (Opcional) Bibliotecas avançadas: raylib + SDL2 + SDL3 + libwebp + LunaSVG
 python3 apkfast.py setup-libs --abis all       # ou --abis arm64-v8a
 
 # Link global (Termux)
@@ -120,8 +120,9 @@ APP_MAIN(App)
 Documentação completa:
 - [Guias individuais de cada helper](docs/README.md) — recomendado
   (inclui [bibliotecas próprias](docs/libraries.md),
-  [imagens WebP/SVG](docs/image-formats.md) e
-  [build incremental](docs/incremental.md))
+  [WebP animado/SVG completo](docs/image-formats.md),
+  [build incremental](docs/incremental.md) e
+  [cache remoto](docs/cache-remote.md))
 - [Referência consolidada da API](include/nativeapp/README.md)
 Exemplos: `examples/nativeapp-gl`, `examples/nativeapp-vulkan`,
 `examples/nativeapp-advanced` (Mesh/Material/matrizes/dt/Scene) e
@@ -131,10 +132,11 @@ A API agora inclui `Shader`, `Mesh`, `Texture`, `GLContext`, `GraphicsPipeline`
 Vulkan com depth + 2 frames in-flight, matemática `Mat4`, `on_update(dt)`,
 input polling, assets via `AAssetManager`, **`TextInput`** (teclado virtual
 via JNI, sem EditText), **áudio** (AAudio + OpenSLES), **imagens** PNG/JPEG,
-**WebP** (via `BitmapFactory`) e **SVG** (via NanoSVG), **sensores**,
-**gamepad/mouse** e **device** (vibração/bateria/orientação).
-Exemplos: `examples/text-input-hello`, `examples/device-demo` e
-`examples/image-demo`. Veja a [documentação completa](include/nativeapp/README.md).
+**WebP estático e animado** (libwebp), **SVG completo** (LunaSVG: CSS, texto,
+clip/mask/pattern/filtros), **sensores**, **gamepad/mouse** e **device**
+(vibração/bateria/orientação). Exemplos: `examples/text-input-hello`,
+`examples/device-demo` e `examples/image-demo`. Veja a
+[documentação completa](include/nativeapp/README.md).
 
 A API de permissões também funciona com **raylib** (`GetAndroidApp()`) e
 **SDL2/SDL3** (`JniPermissions` via `SDL_AndroidGetActivity()` /
@@ -167,6 +169,10 @@ python3 ../../apkfast.py install dist/native-hello.apk -g
 
 # Inspeciona o APK
 python3 ../../apkfast.py info dist/native-hello.apk
+
+# Cache remoto/compartilhado
+python3 ../../apkfast.py cache-export . -o cache.tar.gz --abi all
+python3 ../../apkfast.py cache-import . cache.tar.gz --cache-dir /mnt/nfs/apkfast
 ```
 
 ## Estrutura esperada do projeto
@@ -203,6 +209,9 @@ de `apkfast.json` (`nativeLibraryName`) ou usa `main` como padrão.
 | `--assets` | diretório de assets |
 | `--no-incremental` | desliga o cache incremental (padrão: ligado) |
 | `--clean-cache` | apaga o cache incremental antes do build |
+| `--cache-dir` / `--cache-mode` | raiz compartilhada e modo `trusted`/`verify` |
+| `--cache-namespace` | isola projetos com o mesmo package |
+| `--require-cache-signature` | exige HMAC em cache importado |
 | `--lib` / `--libs-dir` | bibliotecas `.a`/`.so` próprias (repitível) |
 
 O keystore de debug é criado automaticamente em `~/.apkfast/debug.jks`.
