@@ -593,7 +593,7 @@ def _cmd_setup_libs(args: argparse.Namespace) -> int:
         return _fail(f"LunaSVG: {exc}")
     for abi in abis:
         for name, fn in (
-            ("raylib", lambda: raylib_install(abi, api=36, quiet=_quiet(args))),
+            ("raylib", lambda: raylib_install(abi, api=21, quiet=_quiet(args))),
             ("SDL2", lambda: sdl_install(2, abi, api=21, quiet=_quiet(args))),
             ("SDL3", lambda: sdl_install(3, abi, api=21, quiet=_quiet(args))),
             ("libwebp", lambda: webp_install(abi, api=21, quiet=_quiet(args))),
