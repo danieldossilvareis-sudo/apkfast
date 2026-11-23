@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from apkfast import __version__ as TOOL_VERSION
 from apkfast import cli, completions, lockfile as lf
 from apkfast.builder import Logger
 
@@ -120,7 +121,7 @@ class CliAdditionsTests(unittest.TestCase):
         report = json.loads(
             (self.project / "build" / "apkfast-report.json").read_text()
         )
-        self.assertEqual(report["apiVersion"], "2.4.0")
+        self.assertEqual(report["apiVersion"], TOOL_VERSION)
         self.assertEqual(report["output"], str(apk.resolve()))
         self.assertEqual(report["toolchain"]["buildTools"], "36.0.0")
         self.assertTrue(report["configValid"])

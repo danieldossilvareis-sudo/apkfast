@@ -9,6 +9,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from apkfast import __version__ as TOOL_VERSION
+
+_MAJOR, _MINOR, _PATCH = (int(part) for part in TOOL_VERSION.split("."))
+EXPECTED_INT = _MAJOR * 10000 + _MINOR * 100 + _PATCH
+
 ROOT = Path(__file__).resolve().parent.parent
 VERSION_HPP = ROOT / "include" / "nativeapp" / "version.hpp"
 UMBRELLA = ROOT / "include" / "nativeapp" / "nativeapp.hpp"
@@ -28,7 +33,8 @@ class VersionHeaderTests(unittest.TestCase):
             assert match is not None
             values[name] = int(match.group(1))
         self.assertEqual(
-            [values[k] for k in sorted(values)], [2, 4, 0]
+            [values[k] for k in sorted(values)],
+            [int(piece) for piece in TOOL_VERSION.split(".")],
         )
         self.assertIn("APKFAST_DEPRECATED", text)
         self.assertIn("source-compatible", text)
@@ -43,7 +49,7 @@ class VersionHeaderTests(unittest.TestCase):
             source = Path(tmp) / "check.cpp"
             source.write_text(
                 '#include "version.hpp"\n'
-                "static_assert(APKFAST_API_VERSION == 20400, \"versao\");\n"
+                f"static_assert(APKFAST_API_VERSION == {EXPECTED_INT}, \"versao\");\n"
                 "APKFAST_DEPRECATED(\"use novo\") int antigo;\n"
                 "int main() { return 0; }\n"
             )

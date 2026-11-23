@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.4.1] - 2026-11-23 — Patch de estabilidade
+
+- CI convertida de emulator para **build matrix** confiável: API 21/28/35 ×
+  x86_64 e API 35 × arm64-v8a/armeabi-v7a (todas verdes)
+- `setup-libs`: raylib compilada em API 21 para funcionar com NDK 27.x
+- `webp`: SIMD habilitado em x86/x86_64 (corrige build da libwebp no CI)
+- `text_input.hpp`: declaração compatível de `AInputEvent_toJava` com NDKs
+  antigos que suportam API 35
+- `vk.hpp`: `VK_NULL_HANDLE` em vez de `nullptr` — corrige 32-bit ABIs com
+  handles Vulkan de 64 bits
+- supersede a v2.4.0: use 2.4.1 como versão estável da linha 2.4
+
 ## [2.4.0] - 2026-11-23 — Base pronta e estável
 
 Duas frentes paralelas: **limites da 2.3.0** e **consolidação da base**.
