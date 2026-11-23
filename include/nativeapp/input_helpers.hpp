@@ -99,6 +99,7 @@ public:
 
     void reset() {
         keys_.clear();
+        mouse_x_ = mouse_y_ = 0;
         mouse_buttons_ = 0;
         scroll_x_ = scroll_y_ = 0;
         last_key_ = 0;

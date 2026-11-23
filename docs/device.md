@@ -225,7 +225,13 @@ int battery_level() const {
     jobject intent = register_receiver("android.intent.action.BATTERY_CHANGED");
     if (!intent) return -1;
     jclass clazz = env_->GetObjectClass(intent);
-    jmethodID get_int = env_->GetMethodID(clazz, "getIntExtra", "(Ljava/lang/String;I)I");
+    jmethodID get_int = clazz
+        ? env_->GetMethodID(clazz, "getIntExtra", "(Ljava/lang/String;I)I") : nullptr;
+    if (!get_int) {
+        if (clazz) env_->DeleteLocalRef(clazz);
+        env_->DeleteLocalRef(intent);
+        return -1;
+    }
     jstring key = env_->NewStringUTF("level");
     jstring max_key = env_->NewStringUTF("scale");
     const int level = env_->CallIntMethod(intent, get_int, key, 0);
@@ -404,28 +410,35 @@ LOGI("device=%s android=%s api=%d bateria=%d%%",
 /// Ajusta brilho 0..1 (-1 = automático).
 void set_brightness(float value) {
     if (!env_ || !activity_) return;
+    jclass activity_clazz = find_class("android/app/Activity");
     jclass win_clazz = find_class("android/view/Window");
-    jmethodID get_window = env_->GetMethodID(
-        find_class("android/app/Activity"), "getWindow", "()Landroid/view/Window;");
-    jobject window = env_->CallObjectMethod(activity_, get_window);
-    if (!window) return;
     jclass params_clazz = find_class("android/view/WindowManager$LayoutParams");
+    if (!activity_clazz || !win_clazz || !params_clazz) { /* limpa e retorna */ }
+
+    jmethodID get_window = env_->GetMethodID(
+        activity_clazz, "getWindow", "()Landroid/view/Window;");
     jmethodID get_attrs = env_->GetMethodID(
         win_clazz, "getAttributes", "()Landroid/view/WindowManager$LayoutParams;");
+    jmethodID set_attrs = env_->GetMethodID(
+        win_clazz, "setAttributes", "(Landroid/view/WindowManager$LayoutParams;)V");
+    jfieldID screen = env_->GetFieldID(params_clazz, "screenBrightness", "F");
+    env_->DeleteLocalRef(activity_clazz);
+
+    if (!get_window || !get_attrs || !set_attrs || !screen) { /* limpa e retorna */ }
+
+    jobject window = env_->CallObjectMethod(activity_, get_window);
+    if (!window) { /* limpa e retorna */ }
     jobject attrs = env_->CallObjectMethod(window, get_attrs);
-    if (attrs && params_clazz) {
-        jfieldID screen = env_->GetFieldID(params_clazz, "screenBrightness", "F");
+    if (attrs) {
         const float clamped = value < 0 ? -1.0f
             : (value > 1.0f ? 1.0f : value);
-        if (screen) env_->SetFloatField(attrs, screen, clamped);
-        jmethodID set_attrs = env_->GetMethodID(
-            win_clazz, "setAttributes", "(Landroid/view/WindowManager$LayoutParams;)V");
-        if (set_attrs) env_->CallVoidMethod(window, set_attrs, attrs);
+        env_->SetFloatField(attrs, screen, clamped);
+        env_->CallVoidMethod(window, set_attrs, attrs);
         env_->DeleteLocalRef(attrs);
     }
-    env_->DeleteLocalRef(params_clazz);
     env_->DeleteLocalRef(window);
     env_->DeleteLocalRef(win_clazz);
+    env_->DeleteLocalRef(params_clazz);
 }
 ```
 

@@ -16,6 +16,9 @@
   falha a carregar
 - `Audio::play_opensles()` aplica volume (antes ignorava) e mantém o buffer
   vivo durante o `Enqueue` (evita áudio corrompido)
+- `Device`: checagens de `jclass`/`jmethodID` nulos em `battery_level()`,
+  `is_charging()` e `set_brightness()`, com liberação de refs locais
+- `InputHelpers::reset()` agora zera também `mouse_x_`/`mouse_y_`
 
 ## [1.0.0] - 2026-11-22
 

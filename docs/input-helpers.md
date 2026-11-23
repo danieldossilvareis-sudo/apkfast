@@ -411,15 +411,14 @@ void reset() {
 | `stick_left_`, `stick_right_` | `{}` → `{x=0, y=0}` |
 | `triggers_` | `{}` → `{0, 0}` |
 | `gamepad_connected_` | `false` |
-| `mouse_x_`, `mouse_y_` | **não são tocados** (mantêm o último valor) |
+| `mouse_x_`, `mouse_y_` | `0`, `0` |
 
 **Observação:** `reset()` é público e **não é chamado automaticamente** pelo
 `App` em nenhum ponto de `app.hpp`. Cabe ao seu código decidir quando chamá-lo
 (por exemplo, ao trocar de cena ou ao voltar de `on_pause()`).
 
-**Observação:** como `mouse_x_`/`mouse_y_` não são zerados, após `reset()` um
-`mouse_x()`/`mouse_y()` pode devolver a última posição conhecida antes do
-reset; isso não é um bug de leitura, é o comportamento do código.
+**Observação:** `reset()` também zera `mouse_x_`/`mouse_y_` — após o reset,
+`mouse_x()`/`mouse_y()` devolvem `0` até um novo evento de mouse chegar.
 
 ---
 
@@ -584,8 +583,8 @@ controle é desligado, o helper continua reportando `true` até você chamar
 
 ### 10.2 `reset()` limpa o estado — e não é automático
 
-`reset()` zera teclas, botões de mouse, scroll, `last_key`, sticks, triggers e
-`gamepad_connected_`, **mas não zera `mouse_x_`/`mouse_y_`** (ver [§7](#7-reset-e-consume_scroll)).
+`reset()` zera teclas, posição e botões do mouse, scroll, `last_key`, sticks,
+triggers e `gamepad_connected_` (ver [§7](#7-reset-e-consume_scroll)).
 O `App` não chama `reset()` sozinho: faça isso explicitamente se precisar de
 um estado limpo.
 
