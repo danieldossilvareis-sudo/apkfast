@@ -30,9 +30,11 @@
 //   APP_MAIN(MeuApp)
 
 #pragma once
+#include "version.hpp"
 
 #include "app.hpp"
 #include "animated_image.hpp"
+#include "animated_svg.hpp"
 
 // Tipos base primeiro (app.hpp e os backends também os incluem, mas a
 // umbrella deve ser autossuficiente mesmo se a ordem interna mudar).

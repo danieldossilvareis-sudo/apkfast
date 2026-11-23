@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import cache as cache_mod
+from . import config_schema, lockfile as lock_mod
 from .manifest import ManifestInfo, is_native_activity, parse_manifest
 from .toolchain import NDK_ARCH_DIR, Toolchain, detect
 
@@ -100,6 +101,8 @@ class BuildOptions:
     cache_namespace: str = ""
     require_cache_signature: bool | None = None
     cache_ctx: cache_mod.CacheContext | None = None  # resolvido em build()
+    ignore_lock: bool = False                 # ignora divergência do lockfile
+    lock_path: Path | None = None             # default: <projeto>/apkfast.lock.json
     verbose: bool = False
     quiet: bool = False
     log: Logger | None = None
@@ -879,19 +882,20 @@ def _native_lib_name(manifest: ManifestInfo, project: Path) -> str:
 
 
 def _read_project_config(project: Path) -> dict:
-    """Lê apkfast.json com validação (config vazia = {})."""
-    config = project / "apkfast.json"
+    """Lê apkfast.json com validação de chaves/tipos (config vazia = {})."""
+    config = project / config_schema.CONFIG_NAME
     if not config.is_file():
         return {}
     import json
 
     try:
         data = json.loads(config.read_text())
-    except (OSError, ValueError) as exc:
+    except (OSError, UnicodeError, ValueError) as exc:
         raise BuildError(f"apkfast.json inválido em {config}: {exc}") from exc
-    if not isinstance(data, dict):
-        raise BuildError(f"apkfast.json em {config} deve conter um objeto JSON.")
-    return data
+    try:
+        return config_schema.validate(data, path=config)
+    except config_schema.ConfigError as exc:
+        raise BuildError(str(exc)) from exc
 
 
 def _stage_native_lib(
@@ -1278,6 +1282,26 @@ def build(options: BuildOptions) -> Path:
         ndk_dir=options.ndk_dir,
         build_tools=options.build_tools,
     )
+
+    # Lockfile de toolchain: uma vez presente, a divergência falha o build
+    # (ou apenas avisa com --ignore-lock). Nada aqui altera cache/link/imagem.
+    try:
+        lock_doc = lock_mod.load(options.lock_path or project)
+        if lock_doc is not None:
+            mismatches = lock_mod.verify(
+                lock_doc,
+                lock_mod.facts(tc, api=options.api),
+                ignore=options.ignore_lock,
+            )
+            if mismatches:
+                log.warn(
+                    "[!] Lockfile divergente (--ignore-lock): "
+                    + "; ".join(mismatches)
+                )
+            else:
+                log.detail("[*] Lockfile de toolchain conferido.")
+    except lock_mod.LockfileError as exc:
+        raise BuildError(str(exc)) from exc
 
     work = (options.build_dir or (project / "build" / "apkfast")).expanduser().resolve()
     # Nunca permite que a limpeza apague o próprio projeto ou um ancestral.

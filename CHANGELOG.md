@@ -1,5 +1,51 @@
 # Changelog
 
+## [2.4.0] - 2026-11-23 — Base pronta e estável
+
+Duas frentes paralelas: **limites da 2.3.0** e **consolidação da base**.
+
+### Adicionado — limites removidos
+
+- `cache-push` / `cache-pull`: transporte do bundle `tar.gz` por path local,
+  `file://`, HTTP(S) (`curl -fL --retry 3`) e `s3://` (`aws s3 cp`), com HMAC e
+  `--expect-sha256`. Nenhum segundo formato de cache foi criado.
+- `nativeapp::AnimatedSvg`: subconjunto SMIL (`animate`, `animateTransform`,
+  `set`) sobre LunaSVG, com `update(dt_ms)`, `reset()`, `current()` e
+  `set_size()`. SVGs sem SMIL continuam no caminho estático.
+- `docs/cache-transport.md` e `docs/animated-svg.md`.
+
+### Adicionado — consolidação
+
+- **API versionada**: `include/nativeapp/version.hpp` com
+  `APKFAST_API_VERSION_*` e `APKFAST_DEPRECATED`; política em
+  `docs/compatibility.md` e guia em `docs/migration.md`
+- **Lockfile reprodutível**: `apkfast.lock.json` com NDK/build-tools/platform,
+  versões de libwebp/LunaSVG e checksums; `--generate-lock`, `--ignore-lock`
+- **Config validada**: `apkfast/config_schema.py`, `apkfast config show`
+- **Observabilidade**: `build --report`, `doctor --json`
+- **Instalação**: `pyproject.toml`, entry point `apkfast`, `pip install -e .`,
+  wheel/sdist com `include/`, `src/`, `patches/` e `docs/`
+- **Completions**: bash/zsh/fish via `--completions` ou `completions`
+- **CI de dispositivo**: `.github/workflows/device.yml` com matriz
+  API 21/28/36 × arm64-v8a/armeabi-v7a
+- Governança: `SECURITY.md`, `CODE_OF_CONDUCT.md`, `THIRD_PARTY_NOTICES.md`,
+  `RELEASE.md`
+
+### Validado
+
+- 29 testes unitários OK
+- 14 exemplos compilam
+- `pip install -e .`, wheel e sdist validados
+- CLI: `config show`, `doctor --json`, completions, `cache-push/pull --help`
+
+### Limitações honestas
+
+- SMIL é subconjunto: sem `<script>`, CSS animations, `calcMode` não linear,
+  `keyTimes`, `animateMotion` ou `href` externo
+- HTTP PUT depende do servidor; atomicidade remota é responsabilidade dele
+- `vendor/` não entra na wheel — libs avançadas são baixadas por `setup-libs`
+- `build --report` fica fora do APK e não é assinado
+
 ## [2.3.0] - 2026-11-23 — Limitações removidas
 
 ### Adicionado

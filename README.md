@@ -1,7 +1,7 @@
 # apkfast
 
 [![CI](https://github.com/danieldossilvareis-sudo/apkfast/actions/workflows/ci.yml/badge.svg)](https://github.com/danieldossilvareis-sudo/apkfast/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-2.3.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.4.0-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 CLI para **montar, compilar, otimizar e entregar APKs sem Gradle**, com suporte
@@ -23,10 +23,25 @@ Você pode sobrescrever com `--sdk-dir`, `--ndk-dir`, `--build-tools` ou
 
 ## Instalação
 
+### Via PyPI (recomendado)
+
+```sh
+python3 -m pip install apkfast
+apkfast --version
+apkfast doctor
+```
+
+O wheel instala o comando `apkfast` e os dados de build (`include/`, `src/`,
+`patches/`, `docs/`) junto com o pacote Python. O SDK/NDK continua sendo
+detectado em `~/Android` (ou via `--sdk-dir`/`--ndk-dir`).
+
+### Via repositório (alternativa / desenvolvimento)
+
 ```sh
 git clone https://github.com/apkfast/apkfast.git
 cd apkfast
 chmod +x apkfast.py
+python3 -m pip install -e .          # opcional: instala o comando `apkfast`
 
 # (Opcional) Instala SDK + NDK pré-compilados para Termux
 python3 apkfast.py setup-sdk              # ~340 MB em ~/Android
@@ -38,12 +53,13 @@ python3 apkfast.py doctor
 # (Opcional) Bibliotecas avançadas: raylib + SDL2 + SDL3 + libwebp + LunaSVG
 python3 apkfast.py setup-libs --abis all       # ou --abis arm64-v8a
 
-# Link global (Termux)
+# Link global sem pip (Termux)
 ln -s "$PWD/apkfast.py" "$PREFIX/bin/apkfast"
 ```
 
 > O repositório **não versiona** bibliotecas binárias. `setup-libs` baixa e
-> compila raylib/SDL2/SDL3 para as ABIs escolhidas usando o seu NDK.
+> compila raylib/SDL2/SDL3, libwebp e LunaSVG para as ABIs escolhidas usando o
+> seu NDK.
 >
 > `setup-sdk` instala SDK/NDK pré-compilados para `aarch64-linux-android`
 > (Termux) a partir dos releases de
@@ -51,6 +67,24 @@ ln -s "$PWD/apkfast.py" "$PREFIX/bin/apkfast"
 > e [HomuHomu833/android-ndk-custom](https://github.com/HomuHomu833/android-ndk-custom).
 > Se você já tem SDK/NDK em `~/Android`, o comando detecta e não baixa nada
 > (use `--force` para reinstalar).
+
+## Estabilidade e compatibilidade
+
+- **API versionada:** `nativeapp/` segue SemVer; a versão contratual está em
+  `include/nativeapp/version.hpp` (`APKFAST_API_VERSION*`) e é exibida por
+  `apkfast doctor --json`. Headers são **source-compatible**, não ABI —
+  recompile o app ao atualizar. Política completa:
+  [docs/compatibility.md](docs/compatibility.md).
+- **Toolchain reprodutível:** `apkfast build . --generate-lock` cria
+  `apkfast.lock.json` (lockVersion 1) com NDK, build-tools, API e checksums.
+  Builds divergentes falham; `--ignore-lock` transforma em aviso.
+- **Config validada:** chaves/tipos de `apkfast.json` são checados com mensagens
+  claras. Inspecione com `apkfast config show .`.
+- **CI real em dispositivo:** a matriz API 21/28/36 × arm64-v8a/armeabi-v7a
+  instala `native-hello`, `image-demo` e `permissions-test` no emulator e
+  falha se o logcat contiver `FATAL` ou `dlopen failed`.
+- **Migração:** veja [docs/migration.md](docs/migration.md) (inclui o aviso de
+  que o cache schema 1 da v2.2 foi invalidado na v2.3).
 
 ## Novo modelo de ciclo de vida (nativeapp)
 
@@ -173,6 +207,8 @@ python3 ../../apkfast.py info dist/native-hello.apk
 # Cache remoto/compartilhado
 python3 ../../apkfast.py cache-export . -o cache.tar.gz --abi all
 python3 ../../apkfast.py cache-import . cache.tar.gz --cache-dir /mnt/nfs/apkfast
+python3 ../../apkfast.py cache-push s3://bucket/apkfast/cache.tar.gz .
+python3 ../../apkfast.py cache-pull https://server/cache.tar.gz .
 ```
 
 ## Estrutura esperada do projeto

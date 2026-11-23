@@ -1,0 +1,125 @@
+name: Device matrix
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  device:
+    name: API ${{ matrix.api }} / ${{ matrix.abi }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        api: [21, 28, 36]
+        abi: [arm64-v8a, armeabi-v7a]
+    env:
+      NDK_VERSION: 27.2.12479018
+      BUILD_TOOLS: 36.0.0
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install SDK platforms and NDK
+        run: |
+          set -e
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-21" \
+            "platforms;android-28" \
+            "platforms;android-36" \
+            "build-tools;${BUILD_TOOLS}" \
+            "ndk;${NDK_VERSION}"
+
+      - name: Expose SDK/NDK to apkfast discovery
+        run: |
+          set -e
+          root="$RUNNER_TEMP/android-root"
+          mkdir -p "$root"
+          ln -s "$ANDROID_HOME" "$root/android-sdk"
+          ln -s "$ANDROID_HOME/ndk/$NDK_VERSION" "$root/android-ndk"
+          echo "APKFAST_ANDROID_ROOT=$root" >> "$GITHUB_ENV"
+
+      - name: Prepare native libraries (libwebp, LunaSVG, raylib, SDL)
+        run: python3 apkfast.py setup-libs --abis "${{ matrix.abi }}"
+
+      - name: Generate and verify toolchain lockfile
+        run: |
+          set -e
+          python3 apkfast.py build --generate-lock \
+            --sdk-dir "$ANDROID_HOME" \
+            --ndk-dir "$ANDROID_HOME/ndk/$NDK_VERSION" \
+            --build-tools "$BUILD_TOOLS"
+          python3 -m json.tool apkfast.lock.json >/dev/null
+          python3 apkfast.py doctor --json > doctor.json
+          python3 -m json.tool doctor.json >/dev/null
+          grep -q '"status": "ok"' doctor.json
+
+      - name: Build native-hello, image-demo and permissions-test
+        run: |
+          set -e
+          mkdir -p dist
+          for example in native-hello image-demo permissions-test; do
+            python3 apkfast.py build "examples/$example" \
+              --abi "${{ matrix.abi }}" \
+              --api 36 --min-sdk 21 --target-sdk 36 \
+              --sdk-dir "$ANDROID_HOME" \
+              --ndk-dir "$ANDROID_HOME/ndk/$NDK_VERSION" \
+              --build-tools "$BUILD_TOOLS" \
+              --lock-file "$GITHUB_WORKSPACE/apkfast.lock.json" \
+              --report \
+              -o "$GITHUB_WORKSPACE/dist/${example}-${{ matrix.abi }}.apk"
+          done
+
+      - name: Install, launch and capture logcat
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api }}
+          # Imagens ARM de API 21 são 'default'; nas demais usamos google_apis.
+          target: ${{ matrix.api == 21 && 'default' || 'google_apis' }}
+          arch: ${{ matrix.abi }}
+          profile: pixel_2
+          disable-animations: true
+          script: |
+            set -e
+            adb logcat -c
+            for pair in \
+              "native-hello:com.example.nativehello" \
+              "image-demo:com.apkfast.imagedemo" \
+              "permissions-test:com.apkfast.permstest"; do
+              name="${pair%%:*}"
+              package="${pair#*:}"
+              apk="$GITHUB_WORKSPACE/dist/${name}-${{ matrix.abi }}.apk"
+              test -f "$apk"
+              adb install -r "$apk"
+              adb shell monkey -p "$package" -c android.intent.category.LAUNCHER 1
+              sleep 5
+              adb shell am force-stop "$package"
+              echo "OK $package"
+            done
+            log="$GITHUB_WORKSPACE/logcat-api${{ matrix.api }}-${{ matrix.abi }}.txt"
+            adb logcat -d > "$log"
+            if grep -Ei 'FATAL|dlopen failed' "$log"; then
+              echo "::error::logcat contém FATAL ou dlopen failed"
+              exit 1
+            fi
+
+      - name: Upload logcat and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: device-api${{ matrix.api }}-${{ matrix.abi }}
+          path: |
+            logcat-*.txt
+            doctor.json
+            examples/*/build/apkfast-report.json
+          if-no-files-found: ignore

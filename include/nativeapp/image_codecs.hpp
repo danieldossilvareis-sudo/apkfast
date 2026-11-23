@@ -32,6 +32,11 @@ struct DecodedImage {
     int height = 0;
 };
 
+// SVG animado (subconjunto SMIL) vive em animated_svg.hpp. Declarado aqui
+// apenas para documentar que ele compartilha DecodedImage sem criar ciclo
+// de include (animated_svg.hpp inclui este header).
+class AnimatedSvg;
+
 /// Detecta o formato pelos magic bytes (extensão não é confiável em assets).
 inline ImageFormat detect_image_format(const uint8_t* data, size_t size) {
     if (!data || size < 4) return ImageFormat::Unknown;

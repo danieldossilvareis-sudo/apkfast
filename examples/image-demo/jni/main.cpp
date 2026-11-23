@@ -31,22 +31,31 @@ private:
             const auto& first = anim_.current_frame();
             anim_tex_.load_rgba(first.rgba.data(), first.width, first.height);
         }
-        LOGI("webp=%s %dx%d svg=%s %dx%d font=%s anim=%s frames=%zu loop=%d",
+        pulse_ok_ = pulse_.open_asset("pulse.svg");
+        if (pulse_ok_) {
+            const auto& first = pulse_.current();
+            pulse_tex_.load_rgba(first.rgba.data(), first.width, first.height);
+        }
+        LOGI("webp=%s %dx%d svg=%s %dx%d font=%s anim=%s frames=%zu loop=%d smil=%s anims=%zu",
              webp_ok_ ? "OK" : "FALHOU", webp_.width(), webp_.height(),
              svg_ok_ ? "OK" : "FALHOU", svg_.width(), svg_.height(),
              font_ok_ ? "OK" : "FALHOU",
-             anim_ok_ ? "OK" : "FALHOU", anim_.frame_count(), anim_.loop_count());
+             anim_ok_ ? "OK" : "FALHOU", anim_.frame_count(), anim_.loop_count(),
+             pulse_ok_ ? "OK" : "FALHOU", pulse_.animation_count());
     }
 
     void on_surface_destroyed() override { scene_.destroy(); }
     void on_surface_changed(int w, int h) override { scene_.resize(w, h); }
 
     void on_update(float dt) override {
-        if (!anim_ok_) return;
-        if (anim_.update(dt * 1000.0f)) {
+        if (anim_ok_ && anim_.update(dt * 1000.0f)) {
             const auto& frame = anim_.current_frame();
             anim_tex_.load_rgba(frame.rgba.data(), frame.width, frame.height);
             LOGI("anim frame=%zu/%zu", anim_.current_index() + 1, anim_.frame_count());
+        }
+        if (pulse_ok_ && pulse_.update(dt * 1000.0f)) {
+            const auto& frame = pulse_.current();
+            pulse_tex_.load_rgba(frame.rgba.data(), frame.width, frame.height);
         }
     }
 
@@ -70,6 +79,14 @@ private:
             center = mat4_multiply(center, mat4_scale(160, 160, 1));
             scene_.draw_with_texture(quad_, anim_mat, center.data(), &anim_tex_);
         }
+
+        if (pulse_ok_) {
+            Material smil_mat;
+            smil_mat.depth_test = false;
+            Mat4 place = mat4_translate(width() * 0.5f, height() * 0.84f, 0);
+            place = mat4_multiply(place, mat4_scale(110, 110, 1));
+            scene_.draw_with_texture(quad_, smil_mat, place.data(), &pulse_tex_);
+        }
     }
 
     void on_key(int32_t code, bool down) override {
@@ -81,10 +98,13 @@ private:
     Texture webp_;
     Texture svg_;
     Texture anim_tex_;
+    Texture pulse_tex_;
     AnimatedImage anim_;
+    AnimatedSvg pulse_;
     bool webp_ok_ = false;
     bool svg_ok_ = false;
     bool anim_ok_ = false;
+    bool pulse_ok_ = false;
     bool font_ok_ = false;
 };
 

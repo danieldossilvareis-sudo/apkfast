@@ -24,6 +24,39 @@ jobs:
           python3 apkfast.py cache-import --help
           python3 apkfast.py webp-install --help
           python3 apkfast.py lunasvg-install --help
+          python3 apkfast.py config show --help
+          python3 apkfast.py completions --help
+          python3 apkfast.py doctor --help
+          python3 apkfast.py --completions bash >/dev/null
+          python3 apkfast.py --completions zsh >/dev/null
+          python3 apkfast.py --completions fish >/dev/null
+      - name: Validate project config
+        run: python3 apkfast.py config show examples/native-hello
+      - name: Validate lockfile round-trip (no SDK required)
+        run: |
+          python3 - <<'PY'
+          import tempfile
+          from pathlib import Path
+          from types import SimpleNamespace
+          from apkfast import config_schema, lockfile
+
+          project = Path(tempfile.mkdtemp())
+          (project / "apkfast.json").write_text('{"incremental": true, "cacheMode": "verify"}')
+          config_schema.validate(config_schema.load(project / "apkfast.json"))
+          tc = SimpleNamespace(
+              ndk_dir=Path("/sdk/android-ndk-r30"),
+              build_tools_dir=Path("/sdk/build-tools/36.0.0"),
+              platform_dir=Path("/sdk/platforms/android-36"),
+              api=36,
+          )
+          doc = lockfile.generate(project, tc, api=36)
+          target = lockfile.write(project, doc)
+          loaded = lockfile.load(project)
+          assert loaded["lockVersion"] == 1
+          assert lockfile.compare(loaded, lockfile.facts(tc, api=36)) == []
+          assert lockfile.compare(loaded, lockfile.facts(tc, api=28))
+          print("OK", target)
+          PY
       - name: Unit tests
         run: python3 -m unittest discover -s tests -v
 

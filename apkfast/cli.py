@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from . import __version__
 from .builder import BuildOptions, BuildError, build
+from .completions import SHELLS
+from .cache_transport import register as register_cache_transport
 from .toolchain import detect
 
 BANNER = r"""
@@ -53,10 +57,120 @@ def _fail(message: str) -> int:
     return 1
 
 
+def _api_version_string() -> str:
+    """Lê a versão contratual dos headers (source-compatible, não ABI)."""
+    header = (
+        Path(__file__).resolve().parent.parent
+        / "include" / "nativeapp" / "version.hpp"
+    )
+    try:
+        text = header.read_text(encoding="utf-8")
+    except OSError:
+        return __version__
+    pieces: list[str] = []
+    for name in (
+        "APKFAST_API_VERSION_MAJOR",
+        "APKFAST_API_VERSION_MINOR",
+        "APKFAST_API_VERSION_PATCH",
+    ):
+        match = re.search(rf"#define\s+{name}\s+(\d+)", text)
+        if match is None:
+            return __version__
+        pieces.append(match.group(1))
+    return ".".join(pieces)
+
+
+def _doctor_tools(tc: Any) -> list[tuple[str, Any]]:
+    return [
+        ("aapt2", tc.aapt2),
+        ("zipalign", tc.zipalign),
+        ("apksigner", tc.apksigner),
+        ("d8", tc.d8),
+        ("clang", tc.clang()),
+        ("clang++", tc.clang(cpp=True)),
+        ("llvm-strip", tc.ndk_toolchain_bin / "llvm-strip"),
+        ("java", tc.java),
+        ("keytool", tc.keytool),
+    ]
+
+
+def _toolchain_payload(tc: Any) -> dict:
+    return {
+        "sdkDir": str(tc.sdk_dir),
+        "ndkDir": str(tc.ndk_dir),
+        "buildTools": tc.build_tools_dir.name,
+        "platform": tc.platform_dir.name,
+        "abi": tc.abi,
+        "api": tc.api,
+        "hostTag": tc.host_tag,
+    }
+
+
+def _lock_status(
+    project: Path,
+    tc: Any | None,
+    api: int,
+    lock_path: Path | None = None,
+) -> dict:
+    """Estado do lockfile para ``doctor --json`` e ``build --report``."""
+    from . import lockfile as lock_mod
+
+    target = (lock_path or lock_mod.path(project)).expanduser()
+    status: dict[str, Any] = {"path": str(target), "present": target.is_file()}
+    if not status["present"]:
+        status["status"] = "missing"
+        return status
+    try:
+        document = lock_mod.load(target)
+        status["lockVersion"] = document["lockVersion"]
+        if tc is None:
+            status["status"] = "toolchain-unavailable"
+            return status
+        mismatches = lock_mod.compare(document, lock_mod.facts(tc, api=api))
+        status["status"] = "ok" if not mismatches else "divergent"
+        status["mismatches"] = mismatches
+    except lock_mod.LockfileError as exc:
+        status["status"] = "error"
+        status["error"] = str(exc)
+    return status
+
+
+def _config_status(project: Path) -> dict:
+    from . import config_schema
+
+    config_path = project / config_schema.CONFIG_NAME
+    result: dict[str, Any] = {
+        "path": str(config_path),
+        "present": config_path.is_file(),
+        "valid": True,
+    }
+    try:
+        result["config"] = config_schema.load(config_path)
+    except config_schema.ConfigError as exc:
+        result["valid"] = False
+        result["error"] = str(exc)
+    return result
+
+
 def _add_build_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("project", nargs="?", default=".", help="diretório do projeto")
     parser.add_argument("-o", "--output", help="caminho do APK final")
     parser.add_argument("--build-dir", help="diretório de arquivos temporários")
+    parser.add_argument(
+        "--generate-lock", action="store_true",
+        help="grava apkfast.lock.json com a toolchain detectada e sai sem compilar",
+    )
+    parser.add_argument(
+        "--ignore-lock", action="store_true",
+        help="se o lockfile divergir, avisa e segue o build (padrão: falha)",
+    )
+    parser.add_argument(
+        "--lock-file", help="caminho alternativo do apkfast.lock.json",
+    )
+    parser.add_argument(
+        "--report", nargs="?", const="", default=None,
+        help="grava relatório JSON do build (padrão: build/apkfast-report.json)",
+    )
     parser.add_argument(
         "--no-incremental", dest="incremental", action="store_false", default=None,
         help="desliga o cache incremental (recompila tudo)",
@@ -139,8 +253,93 @@ def _add_build_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _generate_lock(args: argparse.Namespace) -> int:
+    """Gera o lockfile e termina sem compilar (toolchain já detectada)."""
+    from . import lockfile as lock_mod
+
+    project = Path(args.project).expanduser().resolve()
+    raw_abis = [a.strip() for a in args.abis.split(",") if a.strip()]
+    abi = raw_abis[0] if raw_abis else args.abi
+    try:
+        config = _config_status(project)
+        if not config["valid"]:
+            raise ValueError(config["error"])
+        tc = detect(
+            abi=abi,
+            api=args.api,
+            sdk_dir=args.sdk_dir,
+            ndk_dir=args.ndk_dir,
+            build_tools=args.build_tools,
+        )
+        document = lock_mod.generate(project, tc, api=args.api)
+        lock_path = (
+            Path(args.lock_file).expanduser().resolve() if args.lock_file else None
+        )
+        output = lock_mod.write(project, document, output=lock_path)
+    except (RuntimeError, OSError, ValueError) as exc:
+        return _fail(f"Falha ao gerar lockfile: {exc}")
+    _say(args, f"[✓] Lockfile gerado: {output}")
+    return 0
+
+
+def _write_build_report(args: argparse.Namespace, apk: Path, log: Any) -> None:
+    """Grava metadados do build em JSON (fora do APK)."""
+    project = Path(args.project).expanduser().resolve()
+    if args.report:
+        target = Path(args.report).expanduser()
+        if not target.is_absolute():
+            target = project / target
+        target = target.resolve()
+    else:
+        target = (project / "build" / "apkfast-report.json").resolve()
+
+    raw_abis = [a.strip() for a in args.abis.split(",") if a.strip()]
+    abis = raw_abis or [args.abi]
+    lock_path = Path(args.lock_file).expanduser().resolve() if args.lock_file else None
+    try:
+        tc = detect(
+            abi=abis[0],
+            api=args.api,
+            sdk_dir=args.sdk_dir,
+            ndk_dir=args.ndk_dir,
+            build_tools=args.build_tools,
+        )
+        toolchain: dict[str, Any] = _toolchain_payload(tc)
+        lock = _lock_status(project, tc, args.api, lock_path)
+    except (RuntimeError, OSError) as exc:
+        toolchain = {"error": str(exc)}
+        lock = _lock_status(project, None, args.api, lock_path)
+
+    config = _config_status(project)
+    report = {
+        "apkfastVersion": __version__,
+        "apiVersion": _api_version_string(),
+        "project": str(project),
+        "output": str(apk.resolve()),
+        "abis": abis,
+        "api": args.api,
+        "minSdk": args.min_sdk,
+        "targetSdk": args.target_sdk,
+        "optimize": args.optimize,
+        "toolchain": toolchain,
+        "lock": lock,
+        "config": config.get("config", {}),
+        "configValid": config["valid"],
+    }
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError as exc:
+        log.warn(f"[!] Não foi possível gravar relatório {target}: {exc}")
+        return
+    _say(args, f"[✓] Relatório do build: {target}")
+
+
 def _cmd_build(args: argparse.Namespace) -> int:
     from .builder import Logger
+
+    if args.generate_lock:
+        return _generate_lock(args)
 
     log = Logger(quiet=_quiet(args), verbose=args.verbose)
     options = BuildOptions(
@@ -173,6 +372,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
         cache_mode=args.cache_mode,
         cache_namespace=args.cache_namespace or "",
         require_cache_signature=args.require_cache_signature,
+        ignore_lock=args.ignore_lock,
+        lock_path=Path(args.lock_file).expanduser().resolve() if args.lock_file else None,
         verbose=args.verbose,
         quiet=_quiet(args),
         log=log,
@@ -183,6 +384,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
         log.error(f"[✗] {exc}")
         return 1
     log.info(f"[✓] Build concluído: {apk}")
+    if args.report is not None:
+        _write_build_report(args, apk, log)
     return 0
 
 
@@ -213,26 +416,93 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
-    _say(args, BANNER)
+    project = Path(getattr(args, "project", ".")).expanduser().resolve()
+    lock_path = (
+        Path(args.lock_file).expanduser().resolve()
+        if getattr(args, "lock_file", None) else None
+    )
+    config = _config_status(project)
+    tc: Any | None = None
+    error: str | None = None
     try:
         tc = detect(abi=args.abi, api=args.api)
     except (RuntimeError, OSError) as exc:
-        return _fail(str(exc))
+        error = str(exc)
+
+    if args.json:
+        payload: dict[str, Any] = {
+            "ok": tc is not None and config["valid"],
+            "apkfastVersion": __version__,
+            "apiVersion": _api_version_string(),
+            "abi": args.abi,
+            "api": args.api,
+        }
+        if tc is not None:
+            payload["toolchain"] = _toolchain_payload(tc)
+            payload["tools"] = {
+                name: {
+                    "ok": bool(path and Path(path).exists()),
+                    "path": str(path) if path else None,
+                }
+                for name, path in _doctor_tools(tc)
+            }
+        else:
+            payload["error"] = error
+        payload["lock"] = _lock_status(project, tc, args.api, lock_path)
+        payload["config"] = config
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0 if payload["ok"] else 1
+
+    _say(args, BANNER)
+    if tc is None:
+        return _fail(error or "toolchain indisponível")
     _say(args, tc.summary())
     _say(args, "\nVerificando ferramentas:")
-    for name, path in [
-        ("aapt2", tc.aapt2),
-        ("zipalign", tc.zipalign),
-        ("apksigner", tc.apksigner),
-        ("d8", tc.d8),
-        ("clang", tc.clang()),
-        ("clang++", tc.clang(cpp=True)),
-        ("llvm-strip", tc.ndk_toolchain_bin / "llvm-strip"),
-        ("java", tc.java),
-        ("keytool", tc.keytool),
-    ]:
+    for name, path in _doctor_tools(tc):
         status = "OK" if path and Path(path).exists() else "FALTANDO"
         _say(args, f"  {status:9} {name:12} {path}")
+
+    lock = _lock_status(project, tc, args.api, lock_path)
+    _say(args, f"\nLockfile: {lock['path']} ({lock['status']})")
+    for mismatch in lock.get("mismatches", []):
+        _say(args, f"  - {mismatch}")
+    if lock.get("error"):
+        _say(args, f"  {lock['error']}")
+    _say(args, f"Config: {config['path']} ({'ok' if config['valid'] else 'inválido'})")
+    if not config["valid"]:
+        _say(args, f"  {config['error']}")
+    return 0 if config["valid"] else 1
+
+
+def _cmd_config_show(args: argparse.Namespace) -> int:
+    """Mostra o apkfast.json validado e a configuração efetiva em JSON."""
+    from . import config_schema
+
+    project = Path(args.project).expanduser().resolve()
+    config_path = project / config_schema.CONFIG_NAME
+    try:
+        data = config_schema.load(config_path)
+    except config_schema.ConfigError as exc:
+        return _fail(str(exc))
+    payload = {
+        "project": str(project),
+        "configFile": str(config_path),
+        "present": config_path.is_file(),
+        "config": data,
+        "effective": config_schema.effective(data),
+        "knownKeys": sorted(config_schema.FIELDS),
+    }
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
+def _cmd_completions(args: argparse.Namespace) -> int:
+    from .completions import generate
+
+    try:
+        print(generate(args.shell))
+    except ValueError as exc:
+        return _fail(str(exc))
     return 0
 
 
@@ -555,7 +825,11 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-q", "--quiet", action="store_true", help="silencioso: mostra só erros"
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument(
+        "--completions", choices=SHELLS,
+        help="imprime o script de conclusão para bash/zsh/fish e sai",
+    )
+    sub = parser.add_subparsers(dest="command")
 
     p_build = sub.add_parser("build", help="compila e gera o APK final")
     _add_build_args(p_build)
@@ -583,8 +857,21 @@ def create_parser() -> argparse.ArgumentParser:
     p_doctor = sub.add_parser("doctor", help="verifica SDK, NDK e ferramentas")
     p_doctor.add_argument("--abi", default="arm64-v8a")
     p_doctor.add_argument("--api", type=int, default=36)
+    p_doctor.add_argument("--project", default=".", help="projeto para checar lock/config")
+    p_doctor.add_argument("--lock-file", help="caminho alternativo do apkfast.lock.json")
+    p_doctor.add_argument("--json", action="store_true", help="saída em JSON (para CI)")
     _add_quiet(p_doctor)
     p_doctor.set_defaults(func=_cmd_doctor)
+
+    p_config = sub.add_parser("config", help="inspeciona apkfast.json")
+    config_sub = p_config.add_subparsers(dest="config_command", required=True)
+    p_config_show = config_sub.add_parser("show", help="mostra config validada em JSON")
+    p_config_show.add_argument("project", nargs="?", default=".", help="diretório do projeto")
+    p_config_show.set_defaults(func=_cmd_config_show)
+
+    p_comp = sub.add_parser("completions", help="gera script de conclusão para o shell")
+    p_comp.add_argument("shell", choices=SHELLS, help="bash, zsh ou fish")
+    p_comp.set_defaults(func=_cmd_completions)
 
     p_install = sub.add_parser("install", help="instala APK via adb")
     p_install.add_argument("apk")
@@ -649,6 +936,7 @@ def create_parser() -> argparse.ArgumentParser:
     p_cache_import = sub.add_parser("cache-import", help="importa cache de .tar.gz")
     _add_cache_transport_args(p_cache_import, export=False)
     p_cache_import.set_defaults(func=_cmd_cache_import)
+    register_cache_transport(sub)
 
     p_luna = sub.add_parser("lunasvg-install", help="prepara LunaSVG (SVG completo)")
     _add_quiet(p_luna)
@@ -681,6 +969,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = create_parser()
     args = parser.parse_args(argv)
     args.quiet = _quiet(args)
+    if getattr(args, "completions", None):
+        args.shell = args.completions
+        return _cmd_completions(args)
+    if not args.command:
+        parser.print_help()
+        return 2
     if args.command == "build" and args.verbose and not args.quiet:
         print(BANNER)
     return int(args.func(args))

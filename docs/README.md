@@ -28,10 +28,12 @@ armadilhas encontradas em testes reais.
 | [text-input.md](text-input.md) | Teclado virtual sem EditText, IME/unicode, API 21+ |
 | [fonts.md](fonts.md) | Fontes TTF/OTF, atlas de glyphs, `draw_text()` |
 | [audio-codecs.md](audio-codecs.md) | WAV/OGG/MP3, decode completo e streaming `Music` |
-| [image-formats.md](image-formats.md) | PNG/JPEG, WebP via Android e SVG via NanoSVG |
+| [image-formats.md](image-formats.md) | PNG/JPEG, WebP animado (libwebp) e SVG completo (LunaSVG) |
+| [animated-svg.md](animated-svg.md) | SMIL declarativo (`animate`/`animateTransform`/`set`) via LunaSVG |
 | [libraries.md](libraries.md) | Bibliotecas `.a`/`.so` próprias por ABI |
 | [incremental.md](incremental.md) | Cache incremental portável (schema 2) |
 | [cache-remote.md](cache-remote.md) | Cache compartilhado, bundles e HMAC |
+| [cache-transport.md](cache-transport.md) | `cache-push`/`cache-pull` por file/HTTP/S3 sobre o mesmo `.tar.gz` |
 | [permissions.md](permissions.md) | Permissões runtime, callbacks, estados, todas as engines |
 | [input-helpers.md](input-helpers.md) | Mouse, gamepad analógico, estado de teclas |
 | [sensors.md](sensors.md) | Acelerômetro/giroscópio via callbacks no looper |
@@ -61,4 +63,6 @@ python3 apkfast.py install app.apk
 - [README principal](../README.md) — instalação, CLI, setup-sdk/setup-libs
 - [README da API](../include/nativeapp/README.md) — referência consolidada
 - [AUDIT.md](../AUDIT.md) — auditoria completa e bugs corrigidos
+- [Compatibilidade](compatibility.md) — SemVer da API nativeapp
+- [Migração](migration.md) — 2.2 → 2.3 → 2.4
 - [CHANGELOG.md](../CHANGELOG.md) — histórico de versões

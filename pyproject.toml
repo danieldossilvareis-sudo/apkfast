@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "apkfast"
+dynamic = ["version"]
+description = "Build signed Android APKs without Gradle, with first-class NativeActivity support"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "apkfast contributors" }]
+keywords = ["android", "apk", "ndk", "nativeactivity", "termux", "no-gradle"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: C++",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development :: Build Tools",
+]
+
+[project.scripts]
+apkfast = "apkfast.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/apkfast/apkfast"
+Documentation = "https://github.com/apkfast/apkfast/tree/main/docs"
+Source = "https://github.com/apkfast/apkfast"
+Issues = "https://github.com/apkfast/apkfast/issues"
+
+# Os diretórios include/, src/, patches/ e docs/ vivem na raiz do repositório
+# porque o builder resolve `<pacote>/../include` e `<pacote>/../src`. Declará-los
+# como pacotes (namespace, sem __init__.py) faz com que a wheel os instale em
+# site-packages/, preservando exatamente esse layout relativo.
+[tool.setuptools]
+packages = [
+  "apkfast",
+  "include",
+  "include.nativeapp",
+  "include.nativeapp.third_party",
+  "src",
+  "patches",
+  "docs",
+]
+package-dir = { apkfast = "apkfast/.", include = "include", src = "src", patches = "patches", docs = "docs" }
+include-package-data = true
+
+[tool.setuptools.dynamic]
+# O script legado apkfast.py na raiz sombreia o pacote na busca de attrs do
+# setuptools; o sufixo "/." força a leitura de apkfast/__init__.py.
+version = { attr = "apkfast.__version__" }
+
+[tool.setuptools.package-data]
+"include" = ["*.hpp", "*.h", "*.c", "*.md", "LICENSE*"]
+"include.nativeapp" = ["*.hpp", "*.h", "*.c", "*.md"]
+"include.nativeapp.third_party" = ["*"]
+"src" = ["*.cpp", "*.c"]
+"patches" = ["*.diff", "*.patch", "*.md"]
+"docs" = ["*.md"]

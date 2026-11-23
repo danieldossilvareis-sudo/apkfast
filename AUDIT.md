@@ -121,3 +121,57 @@ o clear color das surfaces EGL — não o conteúdo renderizado.
   cai para OpenSLES — correção exigiria `dlopen/dlsym`
 - Race conditions com builds paralelos no mesmo diretório (baixa probabilidade)
 - Algumas checagens JNI adicionais em casos extremos de exceção pendente
+
+## v2.4.0 — EQUIPE A
+
+Escopo: itens que ficaram de fora da v2.3.0 (transporte de cache, SVG
+declarativo animado e redução do trabalho restante no build). Nenhuma versão
+foi alterada e nenhuma API existente foi removida.
+
+### Feito
+
+- `apkfast/cache_transport.py`: `register()`, `push()`, `pull()` e
+  `TransportResult`. Reusa `cache.export_bundle()` / `cache.import_bundle()`
+  sem criar segundo formato; suporta path local/`file://` com cópia atômica,
+  HTTP(S) com `curl -fL --retry 3` (PUT/GET, `.part` + `rename`, redirect
+  restrito a http/https, `--header` repitível) e `s3://` via `aws s3 cp`.
+  Respeita `APKFAST_CACHE_HMAC` e `--require-cache-signature`; oferece
+  `--expect-sha256` opcional (SHA256 do arquivo, nunca ETag S3). Locks
+  `(projectId, ABI)` envolvem export/import.
+- `include/nativeapp/animated_svg.hpp` + implementação em `image_impl.hpp`:
+  `AnimatedSvg` com pimpl (nenhum tipo LunaSVG vaza para a API pública),
+  `open`/`open_asset`, `update(dt_ms)`, `reset`, `width/height`,
+  `duration_ms`, `loop_count`, `animation_count`, `set_size` e `current()`.
+  Driver SMIL lê `<animate>`, `<animateTransform>` e `<set>` do XML cru
+  (o parser do LunaSVG descarta elementos desconhecidos) e reaplica atributos
+  no alvo resolvido por `href="#id"`, `id` ancestral ou tag ancestral+índice.
+  Documentos sem SMIL seguem exatamente o caminho `decode_svg_auto()`.
+- Documentação nova: `docs/cache-transport.md`, `docs/animated-svg.md`;
+  duas linhas adicionadas às tabelas de `docs/README.md`.
+
+### Riscos e limitações honestas
+
+- A integração em `cli.py`, `nativeapp.hpp`, `builder.py`, `CHANGELOG.md` e
+  `README.md` é de responsabilidade da sessão coordenadora: até lá os
+  subcomandos `cache-push`/`cache-pull` não aparecem na CLI e `AnimatedSvg`
+  precisa ser incluído explicitamente (o build já compila LunaSVG e o TU
+  injetado, então nenhuma flag nova é necessária).
+- SMIL é um subconjunto: sem `<script>`, CSS animations, `calcMode` não linear,
+  `keyTimes`/`keySplines`, `animateMotion`, `animateColor`, eventos/`begin`
+  com syncbase, `end`/`min`/`max` ou `href` externo. Atributos não numéricos
+  só funcionam via `<set>`. Ver `docs/animated-svg.md` para a lista completa.
+- Sem LunaSVG instalado, um SVG com SMIL **falha** em `open()` (aviso no
+  logcat) em vez de cair silenciosamente para NanoSVG estático. Com LunaSVG,
+  marcadores que não pertencem ao subconjunto são ignorados; se nenhum for
+  utilizável, `open()` faz fallback para o decoding estático e avisa.
+- Cada mudança de atributo animado rasteriza o documento inteiro; animações
+  com muitos elementos podem ser caras em dispositivos little-endian de baixo
+  poder. Não há cache de frame SVG (diferente de `AnimatedImage`).
+- HTTP PUT depende de endpoint que aceite `PUT`; atomicidade remota é
+  responsabilidade do servidor. Somente destinos locais/`file://` usam
+  `os.replace` de fato.
+- `aws s3 cp` exige AWS CLI no PATH; ETags nunca são usados como integridade
+  (correção/autenticidade vêm do SHA256 opcional e do HMAC do manifesto).
+- Item (3) do escopo (cache de recursos/APK assinado) **não foi implementado**:
+  mexeria em `builder.py`/`apkfast.py`, que são de propriedade da sessão
+  coordenadora. Nenhum atalho de build foi introduzido nesta rodada.
