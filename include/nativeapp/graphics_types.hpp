@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -39,6 +40,9 @@ struct MeshData {
     Topology topology = Topology::Triangles;
 
     void add_triangle(const Vertex& a, const Vertex& b, const Vertex& c) {
+        if (vertices.size() + 3 > 65536) {
+            throw std::runtime_error("Mesh excede 65536 vertices (limite uint16)");
+        }
         const uint16_t base = static_cast<uint16_t>(vertices.size());
         vertices.push_back(a);
         vertices.push_back(b);

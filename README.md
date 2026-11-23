@@ -117,7 +117,9 @@ APP_MAIN(App)
   com `on_surface_created()` / `on_surface_destroyed()` para recriar EGL/swapchain
   ao voltar de background (evita tela preta)
 
-Documentação completa: [`include/nativeapp/README.md`](include/nativeapp/README.md).
+Documentação completa:
+- [Guias individuais de cada helper](docs/README.md) — recomendado
+- [Referência consolidada da API](include/nativeapp/README.md)
 Exemplos: `examples/nativeapp-gl`, `examples/nativeapp-vulkan`,
 `examples/nativeapp-advanced` (Mesh/Material/matrizes/dt/Scene) e
 `examples/permissions-test` (teste real de permissões com callback).

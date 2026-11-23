@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.0.0] - 2026-11-22 (pós-release)
+
+### Documentação
+- `docs/` com 12 guias individuais e ricos (8.900+ linhas), um por helper:
+  App, OpenGL, Vulkan, permissões, text input, áudio, sensores, device,
+  input helpers, assets, matemática e tipos gráficos — todos baseados no
+  código real, com tabelas de API, exemplos compiláveis e armadilhas
+- Índice em `docs/README.md`, linkado no README principal
+
+### Correções descobertas durante a documentação
+- `MeshData::add_triangle()` agora rejeita malhas acima de 65536 vértices
+  (protege o índice `uint16_t`)
+- `GLES2Scene::draw_mesh()` não dereferencia mais `end()` quando uma textura
+  falha a carregar
+- `Audio::play_opensles()` aplica volume (antes ignorava) e mantém o buffer
+  vivo durante o `Enqueue` (evita áudio corrompido)
+
 ## [1.0.0] - 2026-11-22
 
 Primeira versão estável do apkfast. Build Android completo sem Gradle, com

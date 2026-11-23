@@ -194,7 +194,14 @@ private:
     }
 
     void play_opensles(const AudioBuffer& buffer, float volume) {
-        (void)volume;
+        // Aplica ganho em uma cópia: funciona independentemente de suporte a
+        // SLVolumeItf no device e mantém o buffer original intacto.
+        sles_samples_ = buffer.samples;  // mantém vivo até o player terminar
+        if (volume < 1.0f) {
+            for (auto& sample : sles_samples_) {
+                sample = static_cast<int16_t>(sample * volume);
+            }
+        }
         SLDataLocator_AndroidSimpleBufferQueue locator{
             SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE, 1};
         SLDataFormat_PCM format{
@@ -223,13 +230,14 @@ private:
         SLAndroidSimpleBufferQueueItf queue = nullptr;
         (*sles_player_)->GetInterface(sles_player_, SL_IID_PLAY, &play);
         (*sles_player_)->GetInterface(sles_player_, SL_IID_BUFFERQUEUE, &queue);
-        (*queue)->Enqueue(queue, buffer.samples.data(),
-                          buffer.samples.size() * sizeof(int16_t));
+        (*queue)->Enqueue(queue, sles_samples_.data(),
+                          sles_samples_.size() * sizeof(int16_t));
         (*play)->SetPlayState(play, SL_PLAYSTATE_PLAYING);
     }
 
     bool initialized_ = false;
     float volume_ = 1.0f;
+    std::vector<int16_t> sles_samples_;
     AAudioStream* aaudio_stream_ = nullptr;
     SLObjectItf sles_engine_ = nullptr;
     SLEngineItf sles_engine_interface_ = nullptr;

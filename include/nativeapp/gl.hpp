@@ -518,12 +518,15 @@ public:
                                         "Textura nao carregada: %s",
                                         material.texture.c_str());
                     shader.set_uniform("u_use_texture", 0);
+                    it = textures_.end();  // não dereferenciar abaixo
                 } else {
                     it = textures_.emplace(material.texture, std::move(texture)).first;
                 }
             }
-            it->second->bind(0);
-            shader.set_uniform("u_texture", 0);
+            if (it != textures_.end()) {
+                it->second->bind(0);
+                shader.set_uniform("u_texture", 0);
+            }
         }
 
         if (material.depth_test) glEnable(GL_DEPTH_TEST);
