@@ -1,7 +1,7 @@
 # apkfast
 
 [![CI](https://github.com/danieldossilvareis-sudo/apkfast/actions/workflows/ci.yml/badge.svg)](https://github.com/danieldossilvareis-sudo/apkfast/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-2.0.2-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.1.0-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 CLI para **montar, compilar, otimizar e entregar APKs sem Gradle**, com suporte
@@ -119,6 +119,7 @@ APP_MAIN(App)
 
 Documentação completa:
 - [Guias individuais de cada helper](docs/README.md) — recomendado
+  (inclui [bibliotecas próprias](docs/libraries.md))
 - [Referência consolidada da API](include/nativeapp/README.md)
 Exemplos: `examples/nativeapp-gl`, `examples/nativeapp-vulkan`,
 `examples/nativeapp-advanced` (Mesh/Material/matrizes/dt/Scene) e

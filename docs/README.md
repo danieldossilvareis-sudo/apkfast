@@ -28,6 +28,7 @@ armadilhas encontradas em testes reais.
 | [text-input.md](text-input.md) | Teclado virtual sem EditText, IME/unicode, API 21+ |
 | [fonts.md](fonts.md) | Fontes TTF/OTF, atlas de glyphs, `draw_text()` |
 | [audio-codecs.md](audio-codecs.md) | WAV/OGG/MP3, decode completo e streaming `Music` |
+| [libraries.md](libraries.md) | Bibliotecas `.a`/`.so` próprias por ABI |
 | [permissions.md](permissions.md) | Permissões runtime, callbacks, estados, todas as engines |
 | [input-helpers.md](input-helpers.md) | Mouse, gamepad analógico, estado de teclas |
 | [sensors.md](sensors.md) | Acelerômetro/giroscópio via callbacks no looper |

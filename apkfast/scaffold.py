@@ -235,6 +235,13 @@ def interactive_config(args, target: Path) -> ProjectConfig | None:
     )
 
 
+def _expand_abis(raw: str) -> list[str]:
+    """Expande 'all' ou lista separada por vírgula em ABIs válidas."""
+    if raw.strip() == "all":
+        return list(ALL_ABIS)
+    return [a.strip() for a in raw.split(",") if a.strip() in ALL_ABIS]
+
+
 def _slug(name: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "", name.lower())
     return slug or "app"
@@ -481,6 +488,10 @@ def create_project(target: Path, config: ProjectConfig) -> None:
     (target / "jni").mkdir(parents=True, exist_ok=True)
     (target / "assets").mkdir(parents=True, exist_ok=True)
     (target / "src" / "main" / "cpp").mkdir(parents=True, exist_ok=True)
+    # Convenção para bibliotecas próprias: libs/<abi>/. O apkfast cria as
+    # pastas das ABIs pedidas para facilitar o drop-in de .a/.so.
+    for abi_name in _expand_abis(config.abis):
+        (target / "libs" / abi_name).mkdir(parents=True, exist_ok=True)
 
     (target / "AndroidManifest.xml").write_text(render_manifest(config), encoding="utf-8")
     (target / "jni" / "main.cpp").write_text(render_source(config), encoding="utf-8")
@@ -497,6 +508,8 @@ def create_project(target: Path, config: ProjectConfig) -> None:
                 "release": config.release,
                 "keystore": config.keystore,
                 "template": config.template,
+                "libraries": [],
+                "libsDir": "libs",
             },
             indent=2,
         )

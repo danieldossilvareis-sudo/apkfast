@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.1.0] - 2026-11-23 — Bibliotecas próprias (.a/.so)
+
+### Adicionado
+- **Suporte a bibliotecas já compiladas**: convenção `libs/<abi>/*.a` e
+  `*.so`, flags `--lib` (repitível) e `--libs-dir`, e chaves `libraries` /
+  `libsDir` em `apkfast.json`
+- `.a` é linkada dentro de `libmain.so` (antes das libs do sistema); `.so` é
+  copiada para `lib/<abi>/` no APK
+- Isolamento por ABI em fat APK (uma lib arm64 nunca é linkada em x86)
+- scaffolds criam as pastas `libs/<abi>/`
+- Guia `docs/libraries.md`
+
+### Validado
+- lib estática própria retornando 42: `mylib-test: answer=42` no dispositivo
+- `.so` externa presente em `lib/arm64-v8a/` no APK
+- `--abi all` com libs apenas arm64 — sem contaminação entre ABIs
+- erro claro para `--lib` inexistente
+
 ## [2.0.2] - 2026-11-23 — Auditoria completa (6 equipes paralelas)
 
 Seis equipes independentes auditaram e corrigiram todo o código-fonte em

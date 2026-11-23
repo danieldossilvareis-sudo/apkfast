@@ -85,6 +85,8 @@ class BuildOptions:
     extra_cflags: list[str] = field(default_factory=list)
     extra_ldflags: list[str] = field(default_factory=list)
     sources: list[str] = field(default_factory=list)
+    libraries: list[str] = field(default_factory=list)
+    libs_dir: Path | None = None
     assets_dir: Path | None = None
     verbose: bool = False
     quiet: bool = False
@@ -319,6 +321,93 @@ def _collect_sources(project: Path, explicit: list[str]) -> list[Path]:
     return sorted(set(sources))
 
 
+def _collect_project_libs(
+    project: Path,
+    tc: Toolchain,
+    options: "BuildOptions",
+    log: Logger,
+) -> tuple[list[Path], list[Path]]:
+    """Coleta .a (link) e .so (embed) do projeto para a ABI atual.
+
+    Convenção: <projeto>/libs/<abi>/*.a e *.so. Também aceita --lib e
+    --libs-dir. Nunca cruza ABIs: um .a de arm64 nunca é linkado em x86.
+    """
+    abi = tc.abi
+    static_libs: list[Path] = []
+    shared_libs: list[Path] = []
+
+    roots: list[Path] = []
+    default_libs = project / "libs"
+    if options.libs_dir is not None:
+        custom = options.libs_dir.expanduser()
+        if not custom.is_absolute():
+            custom = project / custom
+        roots.append(custom.resolve())
+    elif default_libs.is_dir():
+        roots.append(default_libs)
+
+    for raw in options.libraries:
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = project / path
+        path = path.resolve()
+        if not path.exists():
+            raise BuildError(f"Biblioteca não encontrada: {path}")
+        if path.is_dir():
+            roots.append(path)
+        else:
+            _classify_lib(path, abi, static_libs, shared_libs, explicit=True)
+
+    for root in roots:
+        abi_dir = root / abi
+        candidates = sorted(abi_dir.glob("*.a")) + sorted(abi_dir.glob("*.so")) if abi_dir.is_dir() else []
+        # Compatibilidade: libs/ soltas (sem subdir de ABI) só valem para
+        # builds de uma ABI única; em fat APK isso é ambíguo e falha.
+        if not candidates and root.is_dir():
+            loose = sorted(root.glob("*.a")) + sorted(root.glob("*.so"))
+            if loose and len(options.selected_abis()) == 1:
+                candidates = loose
+            elif loose:
+                raise BuildError(
+                    f"Bibliotecas soltas em {root} são ambíguas em fat APK. "
+                    f"Use libs/<abi>/ ex.: libs/{abi}/"
+                )
+        for path in candidates:
+            _classify_lib(path, abi, static_libs, shared_libs, explicit=False)
+
+    # Dedup preservando ordem (importante para resolução de símbolos).
+    static_libs = list(dict.fromkeys(static_libs))
+    shared_libs = list(dict.fromkeys(shared_libs))
+    if static_libs or shared_libs:
+        log.info(
+            f"[*] Bibliotecas do projeto ({abi}): "
+            f"{len(static_libs)} estática(s), {len(shared_libs)} compartilhada(s)"
+        )
+    return static_libs, shared_libs
+
+
+def _classify_lib(
+    path: Path,
+    abi: str,
+    static_libs: list[Path],
+    shared_libs: list[Path],
+    *,
+    explicit: bool,
+) -> None:
+    if not path.is_file():
+        return
+    if path.parent.name in ALL_ABIS and path.parent.name != abi:
+        return  # biblioteca de outra ABI: ignora
+    if path.suffix == ".a":
+        static_libs.append(path)
+    elif path.suffix == ".so":
+        shared_libs.append(path)
+    elif explicit:
+        raise BuildError(
+            f"Biblioteca não suportada: {path} (use .a ou .so)"
+        )
+
+
 def _native_build(
     tc: Toolchain,
     options: BuildOptions,
@@ -335,6 +424,8 @@ def _native_build(
     sources = _collect_sources(project, options.sources)
     if not sources:
         return None, []
+
+    project_statics, project_shareds = _collect_project_libs(project, tc, options, log)
 
     # Injeta o TU com as implementações third-party do nativeapp (stb_image,
     # stb_truetype, stb_vorbis, dr_mp3) exatamente uma vez por build.
@@ -477,6 +568,9 @@ def _native_build(
     # falha com "cannot locate symbol __android_log_print".
     cmd += [
         *objects,
+        # Bibliotecas estáticas do projeto: antes das libs do sistema para
+        # que os símbolos sejam resolvidos na ordem correta.
+        *[str(lib) for lib in project_statics],
         "-lm",
         "-ldl",
         "-landroid",
@@ -488,6 +582,7 @@ def _native_build(
         *options.extra_ldflags,
     ]
     extra_libs: list[Path] = []
+    extra_libs.extend(project_shareds)
     if has_cpp:
         # Padrão: libc++ estático (APK menor, sem dependência externa).
         # --libcxx-shared usa libc++_shared.so e a embute no APK.
@@ -561,24 +656,31 @@ def _native_lib_name(manifest: ManifestInfo, project: Path) -> str:
         value = attrs.get("android:libraryName") or attrs.get("libraryName")
         if value:
             return value
-    config = project / "apkfast.json"
-    if config.is_file():
-        import json
-
-        try:
-            data = json.loads(config.read_text())
-        except (OSError, ValueError) as exc:
-            raise BuildError(f"apkfast.json inválido em {config}: {exc}") from exc
-        if not isinstance(data, dict):
-            raise BuildError(f"apkfast.json em {config} deve conter um objeto JSON.")
-        name = data.get("nativeLibraryName")
-        if name is not None:
-            if not isinstance(name, str) or not name.strip():
-                raise BuildError(
-                    f"nativeLibraryName em {config} deve ser um texto não vazio."
-                )
-            return name.strip()
+    data = _read_project_config(project)
+    name = data.get("nativeLibraryName")
+    if name is not None:
+        if not isinstance(name, str) or not name.strip():
+            raise BuildError(
+                f"nativeLibraryName em {project / 'apkfast.json'} deve ser um texto não vazio."
+            )
+        return name.strip()
     return "main"
+
+
+def _read_project_config(project: Path) -> dict:
+    """Lê apkfast.json com validação (config vazia = {})."""
+    config = project / "apkfast.json"
+    if not config.is_file():
+        return {}
+    import json
+
+    try:
+        data = json.loads(config.read_text())
+    except (OSError, ValueError) as exc:
+        raise BuildError(f"apkfast.json inválido em {config}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise BuildError(f"apkfast.json em {config} deve conter um objeto JSON.")
+    return data
 
 
 def _stage_native_lib(
@@ -900,6 +1002,21 @@ def build(options: BuildOptions) -> Path:
     if not manifest_path.is_file():
         raise BuildError(f"AndroidManifest.xml não encontrado em {project}")
     manifest = parse_manifest(manifest_path)
+
+    # Config do projeto (apkfast.json): bibliotecas próprias podem ser
+    # declaradas aqui; flags de CLI têm precedência.
+    config = _read_project_config(project)
+    if not options.libraries:
+        raw_libs = config.get("libraries", [])
+        if raw_libs is not None:
+            if not isinstance(raw_libs, list) or not all(isinstance(x, str) for x in raw_libs):
+                raise BuildError("'libraries' em apkfast.json deve ser uma lista de textos.")
+            options.libraries = list(raw_libs)
+    if options.libs_dir is None and config.get("libsDir"):
+        raw_dir = config["libsDir"]
+        if not isinstance(raw_dir, str):
+            raise BuildError("'libsDir' em apkfast.json deve ser um texto.")
+        options.libs_dir = Path(raw_dir)
 
     abis = options.selected_abis()
     if not abis:

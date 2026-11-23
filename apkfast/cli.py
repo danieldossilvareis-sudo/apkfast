@@ -101,6 +101,13 @@ def _add_build_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cflags", default="", help="flags extras para C/C++")
     parser.add_argument("--ldflags", default="", help="flags extras para o linker")
     parser.add_argument("--src", action="append", default=[], help="arquivo fonte (repitível)")
+    parser.add_argument(
+        "--lib", action="append", default=[], dest="libraries",
+        help="biblioteca .a/.so própria (repitível); ex.: libs/arm64-v8a/libfoo.a",
+    )
+    parser.add_argument(
+        "--libs-dir", help="raiz de bibliotecas (default: <projeto>/libs, com <abi>/)"
+    )
     parser.add_argument("--assets", help="diretório de assets (default: <projeto>/assets)")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument(
@@ -133,6 +140,8 @@ def _cmd_build(args: argparse.Namespace) -> int:
         extra_cflags=args.cflags.split(),
         extra_ldflags=args.ldflags.split(),
         sources=args.src,
+        libraries=args.libraries,
+        libs_dir=Path(args.libs_dir) if args.libs_dir else None,
         assets_dir=Path(args.assets) if args.assets else None,
         verbose=args.verbose,
         quiet=_quiet(args),
