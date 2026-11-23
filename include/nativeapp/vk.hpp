@@ -72,10 +72,10 @@ public:
 
         // Handles locais: se qualquer etapa falhar, nada fica vazando e o
         // objeto permanece utilizável para outra chamada de build().
-        VkShaderModule vertex_module = nullptr;
-        VkShaderModule fragment_module = nullptr;
-        VkPipelineLayout layout = nullptr;
-        VkPipeline pipeline = nullptr;
+        VkShaderModule vertex_module = VK_NULL_HANDLE;
+        VkShaderModule fragment_module = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        VkPipeline pipeline = VK_NULL_HANDLE;
         try {
             vertex_module = create_shader_module(device_, config.vertex_spv);
             fragment_module = create_shader_module(device_, config.fragment_spv);
@@ -196,7 +196,7 @@ public:
             if (layout) vkDestroyPipelineLayout(device_, layout, nullptr);
             if (vertex_module) vkDestroyShaderModule(device_, vertex_module, nullptr);
             if (fragment_module) vkDestroyShaderModule(device_, fragment_module, nullptr);
-            device_ = nullptr;
+            device_ = VK_NULL_HANDLE;
             throw;
         }
 
@@ -217,9 +217,9 @@ public:
 
     void destroy() {
         if (!device_) return;
-        if (pipeline_) { vkDestroyPipeline(device_, pipeline_, nullptr); pipeline_ = nullptr; }
-        if (layout_) { vkDestroyPipelineLayout(device_, layout_, nullptr); layout_ = nullptr; }
-        device_ = nullptr;
+        if (pipeline_) { vkDestroyPipeline(device_, pipeline_, nullptr); pipeline_ = VK_NULL_HANDLE; }
+        if (layout_) { vkDestroyPipelineLayout(device_, layout_, nullptr); layout_ = VK_NULL_HANDLE; }
+        device_ = VK_NULL_HANDLE;
     }
 
 private:
@@ -239,15 +239,15 @@ private:
         VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         info.codeSize = code.size() * sizeof(uint32_t);
         info.pCode = code.data();
-        VkShaderModule module = nullptr;
+        VkShaderModule module = VK_NULL_HANDLE;
         vk_check(vkCreateShaderModule(device, &info, nullptr, &module),
                  "vkCreateShaderModule");
         return module;
     }
 
-    VkDevice device_ = nullptr;
-    VkPipeline pipeline_ = nullptr;
-    VkPipelineLayout layout_ = nullptr;
+    VkDevice device_ = VK_NULL_HANDLE;
+    VkPipeline pipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout layout_ = VK_NULL_HANDLE;
 };
 
 /// Vertex/index buffer com upload direto para memória HOST_VISIBLE/COHERENT
@@ -317,10 +317,10 @@ public:
         if (index_buffer_) vkDestroyBuffer(device_, index_buffer_, nullptr);
         if (vertex_memory_) vkFreeMemory(device_, vertex_memory_, nullptr);
         if (index_memory_) vkFreeMemory(device_, index_memory_, nullptr);
-        vertex_buffer_ = index_buffer_ = nullptr;
-        vertex_memory_ = index_memory_ = nullptr;
+        vertex_buffer_ = index_buffer_ = VK_NULL_HANDLE;
+        vertex_memory_ = index_memory_ = VK_NULL_HANDLE;
         vertex_count_ = index_count_ = 0;
-        device_ = nullptr;
+        device_ = VK_NULL_HANDLE;
     }
 
 private:
@@ -333,9 +333,9 @@ private:
         vertex_count_ = other.vertex_count_;
         index_count_ = other.index_count_;
         topology_ = other.topology_;
-        other.device_ = nullptr;
-        other.vertex_buffer_ = other.index_buffer_ = nullptr;
-        other.vertex_memory_ = other.index_memory_ = nullptr;
+        other.device_ = VK_NULL_HANDLE;
+        other.vertex_buffer_ = other.index_buffer_ = VK_NULL_HANDLE;
+        other.vertex_memory_ = other.index_memory_ = VK_NULL_HANDLE;
         other.vertex_count_ = other.index_count_ = 0;
         other.topology_ = Topology::Triangles;
     }
@@ -361,7 +361,7 @@ private:
             vk_check(vkAllocateMemory(device_, &alloc, nullptr, &memory),
                      "vkAllocateMemory");
 
-            void* mapped = nullptr;
+            void* mapped = VK_NULL_HANDLE;
             vk_check(vkMapMemory(device_, memory, 0, size, 0, &mapped), "vkMapMemory");
             if (!mapped) throw VulkanError("vkMapMemory retornou ponteiro nulo");
             std::memcpy(mapped, data, static_cast<size_t>(size));
@@ -369,8 +369,8 @@ private:
             vk_check(vkBindBufferMemory(device_, buffer, memory, 0),
                      "vkBindBufferMemory");
         } catch (...) {
-            if (memory) { vkFreeMemory(device_, memory, nullptr); memory = nullptr; }
-            if (buffer) { vkDestroyBuffer(device_, buffer, nullptr); buffer = nullptr; }
+            if (memory) { vkFreeMemory(device_, memory, nullptr); memory = VK_NULL_HANDLE; }
+            if (buffer) { vkDestroyBuffer(device_, buffer, nullptr); buffer = VK_NULL_HANDLE; }
             throw;
         }
     }
@@ -388,11 +388,11 @@ private:
         throw VulkanError("Nenhum memory type adequado");
     }
 
-    VkDevice device_ = nullptr;
-    VkBuffer vertex_buffer_ = nullptr;
-    VkBuffer index_buffer_ = nullptr;
-    VkDeviceMemory vertex_memory_ = nullptr;
-    VkDeviceMemory index_memory_ = nullptr;
+    VkDevice device_ = VK_NULL_HANDLE;
+    VkBuffer vertex_buffer_ = VK_NULL_HANDLE;
+    VkBuffer index_buffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory vertex_memory_ = VK_NULL_HANDLE;
+    VkDeviceMemory index_memory_ = VK_NULL_HANDLE;
     uint32_t vertex_count_ = 0;
     uint32_t index_count_ = 0;
     Topology topology_ = Topology::Triangles;
@@ -420,10 +420,10 @@ public:
             pick_physical_device();
             create_device();
         } catch (...) {
-            if (device_) { vkDestroyDevice(device_, nullptr); device_ = nullptr; }
-            if (instance_) { vkDestroyInstance(instance_, nullptr); instance_ = nullptr; }
-            physical_device_ = nullptr;
-            queue_ = nullptr;
+            if (device_) { vkDestroyDevice(device_, nullptr); device_ = VK_NULL_HANDLE; }
+            if (instance_) { vkDestroyInstance(instance_, nullptr); instance_ = VK_NULL_HANDLE; }
+            physical_device_ = VK_NULL_HANDLE;
+            queue_ = VK_NULL_HANDLE;
             throw;
         }
         initialized_ = true;
@@ -460,9 +460,9 @@ public:
         destroy_swapchain();
         if (surface_) {
             vkDestroySurfaceKHR(instance_, surface_, nullptr);
-            surface_ = nullptr;
+            surface_ = VK_NULL_HANDLE;
         }
-        window_ = nullptr;
+        window_ = VK_NULL_HANDLE;
         swapchain_ok_ = false;
     }
 
@@ -598,14 +598,14 @@ public:
         invalidate();
         if (render_pass_) {
             vkDestroyRenderPass(device_, render_pass_, nullptr);
-            render_pass_ = nullptr;
+            render_pass_ = VK_NULL_HANDLE;
         }
         pipeline_.destroy();
         current_mesh_.destroy();
-        if (device_) { vkDestroyDevice(device_, nullptr); device_ = nullptr; }
-        if (instance_) { vkDestroyInstance(instance_, nullptr); instance_ = nullptr; }
-        queue_ = nullptr;
-        physical_device_ = nullptr;
+        if (device_) { vkDestroyDevice(device_, nullptr); device_ = VK_NULL_HANDLE; }
+        if (instance_) { vkDestroyInstance(instance_, nullptr); instance_ = VK_NULL_HANDLE; }
+        queue_ = VK_NULL_HANDLE;
+        physical_device_ = VK_NULL_HANDLE;
         has_mesh_ = false;
         swapchain_ok_ = false;
         current_frame_ = 0;
@@ -1028,19 +1028,19 @@ private:
         images_in_flight_.clear();
         command_buffers_.clear();
 
-        if (command_pool_) { vkDestroyCommandPool(device_, command_pool_, nullptr); command_pool_ = nullptr; }
+        if (command_pool_) { vkDestroyCommandPool(device_, command_pool_, nullptr); command_pool_ = VK_NULL_HANDLE; }
         for (auto framebuffer : framebuffers_) vkDestroyFramebuffer(device_, framebuffer, nullptr);
         framebuffers_.clear();
-        if (render_pass_) { vkDestroyRenderPass(device_, render_pass_, nullptr); render_pass_ = nullptr; }
-        if (depth_view_) { vkDestroyImageView(device_, depth_view_, nullptr); depth_view_ = nullptr; }
-        if (depth_image_) { vkDestroyImage(device_, depth_image_, nullptr); depth_image_ = nullptr; }
-        if (depth_memory_) { vkFreeMemory(device_, depth_memory_, nullptr); depth_memory_ = nullptr; }
+        if (render_pass_) { vkDestroyRenderPass(device_, render_pass_, nullptr); render_pass_ = VK_NULL_HANDLE; }
+        if (depth_view_) { vkDestroyImageView(device_, depth_view_, nullptr); depth_view_ = VK_NULL_HANDLE; }
+        if (depth_image_) { vkDestroyImage(device_, depth_image_, nullptr); depth_image_ = VK_NULL_HANDLE; }
+        if (depth_memory_) { vkFreeMemory(device_, depth_memory_, nullptr); depth_memory_ = VK_NULL_HANDLE; }
         for (auto view : image_views_) vkDestroyImageView(device_, view, nullptr);
         image_views_.clear();
         images_.clear();
         image_count_ = 0;
         vkDestroySwapchainKHR(device_, swapchain_, nullptr);
-        swapchain_ = nullptr;
+        swapchain_ = VK_NULL_HANDLE;
     }
 
     void recreate_swapchain() {
@@ -1068,27 +1068,27 @@ private:
         swapchain_ok_ = true;
     }
 
-    ANativeActivity* activity_ = nullptr;
-    ANativeWindow* window_ = nullptr;
-    VkInstance instance_ = nullptr;
-    VkPhysicalDevice physical_device_ = nullptr;
-    VkDevice device_ = nullptr;
-    VkQueue queue_ = nullptr;
+    ANativeActivity* activity_ = VK_NULL_HANDLE;
+    ANativeWindow* window_ = VK_NULL_HANDLE;
+    VkInstance instance_ = VK_NULL_HANDLE;
+    VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
+    VkDevice device_ = VK_NULL_HANDLE;
+    VkQueue queue_ = VK_NULL_HANDLE;
     uint32_t queue_family_ = 0;
-    VkSurfaceKHR surface_ = nullptr;
-    VkSwapchainKHR swapchain_ = nullptr;
+    VkSurfaceKHR surface_ = VK_NULL_HANDLE;
+    VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     VkFormat color_format_ = VK_FORMAT_B8G8R8A8_UNORM;
     VkFormat depth_format_ = VK_FORMAT_D16_UNORM;
-    VkImage depth_image_ = nullptr;
-    VkDeviceMemory depth_memory_ = nullptr;
-    VkImageView depth_view_ = nullptr;
-    VkRenderPass render_pass_ = nullptr;
+    VkImage depth_image_ = VK_NULL_HANDLE;
+    VkDeviceMemory depth_memory_ = VK_NULL_HANDLE;
+    VkImageView depth_view_ = VK_NULL_HANDLE;
+    VkRenderPass render_pass_ = VK_NULL_HANDLE;
     VkExtent2D extent_{1, 1};
     uint32_t image_count_ = 0;
     std::vector<VkImage> images_;
     std::vector<VkImageView> image_views_;
     std::vector<VkFramebuffer> framebuffers_;
-    VkCommandPool command_pool_ = nullptr;
+    VkCommandPool command_pool_ = VK_NULL_HANDLE;
     std::vector<VkCommandBuffer> command_buffers_;
     std::vector<VkSemaphore> image_available_;
     std::vector<VkSemaphore> render_finished_;
