@@ -71,7 +71,7 @@ jobs:
           python3 -m json.tool apkfast.lock.json >/dev/null
           python3 apkfast.py doctor --json > doctor.json
           python3 -m json.tool doctor.json >/dev/null
-          grep -q '"status": "ok"' doctor.json
+          grep -q '"ok": true' doctor.json
 
       - name: Build native-hello, image-demo and permissions-test
         run: |
