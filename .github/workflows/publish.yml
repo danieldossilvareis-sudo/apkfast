@@ -41,6 +41,9 @@ jobs:
   config:
     name: Resolve publish mode
     runs-on: ubuntu-latest
+    # Necessário para enxergar secrets do environment (ex.: PYPI_API_TOKEN).
+    environment:
+      name: pypi
     outputs:
       enabled: ${{ steps.decide.outputs.enabled }}
     env:
