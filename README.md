@@ -1,7 +1,7 @@
 # apkfast
 
 [![CI](https://github.com/danieldossilvareis-sudo/apkfast/actions/workflows/ci.yml/badge.svg)](https://github.com/danieldossilvareis-sudo/apkfast/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-2.7.2-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.7.3-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 CLI para **montar, compilar, otimizar e entregar APKs sem Gradle**, com suporte
@@ -293,8 +293,9 @@ Detalhes: [`docs/build-cache.md`](docs/build-cache.md).
 
 ## SDL2 e SDL3 (sem Gradle)
 
-O apkfast inclui SDL 2.32.6 e SDL 3.5 pré-compiladas para as 4 ABIs em
-`vendor/sdl2/` e `vendor/sdl3/`.
+O apkfast suporta SDL2 2.32.10 e SDL3 3.4.20. As bibliotecas são baixadas e
+compiladas por `apkfast setup-libs` para as ABIs escolhidas; o repositório não
+versiona binários em `vendor/`.
 
 ### SDL2 — com SDLActivity (Java)
 
@@ -332,8 +333,8 @@ Para recompilar uma ABI: `python3 apkfast.py sdl-install 2 --abi <abi>` (ou 3).
 
 ## raylib (sem Gradle)
 
-O apkfast já inclui a raylib 6.5 compilada para **todas as 4 ABIs** em
-`vendor/raylib/lib/`. O comando `--abi all` funciona de imediato:
+O apkfast usa raylib 5.5 (pinned por SHA256). Compile as ABIs desejadas uma vez
+com `apkfast setup-libs --abis all`; depois o comando abaixo funciona de imediato:
 
 ```sh
 python3 apkfast.py build . --abi all
@@ -448,5 +449,6 @@ trocar a cor de fundo. Para depurar erros GL/EGL, a API emite warnings
 2. clang do NDK -> objetos + `native_app_glue` -> `lib<name>.so`
 3. `aapt2 link` -> APK base
 4. insere `lib/<abi>/*.so`
-5. `zipalign -f 4`
-6. `apksigner sign` (v2; v1 quando minSdk < 24) + `apksigner verify`
+5. `zipalign -f -P 16 4` (com fallback para `-f 4`)
+6. `apksigner sign` (v1/v2/v3/v4, conforme API e flags) + `apksigner verify`
+7. `bundletool build-bundle` + `jarsigner` quando `--aab` é usado

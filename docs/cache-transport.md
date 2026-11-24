@@ -102,18 +102,11 @@ print(sent.stats["blobs"], got.stats["imported"])
 python3 apkfast.py build examples/nativeapp-gl -o /tmp/a.apk --cache-dir /tmp/cache-a
 python3 apkfast.py cache-export . -o /tmp/cache.tar.gz --cache-dir /tmp/cache-a --abi all
 
-# B) push/pull local (usa as funções se a CLI ainda não estiver ligada)
-python3 - <<'PY'
-from pathlib import Path
-from apkfast import cache, cache_transport
-from apkfast.cli import create_parser
-args = create_parser().parse_args(["cache-export", ".", "--cache-dir", "/tmp/cache-a"])
-# Em integração futura: use cache-push/cache-pull; aqui, montamos o ctx:
-from apkfast.cli import _cache_transport_context
-ctx, abis = _cache_transport_context(args)
-print(cache_transport.push(ctx, "file:///tmp/cache-pushed.tar.gz", abis=abis))
-print(cache_transport.pull(ctx, "/tmp/cache-pushed.tar.gz", abis=abis))
-PY
+# B) push/pull local pela CLI
+python3 apkfast.py cache-push file:///tmp/cache-pushed.tar.gz . \
+  --cache-dir /tmp/cache-a --abi all
+python3 apkfast.py cache-pull /tmp/cache-pushed.tar.gz . \
+  --cache-dir /tmp/cache-b --abi all
 
 # C) HTTP local (se curl existir): suba um servidor que aceite PUT,
 #    por exemplo `python3 -m http.server` não aceita PUT — use nginx/Caddy ou

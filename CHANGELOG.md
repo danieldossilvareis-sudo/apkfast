@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.7.3] - 2026-11-24 — Documentação auditada
+
+Nenhuma mudança de runtime, API ou build. A base permanece estável e congelada.
+
+- README: versões corretas de SDL2 (2.32.10), SDL3 (3.4.20) e raylib (5.5);
+  `vendor/` não versiona binários — use `setup-libs`
+- README: pipeline interno atualizado (`zipalign -P 16`, v1/v2/v3/v4, AAB)
+- `docs/compatibility.md`: contrato atualizado para API 2.7.3
+- `docs/migration.md`: seções 2.4→2.5, 2.5→2.6 e 2.6→2.7
+- `docs/publishing.md`: estado real do PyPI e SemVer examples
+- `docs/cache-transport.md`: exemplos usando a CLI já integrada
+
 ## [2.7.2] - 2026-11-24 — Estável
 
 - metadado do PyPI promovido de **Beta** para **Production/Stable**

@@ -1,16 +1,18 @@
 # Publicação no PyPI
 
-> **Estado desta entrega:** a automação está pronta, mas **nada foi publicado**.
-> `publish.yml` não foi executado; nenhum `twine upload`, tag, commit ou release
-> foi feito. A versão continua `2.4.1`.
+> **Estado atual:** apkfast está publicado no PyPI como **Production/Stable**.
+> A versão de referência é `2.7.2`. O workflow `publish.yml` publica
+> automaticamente em cada GitHub Release quando `PYPI_API_TOKEN` ou o Trusted
+> Publisher está configurado; caso contrário ele apenas valida a distribuição
+> e pula o upload.
 
 ## Versionamento
 
 A única fonte de verdade é `apkfast/__init__.py` (`__version__`). Ela é lida por
 `pyproject.toml`, pela CLI (`apkfast --version`) e pelo lockfile. Use SemVer:
 
-- patch: correção compatível (2.4.1 → 2.4.2);
-- minor: feature compatível (2.4.x → 2.5.0);
+- patch: correção compatível (2.7.2 → 2.7.3);
+- minor: feature compatível (2.7.x → 2.8.0);
 - major: quebra de API/ABI (2.x → 3.0.0).
 
 A tag segue `vX.Y.Z`. Não incrementar a versão em nenhum outro arquivo.

@@ -1,4 +1,4 @@
-# Compatibilidade e contrato de API — v2.4.0
+# Compatibilidade e contrato de API — v2.7.2
 
 A API `nativeapp/` usa **Semantic Versioning** e um número dedicado, disponível
 em [`include/nativeapp/version.hpp`](../include/nativeapp/version.hpp):
@@ -6,21 +6,21 @@ em [`include/nativeapp/version.hpp`](../include/nativeapp/version.hpp):
 ```cpp
 #include <nativeapp/nativeapp.hpp>
 
-#if APKFAST_API_VERSION < 20400
-#  error " Este projeto exige apkfast >= 2.4.0"
+#if APKFAST_API_VERSION < 20702
+#  error " Este projeto exige apkfast >= 2.7.2"
 #endif
 
-const char* versao = APKFAST_API_VERSION_STRING;  // "2.4.0"
+const char* versao = APKFAST_API_VERSION_STRING;  // "2.7.2"
 ```
 
-O número da API acompanha a versão do apkfast (2.4.0 → API 2.4.0). O pacote
+O número da API acompanha a versão do apkfast (2.7.2 → API 2.7.2). O pacote
 Python expõe `apkfast.__version__` e `apkfast --version` com o mesmo valor.
 
 ## O que é prometido
 
 | Promessa | Detalhe |
 |---|---|
-| Compatibilidade de **código-fonte** dentro do mesmo MAJOR | Código que compila com 2.3.x continua compilando com 2.4.x, salvo avisos de depreciação. |
+| Compatibilidade de **código-fonte** dentro do mesmo MAJOR | Código que compila com 2.6.x continua compilando com 2.7.x, salvo avisos de depreciação. |
 | Nomes e assinaturas públicos | `nativeapp::App`, `GLES2Scene`, `VulkanScene`, `Permissions`, helpers de áudio/imagem/device etc. |
 | Comportamento documentado | Ciclo de vida (`on_ready`, `on_surface_created`, `on_draw`, ...), convenção `APP_MAIN`, `lib_name=main`. |
 | Backend de build | Mesma toolchain NDK detectada, com `--sdk-dir`/`--ndk-dir`/`--build-tools` como saída de escape. |

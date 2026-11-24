@@ -44,9 +44,39 @@
   `doctor --json`, `build --report`, `build --generate-lock`,
   `build --ignore-lock`.
 
+## 2.4 → 2.5
+
+- **AAB.** Use `build . --aab` para gerar APK + AAB assinado, ou `--aab-only`.
+  O bundletool 1.18.3 é baixado com SHA256 verificado e cacheado em
+  `~/.apkfast/tools/`. Veja [aab.md](aab.md).
+- **Publicação.** Comandos `dist` e `publish-pypi` (dry-run por padrão) e
+  workflows de release/PyPI e dispositivo real. Veja
+  [publishing.md](publishing.md) e [device-ci.md](device-ci.md).
+
+## 2.5 → 2.6
+
+- **Assinatura.** v1/v2/v3/v4 habilitáveis, keystore/senhas/alias por variáveis
+  de ambiente, `versionCode` com `manifest+1`/`explicit`/`timestamp` e
+  fingerprint da keystore na chave de cache. Veja [signing.md](signing.md).
+- **Cache de recursos/APK.** `aapt2 compile`, `aapt2 link`, `zipalign` e
+  `apksigner` passam a ser cacheados. Trocar a keystore invalida só o APK
+  assinado. Veja [build-cache.md](build-cache.md).
+- Fontes pinned: raylib 5.5, SDL2 2.32.10 e SDL3 3.4.20.
+
+## 2.6 → 2.7
+
+- **Cache completo.** DEX (D8/R8) e AAB assinado entraram no cache; chaves são
+  por ABI, então `--abi X` reaproveita entradas de `--abi all`.
+- `cache-export`/`cache-import` transportam também `resource`, `dex`,
+  `apkLink`, `apk` e `aab` (formato aditivo).
+- **`versionCode` timestamp seguro.** Base 2020-01-01 UTC, válido até 2086.
+  Apps que já publicaram códigos altos devem usar `explicit` para manter a
+  sequência crescente exigida pela Play.
+- v2.7.2 é a primeira versão marcada como **Production/Stable** no PyPI.
+
 ## Antes de atualizar (checklist rápido)
 
-1. `apkfast --version` → 2.4.0.
+1. `apkfast --version` → 2.7.2.
 2. `apkfast config show .` → sem erros de validação.
 3. `apkfast doctor --json` → toolchain coerente com `apkfast.lock.json`.
 4. Recompile os 14 exemplos relevantes (a matriz CI faz isso para
