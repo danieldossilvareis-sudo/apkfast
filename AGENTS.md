@@ -1,105 +1,56 @@
 # AGENTS.md
 
-Instruções para agentes/contribuidores que trabalham neste repositório.
+## Contrato da base
 
-## O que é apkfast
+apkfast é **CLI + runtime `nativeapp/` para Android nativo em C/C++**, não engine nem framework.
 
-apkfast é a **base** para apps Android nativos em C/C++ sem Gradle:
+- Fica na base: toolchain/ABIs, build/APK/AAB, assinatura, cache, lockfile, lifecycle/looper, EGL/GLES/Vulkan, input, permissões, teclado, assets, codecs, fonte/texto, sensores/device, glue raylib/SDL, logs/report/doctor.
+- Não entra: ECS, física, câmera, UI widgets, animação de jogo, save, rede, mixer 3D, scripting, editor, pipeline de assets com baking.
+- Dependência é `framework → apkfast`; nunca o contrário. Se a mudança passa a dizer “como o app deve ser organizado”, saiu do escopo.
 
-- CLI de build, empacotamento, assinatura, AAB, cache e distribuição;
-- API C++ header-only `nativeapp/` como camada de plataforma;
-- glue com raylib, SDL2 e SDL3.
+## Entrypoints e layout não óbvios
 
-Versão estável atual: **2.7.3** (`apkfast/__init__.py`).
-Não altere a versão sem instrução explícita.
+- `apkfast.py` é o script raiz; entry point instalado é `apkfast = apkfast.cli:main`. A lógica vive em `apkfast/cli.py` e `apkfast/builder.py`.
+- Versão: `apkfast/__init__.py`. `include/nativeapp/version.hpp` deve acompanhar. Não bump sem release autorizada.
+- O root `apkfast.py` sombreia o pacote no setuptools; por isso `pyproject.toml` usa `package-dir apkfast = "apkfast/."`. Não “corrigir”.
+- O builder resolve `<pacote>/../include`, `src/`, `patches/` e `docs/`; a wheel os instala como namespace packages. Não mover esses diretórios.
+- Implementações third-party ficam em `src/nativeapp_impl*.cpp` + `include/nativeapp/image_impl.hpp`; raylib usa `nativeapp_impl_no_image.cpp`.
 
-## Limite de escopo — leia antes de propor features
+## Setup e fluxo
 
-apkfast é uma base, **não é uma engine nem um framework de apps**.
+- Python ≥ 3.11. SDK/NDK em `~/Android` ou `APKFAST_ANDROID_ROOT`; verifique com `apkfast doctor`.
+- `setup-libs --abis <abi>` baixa/compila raylib/SDL/libwebp/LunaSVG. `vendor/` não é versionado.
+- `build --generate-lock` **só gera o lockfile e sai**. Lock divergente falha; `--ignore-lock` transforma em aviso.
+- `--no-incremental` ignora leitura/escrita do cache; `--clean-cache` apaga só o escopo do projeto/ABI.
 
-### Fica na base
-
-- toolchain, ABIs, NDK/SDK, lockfile, build, APK/AAB, assinatura, cache;
-- lifecycle/looper, EGL/GLES/Vulkan, input bruto, permissões, teclado virtual;
-- assets, codecs de imagem/áudio, fonte e texto básico;
-- sensores, device, glue com engines;
-- logs, report, doctor, transporte de cache.
-
-Regra: se é difícil, universal e específico do Android, fica aqui.
-
-### Não entra na base
-
-- ECS, scene graph, física, colisão, câmera;
-- UI widgets, layout, temas;
-- animação de jogo, state machines, skeletal animation;
-- save system, serialização de domínio, rede/multiplayer;
-- mixer 3D/posicional, scripting, editor visual, pipeline de assets com baking.
-
-Esses itens pertencem a repositórios separados que dependem do apkfast:
-
-```text
-framework → apkfast
-apkfast  ↛ framework
-```
-
-A base nunca deve saber que existe um framework em cima dela.
-
-## Mapa rápido
-
-| Caminho | Papel |
-|---|---|
-| `apkfast.py`, `apkfast/cli.py` | entry point e comandos |
-| `apkfast/builder.py` | pipeline de build |
-| `apkfast/cache.py`, `resource_cache.py`, `cache_transport.py` | cache local/remoto |
-| `apkfast/bundle.py` | AAB via bundletool |
-| `apkfast/signing.py` | assinatura e versionCode |
-| `apkfast/raylib.py`, `sdl.py`, `webp.py`, `lunasvg.py` | setup de libs pinned |
-| `include/nativeapp/` | API C++ header-only |
-| `src/nativeapp_impl*.cpp` | TUs injetadas com implementações third-party |
-| `examples/` | 14 exemplos funcionais |
-| `tests/` | testes unitários |
-| `docs/` | guias por helper |
-| `scripts/device-check.sh` | validação adb local |
-| `vendor/` | **não versionado** — baixado por `setup-libs` |
-
-## Regras de ouro
-
-1. **Não commite binários.** Nada de `.a`, `.so`, `.apk`, `.aab`, keystore ou `vendor/`.
-2. **Fontes third-party pinned.** raylib/SDL/libwebp/LunaSVG com versão e SHA256 fixados.
-3. **API é source-compatible, não ABI-compatible.** Headers são compilados dentro do app.
-4. **Mude `version.hpp` e `__init__.py` juntos**, somente em release autorizada.
-5. **Cache precisa ser portável.** Nunca coloque paths absolutos nas chaves; use os tokens lógicos de `cache.py`.
-6. **Quiet mode é contrato.** Erros sempre em `stderr` com `[✗]`; `--quiet` não vaza output.
-7. **Segredos nunca em log.** Use `signing.redact_args()` / variáveis de ambiente.
-8. **Docs acompanham código.** Versões de libs, comandos e pipeline descritos no README devem bater com o código.
-9. **Não publique nada sem autorização.** PyPI e releases são ações externas e irreversíveis.
-
-## Validação antes de dizer que terminou
+## Comandos de verificação
 
 ```sh
 python3 -m compileall -q apkfast apkfast.py tests
 python3 -m unittest discover -s tests -v
+python3 -m unittest tests.test_bundle -v          # um arquivo específico
+python3 apkfast.py config show examples/native-hello
 python3 apkfast.py build examples/native-hello -q
 python3 apkfast.py build examples/image-demo --aab -q
-sh scripts/device-check.sh dist/app.apk com.example.nativehello
+sh scripts/device-check.sh app.apk com.example.nativehello
 ```
 
-Também vale conferir links locais dos Markdown e o `--help` de comandos novos.
+- Testes unitários são puros: não exigem SDK/NDK. CI valida lockfile com toolchain fake.
+- `ci.yml`: sintaxe/help/config/lock/testes. `device.yml`: **build matrix**, não runtime em dispositivo. `device-real.yml`: depende de runner self-hosted ou Firebase e fica em skip sem config.
 
-## CI e releases
+## Armadilhas
 
-- `ci.yml`: sintaxe, help, testes, config/lock.
-- `device.yml`: **build matrix**, não runtime em dispositivo.
-- `device-real.yml`: dispositivo real, mas depende de runner self-hosted ou Firebase; fica em skip se nada estiver configurado.
-- `publish.yml`: publica no PyPI quando há token/OIDC configurado.
+- Chaves de cache devem usar tokens lógicos (`<project>`, `<ndk>`, `<cache>`, ...), nunca paths absolutos. Os `-ffile-prefix-map` do builder são necessários.
+- Keystore/senhas vêm de `APKFAST_KEYSTORE`, `APKFAST_STORE_PASS`, `APKFAST_KEY_PASS`, `APKFAST_KEY_ALIAS`. Nunca logar; use `signing.redact_args()`.
+- bundletool 1.18.3 é pinned: `APKFAST_BUNDLETOOL_SHA256` ou `--bundletool-version`; cache em `~/.apkfast/tools` (`APKFAST_TOOLS_DIR`).
+- raylib/SDL2/SDL3 são pinned por versão + SHA256. Trocar a versão sem SHA falha de propósito.
+- AAB = `bundletool build-bundle` + `jarsigner`. APK = `apksigner` v1/v2/v3/v4 + `.idsig` quando v4.
+- `--quiet` é contrato: erros em `stderr` com `[✗]`; nenhum output de subprocess deve vazar.
+- Se docs e código divergirem, `--help`, CI e testes são a fonte de verdade.
 
-Estado atual das releases do GitHub:
+## Publicação e estado das releases
 
-- **v2.7.3 é a única pública**
-- releases antigas estão em **draft**, com tags preservadas
-- não mude isso sem pedido explícito
-
-## Tom das mudanças
-
-Prefira mudanças pequenas, reversíveis e auditáveis.
-Se uma alteração começar a responder “como o app deve ser organizado”, ela provavelmente saiu do escopo do apkfast.
+- `dist` gera/valida sdist+wheel; `publish-pypi` é **dry-run por padrão**, exige `--yes` para upload real.
+- Token local: `TWINE_USERNAME`/`TWINE_PASSWORD` ou `TWINE_API_TOKEN`/`PYPI_TOKEN`. No GitHub: secret `PYPI_API_TOKEN`.
+- Não publique nada sem autorização explícita.
+- Snapshot atual: **v2.7.3 é a única release pública** no GitHub; as antigas estão em draft com tags preservadas. Não alterar sem pedido.
