@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -64,8 +65,10 @@ class ResourceCacheTests(unittest.TestCase):
             assets_dir=None,
             cache_namespace="",
             release=False,
+            optimize="release",
             obfuscate=False,
             key_alias="androiddebugkey",
+            bundletool_version="1.18.3",
             incremental=True,
         )
         self.ctx = self._context("main")
@@ -73,13 +76,18 @@ class ResourceCacheTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def _context(self, name: str, mode: str = "verify") -> cache_mod.CacheContext:
+    def _context(
+        self,
+        name: str,
+        mode: str = "verify",
+        abis: tuple[str, ...] = ("arm64-v8a",),
+    ) -> cache_mod.CacheContext:
         return cache_mod.CacheContext(
             root=self.base / "cache",
             project_id=cache_mod.project_id("com.example.app", name),
             mode=mode,
             require_signature=False,
-            abis=("arm64-v8a",),
+            abis=abis,
         )
 
     def _rkey(self) -> str:
@@ -119,6 +127,32 @@ class ResourceCacheTests(unittest.TestCase):
             for name, data in entries.items():
                 archive.writestr(name, data)
         return path
+
+    def _java_source(self, text: str = "class Main {}") -> Path:
+        path = self.project / "src" / "Main.java"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def _dkey(self, **kwargs: object) -> str:
+        return rc.dex_key(
+            self.project, self.manifest, self.options, self.tc, self.ctx, **kwargs
+        )
+
+    def _aabkey(
+        self, keystore: Path | None = None, **kwargs: object
+    ) -> str:
+        return rc.aab_key(
+            self.project,
+            self.manifest,
+            self.options,
+            self.tc,
+            self.ctx,
+            apk_root=self._apk_root(),
+            lib_name="main",
+            keystore=keystore,
+            **kwargs,
+        )
 
     def test_resource_key_is_stable_and_tracks_invalidators(self) -> None:
         base = self._rkey()
@@ -261,6 +295,172 @@ class ResourceCacheTests(unittest.TestCase):
         rc.clear_apk_cache(other)
         self.assertFalse(self.ctx.blob_path(digest).is_file())  # type: ignore[arg-type]
         self.assertFalse(self.ctx.blob_path(apk_digest).is_file())  # type: ignore[arg-type]
+
+    def test_dex_key_tracks_sources_flags_and_tools(self) -> None:
+        self._java_source()
+        base = self._dkey()
+        self.assertEqual(len(base), 64)
+        self.assertEqual(base, self._dkey())
+
+        self._java_source("class Main { int x = 1; }")
+        self.assertNotEqual(base, self._dkey())
+
+        self._java_source()
+        self.options.optimize = "size"
+        self.assertNotEqual(base, self._dkey())
+        self.options.optimize = "release"
+
+        self.options.obfuscate = True
+        self.assertNotEqual(base, self._dkey())
+        self.options.obfuscate = False
+
+        self.options.min_sdk = 24
+        self.assertNotEqual(base, self._dkey())
+        self.options.min_sdk = 21
+
+        with patch.object(rc, "java_tool_version", return_value="8.2.1"):
+            v1 = self._dkey()
+        with patch.object(rc, "java_tool_version", return_value="8.3.0"):
+            self.assertNotEqual(v1, self._dkey())
+
+    def test_aab_key_tracks_keystore_and_bundletool(self) -> None:
+        self._java_source()
+        ks1 = self._keystore("aab-one.jks", b"keystore-one")
+        ks2 = self._keystore("aab-two.jks", b"keystore-two")
+        base = self._aabkey(ks1)
+        self.assertEqual(base, self._aabkey(ks1))
+        self.assertNotEqual(base, self._aabkey(ks2))
+
+        self.options.bundletool_version = "1.17.0"
+        self.assertNotEqual(base, self._aabkey(ks1))
+        self.options.bundletool_version = "1.18.3"
+
+        # resource/dex também invalidam o AAB.
+        (self.project / "res" / "values" / "strings.xml").write_text("<resources>x</resources>")
+        self.assertNotEqual(base, self._aabkey(ks1))
+
+    def test_single_abi_key_equals_abi_inside_all(self) -> None:
+        self._java_source()
+        ks = self._keystore("shared.jks", b"key")
+        all_ctx = self._context(
+            "main", abis=("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
+        )
+        for name, isolated, inside_all in (
+            (
+                "resource",
+                rc.resource_key(self.project, self.manifest, self.options, self.tc, self.ctx),
+                rc.resource_key(self.project, self.manifest, self.options, self.tc, all_ctx),
+            ),
+            (
+                "dex",
+                rc.dex_key(self.project, self.manifest, self.options, self.tc, self.ctx),
+                rc.dex_key(self.project, self.manifest, self.options, self.tc, all_ctx),
+            ),
+            (
+                "apk",
+                rc.apk_key(
+                    self.project, self.manifest, self.options, self.tc, self.ctx,
+                    apk_root=self._apk_root(), lib_name="main", keystore=ks,
+                    abis=("arm64-v8a",),
+                ),
+                rc.apk_key(
+                    self.project, self.manifest, self.options, self.tc, all_ctx,
+                    apk_root=self._apk_root(), lib_name="main", keystore=ks,
+                    abis=("arm64-v8a",),
+                ),
+            ),
+            ("aab", self._aabkey(ks, abis=("arm64-v8a",)), rc.aab_key(
+                self.project, self.manifest, self.options, self.tc, all_ctx,
+                apk_root=self._apk_root(), lib_name="main", keystore=ks,
+                abis=("arm64-v8a",),
+            )),
+        ):
+            self.assertEqual(isolated, inside_all, name)
+
+        # A seleção de ABI filtra o mapa de libs; não é concatenada na chave.
+        kwargs = dict(
+            apk_root=self._apk_root(), lib_name="main", keystore=ks
+        )
+        arm64_key = rc.apk_key(
+            self.project, self.manifest, self.options, self.tc, self.ctx,
+            abis=("arm64-v8a",), **kwargs,
+        )
+        x86_key = rc.apk_key(
+            self.project, self.manifest, self.options, self.tc, self.ctx,
+            abis=("x86",), **kwargs,
+        )
+        self.assertNotEqual(arm64_key, x86_key)
+
+    def test_dex_blob_hit_miss_and_tamper(self) -> None:
+        self._java_source()
+        key = self._dkey()
+        dex = self.base / "work" / "apk" / "classes.dex"
+        dex.parent.mkdir(parents=True, exist_ok=True)
+        payload = b"dex\n035\x00" + b"conteudo-do-dex"
+        dex.write_bytes(payload)
+
+        digest = rc.store_dex(self.ctx, key, dex)
+        self.assertIsNotNone(digest)
+        restored = self.base / "restored" / "classes.dex"
+        self.assertEqual(rc.load_dex(self.ctx, key, restored), restored)
+        self.assertEqual(restored.read_bytes(), payload)
+
+        with self.assertRaises(rc.CacheMiss):
+            rc.load_dex(self.ctx, "2" * 64, restored)
+        self.ctx.blob_path(digest).write_bytes(b"nao-e-dex")  # type: ignore[arg-type]
+        with self.assertRaises(rc.CacheMiss):
+            rc.load_dex(self.ctx, key, restored)
+
+    def test_aab_blob_hit_miss_and_tamper(self) -> None:
+        ks = self._keystore("app.jks", b"key")
+        key = self._aabkey(ks)
+        signed = self._zip(self.base / "signed.aab", {"BundleConfig.pb": b"config"})
+        digest = rc.store_aab(
+            self.ctx,
+            key,
+            signed,
+            metadata=rc.keystore_fingerprint_info(ks),
+        )
+        self.assertIsNotNone(digest)
+
+        target = self.base / "dist" / "app.aab"
+        self.assertEqual(rc.load_aab(self.ctx, key, target), target)
+        self.assertEqual(target.read_bytes(), signed.read_bytes())
+
+        with self.assertRaises(rc.CacheMiss):
+            rc.load_aab(self.ctx, "3" * 64, target)
+        # Keystore diferente = chave diferente = nenhum AAB servido.
+        other_ks = self._keystore("other.jks", b"other-key")
+        with self.assertRaises(rc.CacheMiss):
+            rc.load_aab(self.ctx, self._aabkey(other_ks), target)
+        self.ctx.blob_path(digest).write_bytes(b"corrompido")  # type: ignore[arg-type]
+        with self.assertRaises(rc.CacheMiss):
+            rc.load_aab(self.ctx, key, target)
+
+    def test_bundle_transports_dex_and_aab_blobs(self) -> None:
+        self._java_source()
+        dex_key = self._dkey()
+        dex = self.base / "classes.dex"
+        dex.write_bytes(b"dex\n035\x00bundle")
+        self.assertIsNotNone(rc.store_dex(self.ctx, dex_key, dex))
+
+        ks = self._keystore("bundle.jks", b"key")
+        aab_key = self._aabkey(ks)
+        aab = self._zip(self.base / "signed.aab", {"BundleConfig.pb": b"pb"})
+        self.assertIsNotNone(rc.store_aab(self.ctx, aab_key, aab))
+
+        bundle = self.base / "bundle.tar.gz"
+        manifest = cache_mod.export_bundle(self.ctx, bundle)
+        self.assertGreaterEqual(len(manifest["blobs"]), 2)
+
+        other = replace(self.ctx, root=self.base / "other-cache")
+        stats = cache_mod.import_bundle(other, bundle)
+        self.assertEqual(stats["rejected"], 0)
+
+        restored_dex = rc.load_dex(other, dex_key, self.base / "out" / "classes.dex")
+        restored_aab = rc.load_aab(other, aab_key, self.base / "out" / "app.aab")
+        self.assertEqual(restored_dex.read_bytes(), dex.read_bytes())
+        self.assertEqual(restored_aab.read_bytes(), aab.read_bytes())
 
     def test_cache_event_shape(self) -> None:
         event = rc.cache_event("apk", "miss", "sem entrada", "abcdef1234567890")

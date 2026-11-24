@@ -28,6 +28,9 @@ BUNDLE_FORMAT = "apkfast-cache-bundle"
 BUNDLE_VERSION = 1
 MAX_BLOB_BYTES = 512 * 1024 * 1024
 LOCK_TTL_SECONDS = 300
+# Entradas de resource/dex/APK/AAB (ver apkfast.resource_cache). São aditivas
+# ao manifesto do bundle: bundles antigos não as têm e continuam importáveis.
+BUNDLE_ENTRIES = ("resource", "dex", "apkLink", "apk", "aab")
 
 _ELF_MACHINES = {
     "arm64-v8a": 0xB7,     # EM_AARCH64
@@ -631,7 +634,18 @@ def export_bundle(ctx: CacheContext, output: Path, abis: Iterable[str] | None = 
                 path = ctx.blob_path(digest)
                 if path.is_file() and sha256_file(path) == digest:
                     blobs[digest] = {"size": path.stat().st_size, "kind": "shared"}
-        abi_data[abi] = {"objects": objects, "link": link}
+        extra: dict[str, dict] = {}
+        for name in BUNDLE_ENTRIES:
+            entry = cache.get(name)
+            if not isinstance(entry, dict):
+                continue
+            digest = entry.get("blob")
+            if isinstance(digest, str) and _BLOB_NAME.fullmatch(digest):
+                path = ctx.blob_path(digest)
+                if path.is_file() and sha256_file(path) == digest:
+                    blobs[digest] = {"size": path.stat().st_size, "kind": name}
+                    extra[name] = entry
+        abi_data[abi] = {"objects": objects, "link": link, **extra}
 
     manifest = {
         "format": BUNDLE_FORMAT,
@@ -779,6 +793,19 @@ def import_bundle(
                     ensure_blob(ctx, link.get("so_blob"), abi=abi)
                 except CacheError:
                     stats["rejected"] += 1
+            extra: dict[str, dict] = {}
+            for name in BUNDLE_ENTRIES:
+                entry = data.get(name)
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    # DEX não é ELF; resource/APK/AAB são ZIP, mas o SHA256
+                    # já basta aqui (validado na leitura por resource_cache).
+                    ensure_blob(ctx, entry.get("blob"), abi=abi, check_elf=False)
+                except CacheError:
+                    stats["rejected"] += 1
+                    continue
+                extra[name] = entry
             if not ctx.writable:
                 continue
             target = ctx.cache_file(abi)
@@ -786,5 +813,6 @@ def import_bundle(
             current.setdefault("objects", {}).update(entries)
             if isinstance(link, dict):
                 current["link"] = link
+            current.update(extra)
             write_cache(ctx, abi, current)
     return stats

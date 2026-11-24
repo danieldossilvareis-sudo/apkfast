@@ -215,24 +215,112 @@ class SigningUnitTests(unittest.TestCase):
                 self.manifest, "explicit", explicit=signing.MAX_VERSION_CODE + 1
             )
 
-    def test_timestamp_strategy_uses_seconds_for_android_limit(self) -> None:
+    def test_timestamp_strategy_uses_seconds_since_2020(self) -> None:
         self.write_manifest(1)
         self.assertEqual(
             signing.next_version_code(
                 self.manifest, "timestamp", now_ms=1_800_000_000_123
             ),
-            1_800_000_000,
+            222_163_200,
         )
         # Alias legado não precisa ler versionCode do manifesto.
         self.write_manifest(None)
         self.assertEqual(
             signing.next_version_code(self.manifest, timestamp=True, now_ms=1_700_000_000_999),
-            1_700_000_000,
+            122_163_200,
         )
-        with self.assertRaisesRegex(signing.SigningError, "limite"):
-            signing.next_version_code(self.manifest, "timestamp", now_ms=10**15)
+        with self.assertRaisesRegex(signing.SigningError, "anterior a 2020"):
+            signing.next_version_code(self.manifest, "timestamp", now_ms=-1)
         with self.assertRaisesRegex(signing.SigningError, "desconhecida"):
             signing.next_version_code(self.manifest, "build-number")
+
+    def test_timestamp_stays_inside_play_range(self) -> None:
+        self.write_manifest(1)
+        base = signing.TIMESTAMP_BASE_MS
+        for now_ms, expected in (
+            (base, 1),
+            (base + 999, 1),
+            (base + 1_000, 1),
+            (base + 1_999, 1),
+            (base + 2_000, 2),
+            (base + signing.MAX_VERSION_CODE * 1_000, signing.MAX_VERSION_CODE),
+        ):
+            with self.subTest(now_ms=now_ms):
+                value = signing.next_version_code(
+                    self.manifest, "timestamp", now_ms=now_ms
+                )
+                self.assertTrue(1 <= value <= signing.MAX_VERSION_CODE)
+                self.assertEqual(value, expected)
+
+    def test_timestamp_is_monotonic_per_second(self) -> None:
+        self.write_manifest(1)
+        now_ms = signing.TIMESTAMP_BASE_MS + 1_000
+        previous = signing.next_version_code(self.manifest, "timestamp", now_ms=now_ms)
+        for _ in range(10):
+            for sub_second in (250, 500, 999):
+                self.assertEqual(
+                    signing.next_version_code(
+                        self.manifest, "timestamp", now_ms=now_ms + sub_second
+                    ),
+                    previous,
+                )
+            now_ms += 1_000
+            current = signing.next_version_code(
+                self.manifest, "timestamp", now_ms=now_ms
+            )
+            self.assertEqual(current, previous + 1)
+            previous = current
+
+    def test_timestamp_with_injected_now_is_deterministic(self) -> None:
+        self.write_manifest(1)
+        now_ms = signing.TIMESTAMP_BASE_MS + 123_456_789_123
+        with patch.object(
+            signing.time, "time", side_effect=AssertionError("relógio não deve ser lido")
+        ):
+            first = signing.next_version_code(
+                self.manifest, "timestamp", now_ms=now_ms
+            )
+            second = signing.next_version_code(
+                self.manifest, "timestamp", now_ms=now_ms
+            )
+        self.assertEqual(first, second)
+        self.assertEqual(first, 123_456_789)
+
+    def test_timestamp_survives_old_epoch_limit(self) -> None:
+        self.write_manifest(1)
+        # Em 2038 o esquema antigo (epoch/1000) já estouraria 2.1e9.
+        now_ms = 2_160_000_000_123
+        self.assertGreater(now_ms // 1_000, signing.MAX_VERSION_CODE)
+        value = signing.next_version_code(self.manifest, "timestamp", now_ms=now_ms)
+        self.assertEqual(value, 582_163_200)
+        self.assertTrue(1 <= value <= signing.MAX_VERSION_CODE)
+        self.assertGreater(
+            signing.next_version_code(
+                self.manifest, "timestamp", now_ms=now_ms + 1_000
+            ),
+            value,
+        )
+
+    def test_timestamp_rejects_beyond_play_limit(self) -> None:
+        self.write_manifest(1)
+        last_ok_ms = (
+            signing.TIMESTAMP_BASE_MS + signing.MAX_VERSION_CODE * 1_000
+        )
+        self.assertEqual(
+            signing.next_version_code(self.manifest, "timestamp", now_ms=last_ok_ms),
+            signing.MAX_VERSION_CODE,
+        )
+        # Ainda dentro do mesmo segundo: truncamento não altera o valor.
+        self.assertEqual(
+            signing.next_version_code(
+                self.manifest, "timestamp", now_ms=last_ok_ms + 999
+            ),
+            signing.MAX_VERSION_CODE,
+        )
+        with self.assertRaisesRegex(signing.SigningError, "limite"):
+            signing.next_version_code(
+                self.manifest, "timestamp", now_ms=last_ok_ms + 1_000
+            )
 
     # --- signature_fingerprint ---------------------------------------------------
     def test_fingerprint_is_sha256_of_keystore_file(self) -> None:

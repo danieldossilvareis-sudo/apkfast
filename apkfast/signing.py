@@ -35,6 +35,7 @@ __all__ = [
     "KeystoreOptions",
     "SigningError",
     "SigningWarning",
+    "TIMESTAMP_BASE_MS",
     "apksigner_help",
     "apksigner_sign_args",
     "detect_supported_versions",
@@ -58,6 +59,12 @@ DEFAULT_KEY_ALIAS = "androiddebugkey"
 # Google Play aceita no máximo 2100000000 (int32 com folga); o Android aceita
 # 2147483647, mas usar o limite da loja evita rejeição na publicação.
 MAX_VERSION_CODE = 2_100_000_000
+
+# Base da estratégia ``timestamp``: 2020-01-01T00:00:00Z em ms desde a epoch
+# Unix. Subtraindo esta base, o versionCode começa em 0 (clampado a 1) em 2020
+# e só atinge 2_100_000_000 após 2_100_000_000 s (~66,5 anos), por volta de
+# 2086. Usar a epoch diretamente (1970) alcançaria o limite em 2036.
+TIMESTAMP_BASE_MS = 1_577_836_800_000
 
 _ANDROID_NS = "http://schemas.android.com/apk/res/android"
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -316,12 +323,15 @@ def _checked_version_code(value: object, source: str) -> int:
 
 def _timestamp_version_code(now_ms: int | None) -> int:
     milliseconds = int(time.time() * 1000) if now_ms is None else int(now_ms)
-    if milliseconds < 0:
-        raise SigningError("Timestamp para versionCode não pode ser negativo.")
-    # ms desde 1970 já passam de 1.7e12, acima do limite do Android/Play.
-    # Truncamos para segundos: ainda monotônico, com resolução de 1 s.
-    seconds = milliseconds if milliseconds <= MAX_VERSION_CODE else milliseconds // 1000
-    if not (1 <= seconds <= MAX_VERSION_CODE):
+    if milliseconds < TIMESTAMP_BASE_MS:
+        raise SigningError(
+            "Timestamp para versionCode anterior a 2020-01-01 UTC "
+            f"(base {TIMESTAMP_BASE_MS} ms); use strategy='explicit'."
+        )
+    # Segundos desde 2020-01-01 UTC, truncados para baixo: monotônico por
+    # segundo e com ~66 anos de folga até o limite da Play (ver módulo).
+    seconds = (milliseconds - TIMESTAMP_BASE_MS) // 1000
+    if seconds > MAX_VERSION_CODE:
         raise SigningError(
             "Timestamp fora do limite de versionCode do Android "
             f"(máx. {MAX_VERSION_CODE}); use strategy='explicit'."
@@ -340,9 +350,10 @@ def next_version_code(
     """Devolve um ``versionCode`` inteiro para o manifesto informado.
 
     Estratégias: ``manifest+1`` (padrão), ``explicit`` (usa ``explicit``) e
-    ``timestamp`` (ms desde a epoch, truncados para segundos para caber no
-    limite do Android/Play). ``timestamp=True`` é aliases legado para a
-    estratégia ``timestamp`` quando nenhuma estratégia explícita foi pedida.
+    ``timestamp`` (segundos desde 2020-01-01 UTC, com resolução de 1 s,
+    válidos até por volta de 2086 dentro do limite da Play). ``timestamp=True``
+    é alias legado para a estratégia ``timestamp`` quando nenhuma estratégia
+    explícita foi pedida.
     """
 
     name = str(strategy or "").strip().lower()

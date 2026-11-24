@@ -274,3 +274,68 @@ foi alterada. Arquivos de propriedade de outras equipes não foram tocados.
   apksigner), 3º build com keystore diferente reaproveitando o APK unsigned.
   Ainda assim, um build com as ferramentas reais deve ser feito pelo
   coordenador.
+
+## v2.7.0 — EQUIPE A
+
+Escopo: itens de cache que ficaram na v2.6.0 — DEX (D8/R8), AAB assinado e
+chaves por conteúdo de ABI. Nenhuma versão foi alterada; `signing.py`, `cli.py`,
+`publish.py`, `docs/signing.md`, `.github/`, `pyproject.toml`,
+`CHANGELOG.md`, `README.md`, `docs/README.md`, `apkfast/__init__.py` e
+`include/` não foram tocados **por esta equipe** nesta rodada (outras equipes
+podem estar alterando esses arquivos em paralelo).
+
+### Feito
+
+- `apkfast/resource_cache.py`: `dex_key()` (fontes `.java`/`.jar` por caminho
+  relativo + SHA256, `optimize`/`obfuscate`, `minSdk`, `--version`/SHA256 de
+  `javac`/`d8`/`r8`, `proguard-rules.pro` e a configuração Java do manifesto)
+  e `aab_key()` (`resource_key` + `dex_key` + natives por ABI + versão do
+  bundletool + fingerprint da keystore + alias/algoritmo/jarsigner). Blobs
+  novos: `store_dex()/load_dex()` (cabeçalho `dex\n`, não ZIP) e
+  `store_aab()/load_aab()` (ZIP assinado), ambos com SHA256/tamanho validados e
+  cópia atômica; `clear_dex_cache()`/`clear_aab_cache()` e
+  `clear_all_resource_caches()` para o `--clean-cache` escopado.
+- `native_libs_state()` troca a string da combinação de ABIs por um mapa
+  `<abi> -> [[arquivo, sha256], ...]`. `apk_key()`/`aab_key()` filtram esse
+  mapa pela seleção de ABI; uma ABI isolada tem a mesma chave da mesma ABI
+  dentro de `--abi all` quando o conteúdo de `.so` é idêntico.
+- `apkfast/builder.py`: hit de `dex` devolve `classes.dex` e pula `javac` e
+  D8/R8; hit de `aab` copia o AAB assinado direto para o destino final e pula
+  `aapt2 --proto-format`, `bundletool`, `jarsigner` e a verificação local.
+  Eventos `stage='dex'`/`stage='aab'` com `hit`/`miss` no `--report`;
+  `--no-incremental` desliga leitura/escrita nos dois níveis; um keystore
+  diferente explica o miss de AAB e nunca serve o blob antigo.
+- `apkfast/cache.py`: `export_bundle()`/`import_bundle()` passam a transportar
+  as entradas `resource`/`dex`/`apkLink`/`apk`/`aab`. O formato do manifesto é
+  aditivo (`BUNDLE_VERSION` permanece 1), então bundles antigos importam.
+- `docs/build-cache.md` reescrito com os seis estágios, invalidadores por
+  chave, regras de ABI, segurança e o que ainda roda sempre;
+  `tests/test_resource_cache.py` ganhou 6 testes (invalidadores de dex/AAB,
+  ABI isolada vs `all`, hit/miss/corrupção de dex e AAB, transporte via bundle).
+
+### Riscos e limitações honestas
+
+- O fingerprint continua sendo o SHA256 do arquivo da keystore, não do
+  certificado; senhas não entram em chave, blob, log ou relatório.
+- Hit de AAB não repete `bundletool validate`/`dump`/`build-apks`: a
+  verificação local só acontece no miss. O upload de teste na Play Store
+  continua sendo responsabilidade do publicador.
+- Um hit de DEX confia na identidade de `javac`/D8/R8 por `--version` + SHA256
+  do binário; ferramentas com o mesmo conteúdo em caminhos diferentes são
+  equivalentes (caminhos lógicos), o que é intencional para portabilidade.
+- Chaves são por conteúdo de ABI: `--abi all` com mais `.so` gera chave
+  diferente da ABI isolada. Isso evita servir um fat APK/AAB como se fosse o
+  artefato de uma ABI só; o reaproveitamento ocorre quando o mapa de libs é
+  realmente igual.
+- `--clean-cache` continua escopado ao `projectId`/namespace e às ABIs
+  selecionadas; blobs órfãos são removidos, mas entradas em `cache.json` de
+  ABIs não selecionadas permanecem.
+- Validação nesta rodada: 93 testes unitários (`python3 -m unittest discover
+  -s tests -v`) passaram, incluindo os 14 de `test_resource_cache.py`. Também
+  foi feito smoke real (SDK/NDK 37/36, bundletool 1.18.3 em cache) num projeto
+  temporário com uma classe Java: 1º build APK com miss de `dex`/native/link/
+  `apk`, 2º com 5 hits (DEX reaproveitado, sem javac/D8); 1º `--aab` com miss
+  de `aab`, 2º com hit e sem invocar bundletool; keystore diferente gerou
+  `apk miss`/`aab miss` com o motivo "keystore diferente"; `--abi all`
+  reaproveitou o mesmo DEX da ABI isolada e estabilizou o APK no 2º build.
+  Ainda não foi feito build em dispositivo.

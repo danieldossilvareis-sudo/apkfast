@@ -128,6 +128,8 @@ class BuildOptions:
     cache_events: list[dict] = field(default_factory=list)
     timings_ms: dict[str, int] = field(default_factory=dict)
     cache_keystore_fingerprint: dict = field(default_factory=dict)
+    cache_dex_key: str = ""      # reaproveitado por aab_key() no mesmo build
+    cache_aab_key: str = ""
 
     def __post_init__(self) -> None:
         if self.log is None:
@@ -1070,11 +1072,16 @@ def _find_tool(tc: Toolchain, name: str) -> Path | None:
 
 
 def _compile_java(
-    tc: Toolchain, options: BuildOptions, work: Path, log: Logger
+    tc: Toolchain,
+    options: BuildOptions,
+    work: Path,
+    log: Logger,
+    manifest: ManifestInfo | None = None,
 ) -> Path | None:
     """Compila .java para classes e depois usa R8/D8 quando presente.
 
-    Retorna o caminho do dex gerado, ou None se não houver código Java.
+    Com incremental ativo, um hit do cache devolve ``classes.dex`` e pula
+    ``javac`` e D8/R8 por completo. Retorna None se não houver código Java.
     """
     java_sources = _iter_files(options.project, ".java", DEFAULT_IGNORED_DIRS)
     jars = _iter_files(options.project, ".jar", DEFAULT_IGNORED_DIRS)
@@ -1082,9 +1089,45 @@ def _compile_java(
     if not java_sources and not jars:
         return None
 
+    dex = work / "apk" / "classes.dex"
+    dex.parent.mkdir(parents=True, exist_ok=True)
+    javac = _find_tool(tc, "javac") or Path("javac")
+    r8 = _find_tool(tc, "r8")
+    d8 = _find_tool(tc, "d8") or tc.d8
+
+    ctx = options.cache_ctx
+    incremental = (
+        options.incremental is not False
+        and ctx is not None
+        and manifest is not None
+    )
+    key = ""
+    if incremental:
+        assert ctx is not None and manifest is not None
+        key = res_cache.dex_key(
+            options.project, manifest, options, tc, ctx,
+            d8=d8, r8=r8, javac=javac,
+        )
+        options.cache_dex_key = key
+        try:
+            restored = res_cache.load_dex(ctx, key, dex)
+            _cache_event(
+                options, "dex", "hit",
+                "DEX reaproveitado do cache (javac/D8/R8 pulados)", key,
+            )
+            return restored
+        except (res_cache.CacheMiss, OSError) as exc:
+            _cache_event(options, "dex", "miss", str(exc), key)
+    else:
+        reason = (
+            "incremental desligado (--no-incremental)"
+            if options.incremental is False
+            else "sem manifesto/cache para DEX"
+        )
+        _cache_event(options, "dex", "miss", reason)
+
     classes = work / "java_classes"
     classes.mkdir(parents=True, exist_ok=True)
-    javac = _find_tool(tc, "javac") or Path("javac")
     if java_sources:
         cmd = [
             javac,
@@ -1096,9 +1139,6 @@ def _compile_java(
         ]
         _run(cmd, log)
 
-    dex = work / "apk" / "classes.dex"
-    r8 = _find_tool(tc, "r8")
-    d8 = _find_tool(tc, "d8") or tc.d8
     class_files = sorted(classes.rglob("*.class"))
     inputs = [str(c) for c in class_files] + [str(j) for j in jars]
     if not inputs:
@@ -1132,6 +1172,8 @@ def _compile_java(
     else:
         log.warn("[!] Aviso: javac/D8/R8 não disponível; código Java ignorado.")
         return None
+    if key and ctx is not None:
+        res_cache.store_dex(ctx, key, dex)
     return dex
 
 
@@ -1569,8 +1611,7 @@ def _build(options: BuildOptions) -> Path:
         if options.clean_cache:
             # Limpa primeiro as entradas novas (para também remover blobs
             # órfãos) e depois o cache C/C++ por ABI, como antes.
-            res_cache.clear_apk_cache(ctx)
-            res_cache.clear_resource_cache(ctx)
+            res_cache.clear_all_resource_caches(ctx)
             for abi in abis:
                 cache_mod.clear_abi(ctx, abi)
         # Validações e detecção da toolchain terminaram antes de qualquer limpeza.
@@ -1589,7 +1630,7 @@ def _build(options: BuildOptions) -> Path:
                 )
 
             with _timed(options, "package_ms"):
-                dex = _compile_java(tc, options, work, log)
+                dex = _compile_java(tc, options, work, log, manifest=manifest)
 
             with _timed(options, "native_ms"):
                 for abi in abis:
@@ -1743,73 +1784,133 @@ def _build(options: BuildOptions) -> Path:
                 apk_result = output
 
             if want_aab:
-                log.info("[*] Gerando AAB...")
                 keystore = _resolve_keystore(tc, options, log)
-                log.warn(
-                    "[!] AAB será assinado com a MESMA keystore do APK "
-                    f"({keystore}, alias {options.key_alias}). "
-                    "Para a Play Store use uma upload key própria; se ela estiver "
-                    "inscrita no Play App Signing, NÃO use a chave de app signing."
+                options.cache_keystore_fingerprint = res_cache.keystore_fingerprint_info(
+                    keystore
                 )
-                if options.keystore is None:
-                    log.warn(
-                        "[!] Keystore de debug: o AAB resultante NÃO pode ser publicado "
-                        "na Play Store (use --release --keystore ...)."
+                aab_output = bundle_mod.default_aab_path(
+                    manifest.package,
+                    suffix,
+                    project / "dist",
+                    apk_output=options.output,
+                    explicit=options.aab_output,
+                ).expanduser().resolve()
+                if aab_output == project or aab_output in project.parents:
+                    raise BuildError(
+                        f"--aab-output não pode ser o projeto nem um ancestral dele: {aab_output}"
                     )
-                try:
-                    bundletool = bundle_mod.ensure_bundletool(
-                        options.bundletool_version, quiet=log.quiet
+
+                incremental_aab = options.incremental is not False and ctx is not None
+                aab_key = ""
+                aab_ready = False
+                if incremental_aab:
+                    assert ctx is not None
+                    aab_key = res_cache.aab_key(
+                        project, manifest, options, tc, ctx,
+                        apk_root=work / "apk",
+                        lib_name=_native_lib_name(manifest, project),
+                        keystore=keystore,
+                        abis=abis,
+                        bundletool_version=options.bundletool_version,
+                        precomputed_dex_key=options.cache_dex_key or None,
                     )
-                    aab_output = bundle_mod.default_aab_path(
-                        manifest.package,
-                        suffix,
-                        project / "dist",
-                        apk_output=options.output,
-                        explicit=options.aab_output,
-                    ).expanduser().resolve()
-                    if aab_output == project or aab_output in project.parents:
-                        raise BuildError(
-                            f"--aab-output não pode ser o projeto nem um ancestral dele: {aab_output}"
+                    options.cache_aab_key = aab_key
+                    try:
+                        with _timed(options, "package_ms"):
+                            res_cache.load_aab(ctx, aab_key, aab_output)
+                        aab_ready = True
+                        _cache_event(
+                            options, "aab", "hit",
+                            "AAB assinado reaproveitado (keystore/bundletool iguais)",
+                            aab_key,
                         )
-                    proto = _link_proto(tc, options, work, manifest_path, manifest, flats)
-                    assets_dir = options.assets_dir or (project / "assets")
-                    unsigned_aab = bundle_mod.build_aab(
-                        work=work,
-                        proto_apk=proto,
-                        bundletool=bundletool,
-                        dex_dir=work / "apk",
-                        lib_dir=work / "apk" / "lib",
-                        assets_dir=assets_dir if assets_dir.is_dir() else None,
-                        quiet=log.quiet,
-                        java=tc.java,
+                        log.info("[*] AAB assinado reaproveitado do cache.")
+                    except (res_cache.CacheMiss, OSError) as exc:
+                        reason = str(exc)
+                        new_fp = str(
+                            options.cache_keystore_fingerprint.get("fingerprint", "")
+                        )
+                        for record in res_cache.aab_records(ctx):
+                            meta = record.get("metadata", {}) or {}
+                            old_fp = str(meta.get("fingerprint", ""))
+                            if old_fp and new_fp and old_fp != new_fp:
+                                reason = (
+                                    f"keystore diferente (salvo={old_fp[:8]}, "
+                                    f"atual={new_fp[:8]})"
+                                )
+                                break
+                        _cache_event(options, "aab", "miss", reason, aab_key)
+                else:
+                    _cache_event(
+                        options, "aab", "miss",
+                        "incremental desligado (--no-incremental)",
                     )
-                    signed_aab = bundle_mod.sign_aab(
-                        unsigned_aab,
-                        keystore=keystore,
-                        store_password=options.keystore_password,
-                        key_alias=options.key_alias,
-                        key_password=options.key_password,
-                        output=work / "aab" / "signed.aab",
-                        quiet=log.quiet,
+
+                if not aab_ready:
+                    log.info("[*] Gerando AAB...")
+                    log.warn(
+                        "[!] AAB será assinado com a MESMA keystore do APK "
+                        f"({keystore}, alias {options.key_alias}). "
+                        "Para a Play Store use uma upload key própria; se ela estiver "
+                        "inscrita no Play App Signing, NÃO use a chave de app signing."
                     )
-                    bundle_mod.verify_aab(
-                        signed_aab,
-                        bundletool=bundletool,
-                        work=work / "aab",
-                        aapt2=tc.aapt2,
-                        keystore=keystore,
-                        store_password=options.keystore_password,
-                        key_alias=options.key_alias,
-                        key_password=options.key_password,
-                        quiet=log.quiet,
-                        java=tc.java,
-                    )
-                    aab_output.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(signed_aab, aab_output)
-                except bundle_mod.BundleError as exc:
-                    raise BuildError(str(exc)) from exc
-                except OSError as exc:
-                    raise BuildError(f"Falha ao gravar AAB final: {exc}") from exc
+                    if options.keystore is None:
+                        log.warn(
+                            "[!] Keystore de debug: o AAB resultante NÃO pode ser publicado "
+                            "na Play Store (use --release --keystore ...)."
+                        )
+                    try:
+                        bundletool = bundle_mod.ensure_bundletool(
+                            options.bundletool_version, quiet=log.quiet
+                        )
+                        proto = _link_proto(
+                            tc, options, work, manifest_path, manifest, flats
+                        )
+                        assets_dir = options.assets_dir or (project / "assets")
+                        unsigned_aab = bundle_mod.build_aab(
+                            work=work,
+                            proto_apk=proto,
+                            bundletool=bundletool,
+                            dex_dir=work / "apk",
+                            lib_dir=work / "apk" / "lib",
+                            assets_dir=assets_dir if assets_dir.is_dir() else None,
+                            quiet=log.quiet,
+                            java=tc.java,
+                        )
+                        signed_aab = bundle_mod.sign_aab(
+                            unsigned_aab,
+                            keystore=keystore,
+                            store_password=options.keystore_password,
+                            key_alias=options.key_alias,
+                            key_password=options.key_password,
+                            output=work / "aab" / "signed.aab",
+                            quiet=log.quiet,
+                        )
+                        bundle_mod.verify_aab(
+                            signed_aab,
+                            bundletool=bundletool,
+                            work=work / "aab",
+                            aapt2=tc.aapt2,
+                            keystore=keystore,
+                            store_password=options.keystore_password,
+                            key_alias=options.key_alias,
+                            key_password=options.key_password,
+                            quiet=log.quiet,
+                            java=tc.java,
+                        )
+                        if aab_key and ctx is not None:
+                            res_cache.store_aab(
+                                ctx,
+                                aab_key,
+                                signed_aab,
+                                metadata=options.cache_keystore_fingerprint,
+                            )
+                        aab_output.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(signed_aab, aab_output)
+                    except bundle_mod.BundleError as exc:
+                        raise BuildError(str(exc)) from exc
+                    except OSError as exc:
+                        raise BuildError(f"Falha ao gravar AAB final: {exc}") from exc
                 options.built_aab = aab_output
                 size = aab_output.stat().st_size / 1024
                 log.info(f"[✓] AAB final: {aab_output} ({size:.1f} KiB)")

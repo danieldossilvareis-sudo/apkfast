@@ -111,15 +111,23 @@ lê `android:versionCode` do `AndroidManifest.xml` e devolve um inteiro:
 | --- | --- |
 | `manifest+1` (padrão) | valor do manifesto + 1 |
 | `explicit` | usa `explicit=` (inteiro ou texto numérico) |
-| `timestamp` | ms desde a epoch truncados para **segundos** |
+| `timestamp` | segundos desde 2020-01-01T00:00:00Z (base `TIMESTAMP_BASE_MS`) |
 
 Limites: Google Play aceita no máximo `2_100_000_000` (`MAX_VERSION_CODE`).
-Milissegundos desde 1970 já passam de `1.7e12`, então a estratégia `timestamp`
-descarta os 3 dígitos de ms para caber no limite; a resolução é de 1 segundo e
-o valor acompanha o relógio do build (use `now_ms=` em testes). Passado o
-limite, a função falha em vez de estourar o inteiro — nesse caso migre para
-`explicit` ou para um esquema próprio. `timestamp=True` funciona como alias
-legado para `strategy="timestamp"`.
+A estratégia `timestamp` calcula
+`(now_ms - 1_577_836_800_000) // 1000` (a base é 2020-01-01 UTC em ms desde a
+epoch) e mantém o resultado em `1..MAX_VERSION_CODE`. Em 2026 o valor ronda
+`2.2e8`; com 1 segundo de resolução ele só alcança o limite em 2086-07-18
+(~66,5 anos após a base), eliminando a antiga ressalva de esgotamento em 2036.
+O valor é monotônico e estável dentro do mesmo segundo; use `now_ms=` para
+determinismo em testes. `timestamp=True` continua sendo alias legado de
+`strategy="timestamp"` (na CLI, o atalho é `--timestamp-version-code`).
+
+Use `explicit` quando o app já publicou `versionCode`s mais altos do que esta
+numeração — por exemplo, códigos gerados pela antiga estratégia baseada em
+1970 ou por `manifest+1` com valor elevado: a Play rejeita um `versionCode`
+menor que o último publicado. Nesse caso, passe `explicit=` com um valor acima
+do último publicado (ou mantenha `manifest+1` com o manifesto atualizado).
 
 ## 5. Segurança da keystore
 

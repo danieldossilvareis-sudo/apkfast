@@ -17,7 +17,7 @@
 #pragma once
 
 #define APKFAST_API_VERSION_MAJOR 2
-#define APKFAST_API_VERSION_MINOR 6
+#define APKFAST_API_VERSION_MINOR 7
 #define APKFAST_API_VERSION_PATCH 0
 
 #define APKFAST_API_VERSION_STR_(a, b, c) #a "." #b "." #c

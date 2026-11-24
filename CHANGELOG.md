@@ -1,5 +1,41 @@
 # Changelog
 
+## [2.7.0] - 2026-11-23 — Cache completo
+
+Últimos itens internos que não dependem de infraestrutura externa.
+
+### Adicionado — Equipe A
+
+- cache de **D8/R8** (`classes.dex`) com chave por fontes Java, flags, min SDK
+  e versão do d8/r8
+- cache de **AAB assinado** com chave por recursos, dex, natives por ABI,
+  versão do bundletool, keystore e flags de assinatura
+- **chaves por ABI**: `--abi arm64-v8a` reaproveita entradas geradas por
+  `--abi all`; natives entram como mapa `<abi> -> hash`
+- `export_bundle`/`import_bundle` transportam também `resource`, `dex`,
+  `apkLink`, `apk` e `aab` (formato aditivo)
+- eventos `stage='dex'` e `stage='aab'` no build report
+
+### Adicionado — Equipe B
+
+- `versionCode` timestamp seguro: segundos desde **2020-01-01 UTC**,
+  monotônico e válido até **2086-07-18** dentro do limite do Play
+- documentação atualizada em `docs/signing.md`
+
+### Validado
+
+- 93 testes unitários OK
+- APK: 1º build com misses, 2º com 5 hits (sem javac/D8)
+- AAB: 2º build com 6 hits e nenhuma invocação de bundletool
+- keystore diferente invalida `apk` e `aab` com motivo explícito
+- `--abi all` reaproveita dex da ABI isolada
+
+### Limitações restantes
+
+- fingerprint da keystore é SHA256 do arquivo, não do certificado
+- hit de AAB pula a verificação local (`bundletool validate`)
+- apps que já publicaram versionCode alto devem usar `explicit`
+
 ## [2.6.0] - 2026-11-23 — Robustez final
 
 Quatro itens de endurecimento do backend.
@@ -37,7 +73,7 @@ Quatro itens de endurecimento do backend.
 
 - D8/R8 e AAB não são cacheados
 - chaves de cache por combinação exata de ABIs
-- `timestamp` usa segundos (limite 2.1e9 do Play); use `explicit` após ~2036
+- `timestamp` usa segundos desde 2020; seguro até 2086 (limite 2.1e9 do Play)
 - GitHub Actions ainda não publica no PyPI nem roda dispositivo real sem
   credenciais/runner configurados
 
