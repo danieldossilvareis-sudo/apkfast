@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.7.1] - 2026-11-24 — Correção da documentação PyPI
+
+- README publicado no PyPI não dizia mais que o pacote “ainda não foi publicado”
+- seção de instalação agora recomenda `pip install apkfast`
+- sem mudanças de runtime, API ou build
+
 ## [2.7.0] - 2026-11-23 — Cache completo
 
 Últimos itens internos que não dependem de infraestrutura externa.

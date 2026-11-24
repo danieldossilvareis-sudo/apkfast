@@ -1,7 +1,7 @@
 # apkfast
 
 [![CI](https://github.com/danieldossilvareis-sudo/apkfast/actions/workflows/ci.yml/badge.svg)](https://github.com/danieldossilvareis-sudo/apkfast/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-2.7.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.7.1-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 CLI para **montar, compilar, otimizar e entregar APKs sem Gradle**, com suporte
@@ -23,11 +23,7 @@ Você pode sobrescrever com `--sdk-dir`, `--ndk-dir`, `--build-tools` ou
 
 ## Instalação
 
-### Via PyPI (quando publicado)
-
-> **Atenção:** nesta versão (v2.4.1) o pacote **ainda não foi publicado** no
-> PyPI. Os comandos abaixo mostram o fluxo previsto após a primeira release
-> automatizada; até lá, use a seção **Via repositório**.
+### Via PyPI (recomendado)
 
 ```sh
 python3 -m pip install apkfast
@@ -39,7 +35,7 @@ O wheel instala o comando `apkfast` e os dados de build (`include/`, `src/`,
 `patches/`, `docs/`) junto com o pacote Python. O SDK/NDK continua sendo
 detectado em `~/Android` (ou via `--sdk-dir`/`--ndk-dir`).
 
-### Via repositório (disponível agora / desenvolvimento)
+### Via repositório (desenvolvimento / contribuição)
 
 ```sh
 git clone https://github.com/apkfast/apkfast.git

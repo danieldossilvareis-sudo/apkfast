@@ -1,3 +1,3 @@
 """apkfast: build APKs without Gradle, with first-class NativeActivity support."""
 
-__version__ = "2.7.0"
+__version__ = "2.7.1"
