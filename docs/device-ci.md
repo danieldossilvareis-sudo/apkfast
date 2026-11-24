@@ -73,8 +73,12 @@ do Test Lab); troque para `arm64-v8a` em um aparelho ARM real.
 
 ## Modo 2 — Firebase Test Lab
 
-1. Crie habilite o projeto Firebase com billing e as APIs **Cloud Testing API**
-   e **Cloud Storage**.
+1. Crie/habilite um projeto Firebase e as APIs **Cloud Testing API** e
+   **Cloud Storage**. O plano **Spark (gratuito)** cobre até 10 testes/dia em
+   dispositivos virtuais (60 min/dia) e 5 testes/dia em dispositivos físicos
+   (30 min/dia), sem exigir cartão. Acima disso, é necessário o plano Blaze com
+   faturamento. Atenção: o Firebase Test Lab foi descontinuado e será encerrado
+   em **30/09/2027**; o sucessor (Developer Device Platform) exige billing.
 2. Crie uma service account com permissão para Test Lab e Storage; copie o JSON.
 3. Configure os secrets/vars:
 
@@ -121,7 +125,9 @@ e a execução termina com sucesso. Como `secrets` não é utilizável em
 - Test Lab robo test cobre launch e fluxos automáticos, não interação humana
   prolongada (toques, IME, permissões em runtime complexas).
 - `model=Pixel2,version=28` é um padrão conservador; ajuste no workflow para
-  cobrir APIs/ABIs específicas. Custo e cotas dependem do projeto Firebase.
+  cobrir APIs/ABIs específicas. Cotas gratuitas do Spark: 10 testes/dia
+  virtuais (60 min) e 5 testes/dia físicos (30 min). O sucessor do Test Lab
+  (Developer Device Platform, a partir de 2027) exige projeto com billing.
 - O grep de crash depende de `FIREBASE_RESULTS_BUCKET`; sem ele, o Test Lab roda,
   mas o logcat não é verificado automaticamente.
 - O schedule é semanal às 06:00 UTC (`0 6 * * 1`).
