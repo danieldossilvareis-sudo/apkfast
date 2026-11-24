@@ -12,7 +12,7 @@ license = { file = "LICENSE" }
 authors = [{ name = "apkfast contributors" }]
 keywords = ["android", "apk", "ndk", "nativeactivity", "termux", "no-gradle"]
 classifiers = [
-  "Development Status :: 4 - Beta",
+  "Development Status :: 5 - Production/Stable",
   "Environment :: Console",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: MIT License",

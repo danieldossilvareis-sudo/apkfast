@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.7.2] - 2026-11-24 — Estável
+
+- metadado do PyPI promovido de **Beta** para **Production/Stable**
+- sem mudanças de runtime, API ou build
+
+Status oficial: **estável**.
+
 ## [2.7.1] - 2026-11-24 — Correção da documentação PyPI
 
 - README publicado no PyPI não dizia mais que o pacote “ainda não foi publicado”
