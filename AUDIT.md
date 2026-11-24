@@ -339,3 +339,70 @@ podem estar alterando esses arquivos em paralelo).
   `apk miss`/`aab miss` com o motivo "keystore diferente"; `--abi all`
   reaproveitou o mesmo DEX da ABI isolada e estabilizou o APK no 2º build.
   Ainda não foi feito build em dispositivo.
+
+## Paridade Vulkan
+
+Backend Vulkan (`include/nativeapp/vk.hpp`) elevado ao mesmo nível de
+ergonomia de `GLES2Scene`, mantendo source compatibility de `init`, `attach`,
+`render`, `set_pipeline`, `set_clear_color`, `set_present_mode`, `invalidate` e
+`resize`. Nenhuma versão, tag, release ou publicação foi alterada.
+
+### O que foi entregue
+
+- Shaders GLSL 450 versionados como comentário no header e SPIR-V incorporado
+  em arrays `uint32_t` (`kGeometryVertSpv`, `kGeometryFragSpv`,
+  `kTextVertSpv`, `kTextFragSpv`), gerados com `glslangValidator -V`.
+- UBO por frame (`SceneUniforms`: projection/model/color/use_texture) com
+  dynamic offsets, descriptor set de sampler separado e textura branca 1×1
+  para `Material::texture` vazio.
+- `TextureVk` com `decode_asset_image()` (PNG/JPEG/WebP/SVG), upload via
+  staging buffer HOST_VISIBLE → DEVICE_LOCAL, image view, sampler
+  linear/clamp e `destroy()` seguro. Cache por caminho em `VulkanScene`.
+- `draw(MeshData, Material, model)` passou a enfileirar itens; `render()`
+  faz upload e grava os comandos. `depth_test`/`blend`/topology selecionam
+  variantes de pipeline; cor, textura e model chegam ao shader.
+- `load_font()`/`draw_text()`/`has_font()` com `FontAtlas`, pipeline de texto
+  (x,y,u,v) e coordenadas de tela iguais às do GL. A projeção usa NDC do
+  Vulkan (`mat4_ortho(0,w,0,h,-1,1)`) para produzir a mesma posição em tela.
+- Exemplo `nativeapp-vulkan` atualizado com clear color, triângulo colorido,
+  quad texturizado e `draw_text("VULKAN OK", ...)`.
+- Documentação reescrita em `docs/graphics-vulkan.md`, tabela de paridade
+  GL/VK e 9 testes estáticos novos em `tests/test_vulkan_parity.py`.
+
+### Validação real
+
+- `glslangValidator` 11.16.6: 4 shaders compilados sem erro; arrays SPIR-V
+  inseridos no header com a fonte GLSL preservada em comentário.
+- `clang++` NDK r30 (`-std=c++17 -fsyntax-only`): header e exemplo compilam
+  (apenas os warnings de depreciação já existentes em `audio.hpp`/`sensor.hpp`).
+- Build: `python3 apkfast.py build examples/nativeapp-vulkan -o
+  <tmp>/vk-parity.apk -q` OK. O caminho literal `/tmp/vk-parity.apk` falhou
+  com `EACCES` neste Termux; foi usado
+  `/data/data/com.termux/files/usr/tmp/opencode/vk-parity.apk`.
+- Dispositivo (`emulator-5554`): `sh scripts/device-check.sh
+  <tmp>/vk-parity.apk com.apkfast.nativeappvk` OK — 362 linhas de logcat,
+  0 erros FATAL/dlopen/AndroidRuntime.
+- Screenshot do APK sem assets: clear color e triângulo com cores
+  interpoladas visíveis; logcat confirmou `on_ready`, device Vulkan criado e
+  avisos de `sprite.png`/`font.ttf` ausentes.
+- Build adicional com assets temporários fora do repositório
+  (`font.ttf` + `sprite.png` de `media-demo`, via `--assets`): textura e texto
+  renderizados; a orientação do texto coincide com o `GLES2Scene` no mesmo
+  dispositivo (o GL já apresenta essa convenção de UV neste frontend).
+- `python3 -m unittest discover -s tests -q`: 102 testes OK (incluindo os
+  testes novos de paridade Vulkan).
+
+### Riscos e limitações restantes
+
+- Assets são por APK: o exemplo não versiona `sprite.png`/`font.ttf`. Sem eles
+  há aviso no logcat e apenas a malha colorida é desenhada.
+- `set_validation(true)` continua sem layers reais; não há validação Vulkan
+  ativa no dispositivo.
+- Upload de textura usa `vkQueueWaitIdle()` (síncrono); cache limitado a 64
+  texturas e 64 itens por frame.
+- `set_pipeline()` legado com SPIR-V externo mantém a API antiga, mas não
+  aplica `Material`/`model`; use o pipeline embutido para paridade completa.
+- Texto mantém a convenção de UV existente em `FontAtlas`/`GLES2Scene`
+  (inclusive a inversão visual observada neste dispositivo); corrigir isso
+  exigiria alterar `font.hpp`/`gl.hpp`, fora do escopo desta rodada.
+
