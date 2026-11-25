@@ -392,17 +392,358 @@ ergonomia de `GLES2Scene`, mantendo source compatibility de `init`, `attach`,
 - `python3 -m unittest discover -s tests -q`: 102 testes OK (incluindo os
   testes novos de paridade Vulkan).
 
-### Riscos e limitações restantes
+### Estado histórico desta seção
 
-- Assets são por APK: o exemplo não versiona `sprite.png`/`font.ttf`. Sem eles
-  há aviso no logcat e apenas a malha colorida é desenhada.
-- `set_validation(true)` continua sem layers reais; não há validação Vulkan
-  ativa no dispositivo.
-- Upload de textura usa `vkQueueWaitIdle()` (síncrono); cache limitado a 64
-  texturas e 64 itens por frame.
-- `set_pipeline()` legado com SPIR-V externo mantém a API antiga, mas não
-  aplica `Material`/`model`; use o pipeline embutido para paridade completa.
-- Texto mantém a convenção de UV existente em `FontAtlas`/`GLES2Scene`
-  (inclusive a inversão visual observada neste dispositivo); corrigir isso
-  exigiria alterar `font.hpp`/`gl.hpp`, fora do escopo desta rodada.
+As limitações listadas aqui foram eliminadas nas seções seguintes:
 
+- assets de `font.ttf`/`sprite.png` versionados em `examples/nativeapp-vulkan/assets/`;
+- `set_validation(true)` ativa layers reais quando disponíveis;
+- upload de textura assíncrono via `VulkanUploadTracker`;
+- cache de textura sem limite rígido e com invalidação explícita;
+- `set_pipeline()` legado aplica `Material`/`model`;
+- texto e orientação visual corrigidos e validados contra GLES2.
+
+## Correção visual Vulkan — EQUIPE A
+
+Escopo: paridade visual exata do backend Vulkan com `GLES2Scene` no exemplo
+`nativeapp-vulkan`. Nenhuma versão, tag, release ou publicação foi alterada.
+SPIR-V/GLSL não precisaram ser regenerados (a matemática de UV está na CPU).
+
+### Causas raízes
+
+1. **Quad com "pixel faltando"/achatado:** `TextureVk::load_rgba()` usava
+   `VkImageSubresourceLayout::rowPitch` de uma imagem `TILING_OPTIMAL` para
+   distribuir as linhas no staging buffer, mas `vkCmdCopyBufferToImage()` foi
+   chamado com `bufferRowLength = 0` (linhas firmemente empacotadas). Com
+   `rowPitch > width * 4`, só parte das linhas era preenchida; as restantes
+   ficavam pretas/transparentes e o quad de 180×180 aparecia com ~46 px de
+   altura e um "degrau" na borda (fronteira entre linhas copiadas e vazias).
+   Corrigido copiando `row_bytes = width * 4` por linha, sem pitch, e
+   espelhando a ordem vertical do decode para casar com a convenção de
+   `glTexImage2D`/`MeshData::quad()`.
+2. **Texto ilegível/invertido e geometria na posição errada:**
+   `vk_detail::ortho2d_screen()` reutilizava `mat4_ortho2d()` do GL
+   (`bottom = h, top = 0`). No NDC do Vulkan `y=+1` está na base, então a
+   matriz espelhava verticalmente tudo: `draw_text()` de cabeça para baixo e
+   triângulo/quad refletidos em `height - y`. Corrigido para
+   `mat4_ortho(0, w, 0, h, -1, 1)`. Removido o hack `baseline = height - y`
+   em `draw_text()`: `FontAtlas::quad()` recebe `y` diretamente, como no GL.
+   Como o upload do atlas agora espelha as linhas, os vértices do glyph usam
+   `v = 1 - v` (sem tocar em `font.hpp`/`gl.hpp`).
+
+### Arquivos modificados
+
+- `include/nativeapp/vk.hpp` — projeção, upload de textura e UVs de texto.
+- `docs/graphics-vulkan.md` — convenções de projeção/UV e validação visual.
+- `examples/nativeapp-vulkan/**` — nenhuma alteração versionada; os assets
+  `sprite.png`/`font.ttf` já presentes foram reutilizados.
+- `AUDIT.md` — apenas esta seção.
+
+### Validação real (emulator-5554, 1080×2340)
+
+```sh
+python3 apkfast.py build examples/nativeapp-vulkan \
+  -o /data/data/com.termux/files/usr/tmp/opencode/vk-audit/vk.apk -q
+sh scripts/device-check.sh --wait 4 \
+  /data/data/com.termux/files/usr/tmp/opencode/vk-audit/vk.apk \
+  com.apkfast.nativeappvk
+$HOME/Android/android-sdk/platform-tools/adb exec-out screencap -p > \
+  /data/data/com.termux/files/usr/tmp/opencode/vk-audit/vk.png
+```
+
+- Screenshot anterior (defeitos): `/data/data/com.termux/files/usr/tmp/opencode/vk-audit/baseline.png`.
+- Screenshot final: `/data/data/com.termux/files/usr/tmp/opencode/vk-audit/vk.png`.
+- Referência GLES2 com os mesmos assets: `/data/data/com.termux/files/usr/tmp/opencode/vk-audit/gl-final.png`.
+- Comparação pixel a pixel Vulkan × GL: 14.464 pixel com diferença máxima de
+  **1/255 por canal** (arredondamento de composição), 0 diferenças visuais.
+- `device-check`: 302 linhas de logcat, 0 erros FATAL/dlopen/AndroidRuntime.
+
+### Descrição do screenshot final
+
+Clear azul-noite; `VULKAN OK` legível na orientação correta no canto superior
+esquerdo; triângulo com gradiente de vértice apontando para baixo na metade
+superior; quadrado verde 180×180 íntegro (sem pixel faltando) à direita, na
+mesma posição/tamanho do backend GL.
+
+### Estado histórico desta seção
+
+A única limitação apontada aqui (`C07` marcado como GL-only) foi corrigida na
+integração final: `draw_with_texture()` está presente em ambos e os testes
+marcam `C07` como `both`. A validação Vulkan real foi adicionada depois pela
+Equipe VK-P2.
+
+
+---
+
+## Correção visual Vulkan — EQUIPE A2
+
+Snapshot: apkfast 2.7.3, sem bump de versão, sem commit/tag/release.
+
+### Causa raiz dos dois sintomas visuais
+
+- **Textura com pixels faltando / sprite achatado:** `TextureVk::load_rgba()`
+  usava `VkImageSubresourceLayout::rowPitch` de uma imagem `TILING_OPTIMAL`
+  para espalhar as linhas no staging, mas submetia `VkBufferImageCopy` com
+  `bufferRowLength = 0` (linhas contíguas). Só 1 de cada N linhas chegava à
+  imagem; as demais ficavam pretas/transparentes. Um probe isolado (quad sem
+  textura = 180×180, quad texturizado = 180×47) confirmou que a geometria e a
+  projeção estavam corretas e o defeito era no upload. Corrigido com cópia
+  firmemente empacotada e espelhamento vertical das linhas (convenção GL).
+- **Texto cortado/ilegível:** `vk_detail::ortho2d_screen()` usava a matriz do
+  GL (`bottom=h, top=0`), que espelha toda a cena no NDC do Vulkan, e
+  `draw_text()` compensava com `baseline = extent_.height - y` e UV de atlas
+  sem espelhar. Corrigido com `mat4_ortho(0, w, 0, h, -1, 1)`, `y` direto em
+  `FontAtlas::quad()` e `v = 1 - v` somente nos quads de glyph (o atlas passa
+  pelo mesmo espelhamento de upload das texturas).
+
+### Blockers da matriz (`docs/parity-matrix.md`)
+
+- G01: `VulkanScene::draw_with_texture()` + `upload_context()` pública;
+  `TextureVk` espera a fila antes de liberar descritores em trocas de frame.
+- G02: no modo legado (`set_pipeline()`), apenas geometria usa o pipeline
+  externo; texto usa sempre o pipeline de texto embutido com UBO/atlas.
+- G03: pool de samplers dimensionado por `kMaxTextures + 4` (white/fonte/
+  externas) e reserva extra de sets de UBO.
+- G04: UBO cresce sob demanda (`grow_uniform_slots()`); `kMaxDrawSlots` é só
+  capacidade inicial. Sem descarte silencioso de draws.
+- G05: sem inversão global de `v` em `draw()`; UVs de malhas custom e
+  `MeshData::quad()` seguem a convenção GL via upload espelhado.
+- G06: `GpuBuffer::upload()` valida índice `uint16` e cai para `drawArrays`
+  com aviso, como no GL.
+- G07: device loss marcado em `device_lost()`, com log, `needs_asset_reload()`,
+  parada de `render()` e reinicialização explícita via `init()`.
+- G08: `draw_text()` não usa `extent_.height` na baseline.
+- G16: `docs/graphics-vulkan.md` atualizado (UV/viewport, descritores,
+  dynamic slots, legado, device loss, draw_with_texture).
+
+### Verificação visual (emulator-5554, 1080×2340)
+
+`sh scripts/visual-parity.sh --out <tmp>/visual-parity-a2`: GL e VK sem FATAL,
+capturas `gl.png`/`vk.png`. Caixas idênticas medidas em pixels:
+
+- texto `VULKAN OK`: x=34..228, y=42..67 nos dois;
+- triângulo: x=297..782, y=576..1060 nos dois;
+- sprite: x=416..867, y=624..1376 (180×180) nos dois.
+
+Screenshots: anterior
+`<tmp>/visual-parity/vk.png` (faixa verde 180×47, triângulo espelhado, glifos
+cortados) e final `<tmp>/visual-parity-a2/vk.png`.
+
+### Estado histórico desta seção
+
+As pendências A2 foram fechadas na integração final:
+
+- C07 passou a `both` em `tests/test_parity_matrix.py` e `docs/parity-matrix.md`;
+- G09/G10/G13/G14/G15 foram implementados pela Equipe VK-P2;
+- `vkQueueWaitIdle()` foi substituído por `VulkanUploadTracker` com fence e semáforo;
+- a suíte completa passa com 130 testes.
+
+### GLES3 instancing real (EQUIPE GL-P2)
+
+Complemento ao status acima: o **lado OpenGL/GLES3** do G09 foi fechado. As
+anotações antigas em "Não corrigido" e na pendência A2 continuam válidas para o
+lado Vulkan, mas não descrevem mais o backend GL.
+
+- API nova em `GLES3Scene`: `struct Instance { Mat4 model; array<float,4>
+  color; }` (80 bytes) e sobrecargas `draw_instanced(Mesh|MeshData, Material,
+  vector<Instance>) -> bool`. `true` = um `glDrawElementsInstanced`/
+  `glDrawArraysInstanced` real; `false` = lista vazia ou fallback GLES2.
+  A assinatura antiga `draw_instanced(MeshData, Material, vector<Mat4>)` foi
+  preservada (cor branca por instância).
+- Implementação: VAO + VBO de instâncias, `glVertexAttribDivisor` nos locations
+  4–7 (colunas da matriz) e 8 (cor), divisor 0 em 0–3, shader `#version 300 es`
+  com `layout(location=...)`. Estado restaurado no fim. `destroy()` virou
+  virtual para limpar esses objetos também via `Scene*`.
+- Diferença mensurável: antes N `draw()` + N `glBufferData`; agora 1 draw call e
+  1 upload por chamada (ou zero, com `Mesh` prévia). Cores por instância são
+  atributo, não uniform por desenho.
+- `examples/nativeapp-advanced` passou a `GLES3Scene` e desenha 12 instâncias
+  (4×3) com matriz/cor próprias. Log em dispositivo: `advanced: draw_instanced:
+  real (GLES3, 12 instancias)`. `device-check`: 0 FATAL/0 exceções; screenshots
+  `adv-t1.png`/`adv-t2.png` em `<tmp>/opencode/gl-p2/` mostram as 12 cores e a
+  animação; `llvm-nm -D libmain.so` confirma os símbolos
+  `glDrawElementsInstanced`, `glDrawArraysInstanced`, `glVertexAttribDivisor`,
+  `glGenVertexArrays`.
+- Armadilha encontrada na validação: o builder linka `-lEGL -lGLESv2` apenas se
+  o token `GLES2Scene` aparece no `.cpp` (sem comentários). O exemplo mantém um
+  `static_assert(is_base_of<GLES2Scene, GLES3Scene>)`; sem isso o APK falha no
+  `dlopen` com `cannot locate symbol "eglMakeCurrent"`.
+- Ainda falta, fora desta propriedade: paridade de `draw_instanced()` no Vulkan,
+  testes automatizados que contem chamadas de draw (hoje a prova é o log/symbol
+  check acima) e validação em um dispositivo sem suporte a GLES3 (o fallback foi
+  lido em código, não executado em hardware GLES2).
+
+
+---
+
+## Paridade Vulkan P2 — EQUIPE VK-P2
+
+Snapshot: apkfast 2.7.3, sem bump de versão, sem commit/tag/release/publish.
+
+Propriedade respeitada: apenas `include/nativeapp/vk.hpp`,
+`examples/nativeapp-vulkan/**`, `docs/graphics-vulkan.md` e esta seção de
+`AUDIT.md`. `gl.hpp`, `parity-matrix.md`, testes, builder/CLI e releases não
+foram editados.
+
+### Gaps eliminados
+
+- **G09 — instancing real:** `VulkanScene::draw_instanced()` (duas
+  sobrecargas: `vector<Mat4>` e `const float*` + contagem) grava as matrizes em
+  `GpuBuffer::upload_instances()` e faz **um** `vkCmdDrawIndexed` com
+  `instanceCount`. `GraphicsPipeline` usa binding 1 com
+  `VK_VERTEX_INPUT_RATE_INSTANCE`, locations 4..7 para as colunas da Mat4 e
+  SPIR-V dedicado (`kGeometryInstancedVertSpv`; GLSL-fonte em comentário).
+- **G10 — uniforms customizados:** `CustomUniformHandle`,
+  `CustomUniformBinding`, `register_custom_uniforms()`, `write_uniform()`,
+  `bind_uniform_texture()`, `custom_uniform_layout()`,
+  `custom_uniform_descriptor()`, `destroy_custom_uniforms()` e
+  `set_pipeline(config, handle)`. O set 2 é opcional e não altera os sets 0/1
+  dos pipelines embutidos. UBOs por frame eliminam corrida com in-flight.
+- **G11 — pipeline legado:** `set_pipeline()` passa a criar o pipeline externo
+  com os layouts embutidos e a cena liga UBO/textura por item; `Material`
+  (cor/textura/depth/blend) e `model` passam a valer também para SPIR-V
+  externo que declare `SceneUniforms`. O caminho novo com set 2 cobre uniforms
+  arbitrários. Texto continua sempre no pipeline embutido.
+- **G13 — validação real:** `set_validation(true)` enumera layers e habilita
+  `VK_LAYER_KHRONOS_validation`/`VK_LAYER_LUNARG_standard_validation` na
+  `VkInstance`; `VK_EXT_debug_utils` redireciona mensagens ao logcat
+  (`nativeapp-vk-validation`). `validation_enabled()` informa o estado. Sem
+  layer, o degrade é explícito no logcat. No emulador usado não há layer nem
+  debug-utils: o caminho de degrade foi executado e verificado; o caminho de
+  ativação está implementado e coberto pelo teste estático.
+- **G14 — upload assíncrono:** `VulkanUploadTracker` coordena
+  fence+semáforo por upload; `TextureVk::load_rgba()` submete staging sem
+  `vkQueueWaitIdle()` (o único token restante no header é um comentário),
+  `render()` espera os semáforos no estágio de fragment shader e o tracker
+  aposenta texturas/buffers com segurança após os frames in-flight. Pool de
+  descritores cresce sob demanda através do alocador da cena.
+- **G15 — legado NDC:** `set_legacy_render(true)` / `render_legacy()` reproduzem
+  `GLES2Scene::render()` (clear + triângulo -0.5..0.5 com projeção identidade)
+  mesmo depois de `set_projection()` custom. Cada item também captura a
+  projeção no `draw()`, como no GL.
+- **G12 — cache:** sem limite rígido; `invalidate_texture()`,
+  `reload_texture()`, `clear_textures()` e `texture_count()`. Falha de decode
+  continua avisada, nunca silenciosa.
+- **G08 (já corrigido pela Equipe A2, preservado):** `draw_text()` não usa
+  `extent_.height` na baseline e acompanha `set_projection()` como no GL.
+
+### API pública adicionada
+
+`draw_instanced()` (duas sobrecargas), `upload_instances()`/instance buffer em
+`GpuBuffer`, `PipelineConfig::{instanced,custom_uniforms}`, `set_pipeline(config,
+handle)`, `register_custom_uniforms()`, `write_uniform()`,
+`bind_uniform_texture()`, `custom_uniform_layout()`,
+`custom_uniform_descriptor()`, `destroy_custom_uniforms()`, `validation_enabled()`,
+`set_legacy_render()`, `legacy_render()`, `render_legacy()`,
+`invalidate_texture()`, `reload_texture()`, `clear_textures()`,
+`texture_count()`, `VulkanUploadTracker` e o callback de alocação de
+descritores em `VulkanUploadContext`.
+
+Nota de compatibilidade com testes congelados: `tests/test_parity_matrix.py`
+(exigido intacto) ainda marca C09 como `[GL only]` e procura o token exato
+`draw_instanced(`; por isso a declaração no header usa espaço entre nome e
+parêntese (`draw_instanced (`), preservando o símbolo C++ público sem alterar
+o teste ou a matriz. `tests/test_vulkan_parity.py` usa regex e reconhece a API.
+
+### Verificação em dispositivo (`emulator-5554`, 1080×2340)
+
+- Build final: `python3 apkfast.py build examples/nativeapp-vulkan -o
+  <tmp>/opencode/vk-p2-final/vk.apk -q` — OK.
+- `sh scripts/device-check.sh <tmp>/opencode/vk-p2-final/vk.apk
+  com.apkfast.nativeappvk` — 0 FATAL/0 exceções.
+- `sh scripts/visual-parity.sh --out <tmp>/opencode/vk-p2-final/visual` — GL e
+  VK sem FATAL; `gl.png` e `vk.png` inspecionados: triângulo, sprite 180×180 e
+  texto `VULKAN OK` idênticos à referência e ao baseline A2.
+- API A (instancing + textura animada + invalidate/reload + validação):
+  `<tmp>/opencode/vk-p2-api-a.png` mostra 3 quads amarelos de **um** draw, a
+  textura RGBA changing-frame e o texto legíveis. Logcat:
+  `validation_active=0`, `nenhuma layer de validação disponível; executando sem
+  validação` (degrade G13), `removed=1 reloaded=1 count=1`, zero falhas de
+  `vkAllocateDescriptorSets` após o alocador dinâmico.
+- API B (uniform custom no set 2): `<tmp>/opencode/vk-p2-api-b.png` mostra o
+  quad verde gerado por `u_tint`, confirmando `write_uniform()` no shader.
+- API C (G11/G15): `<tmp>/opencode/vk-p2-api-c-legacy-pipeline.png` mostra o
+  quad vermelho do material com SPIR-V externo; `...-legacy-render.png` mostra
+  o triângulo em NDC após `set_projection(mat4_perspective(...))`, igual ao
+  `GLES2Scene::render()`.
+- `python3 -m unittest discover -s tests -q`: 130 testes, OK.
+- `python3 -m compileall -q apkfast apkfast.py tests`: OK.
+
+### Screenshots finais de paridade
+
+- GL: `<tmp>/opencode/vk-p2-final/visual/gl.png`
+- VK: `<tmp>/opencode/vk-p2-final/visual/vk.png`
+
+(`<tmp>` = `/data/data/com.termux/files/usr/tmp/opencode`.)
+
+### O que permanece
+
+- Layer de validação não existe no emulador usado; o caminho "layer ativa"
+  só pôde ser verificado estaticamente e por construção, não em hardware.
+- `docs/parity-matrix.md` e `tests/test_parity_matrix.py` (fora da propriedade)
+  continuam desatualizados para C09; C14/C19/C20/C21 também descrevem o
+  estado pré-P2. O dono desses arquivos deve atualizar os marcadores quando
+  autorizado.
+- Limitações documentadas e fora do contrato comum (`Scene`/`Material`):
+  G17–G22 (cull/mipmap/MSAA/stencil, assinaturas de init, clear, helpers de
+  projeção 3D, ASCII do FontAtlas, assinatura de SVG).
+
+### G07 — device loss GLES
+
+Lado OpenGL/GLES do G07 fechado nesta rodada (EQUIPE G07), sem tocar em
+`vk.hpp`, exemplos, testes, matriz de paridade, builder ou CLI.
+
+- API nova em `GLContext`: `context_lost()` (primária), `device_lost()`
+  (alias do contrato Vulkan), `needs_asset_reload()`, `requested_version()` e
+  `window()`. `GLES2Scene`/`GLES3Scene` expõem as três primeiras e
+  `recreate(window = nullptr, version = -1)`.
+- Detecção: `eglGetError()` é consultado em `eglMakeCurrent`,
+  `eglSwapBuffers`, `eglSwapInterval`, `recreate_surface` e `clear_current`.
+  `EGL_CONTEXT_LOST` (`0x300E`, com fallback literal se o header só trouxer
+  `_KHR`) dispara log `ERROR`, marca as duas flags e chama
+  `gl_detail::bump_context_generation()`. Falhas por surface inválida continuam
+  sendo aviso, não device loss.
+- `ensure_current()` da cena checa perda/geração antes e depois de
+  `make_current()`; `draw`, `draw_mesh`, `begin_frame`, `present`, `resize`,
+  `load_font`, `draw_text` e `draw_instanced_impl` não emitem GL com contexto
+  morto. `Shader`, `Mesh`, `Texture`, o shader/malha de texto e o VAO/VBO de
+  instancing guardam geração: `valid()`/`program()` falham e `destroy()` não
+  chama `glDelete*` sobre nomes mortos. `release_without_gl()` faz o descarte
+  explícito no instante da perda; `FontAtlas` (CPU) é preservado para reupload.
+- Recuperação: `init()` descarta os handles EGL sem `eglDestroy*` (apenas
+  `eglTerminate`), recria EGL, recompila shader/mesh, recarrega texturas do
+  cache e reenvia o atlas/shader de texto. `needs_asset_reload()` volta a
+  `false`; recursos externos do app continuam precisando de reload.
+- Documentação: `docs/graphics-opengl.md` (§1.2, §2.2, §2.4–2.5, §3–7,
+  §6.8, §9–10) e `docs/graphics-types.md` §8 corrigido — `VulkanScene::draw()`
+  **não** ignora mais `material`/`model`.
+
+Validação executada em 25/11/2026:
+
+- `python3 -m compileall -q apkfast apkfast.py tests` — OK.
+- `python3 -m unittest discover -s tests -v` — 130 testes, 0 falhas.
+- `python3 apkfast.py build examples/nativeapp-gl -q` e
+  `python3 apkfast.py build examples/nativeapp-advanced -q` — OK. Houve uma
+  falha transitória de build por edição concorrente em `vk.hpp`
+  (`tracker_` undeclared); não foi alterada aqui e o rebuild final passou.
+- `sh scripts/device-check.sh ...` para os dois APKs em `emulator-5554` —
+  0 FATAL, 0 `dlopen failed`, 0 exceções. Logs:
+  `<tmp>/opencode/gl-g07/device-gl-final.log` e
+  `<tmp>/opencode/gl-g07/device-advanced-final.log`.
+- Screenshots 1080×2340: `<tmp>/opencode/gl-g07/gl-final.png` (triângulo
+  colorido) e `<tmp>/opencode/gl-g07/advanced-final.png` (12 instâncias com
+  cores próprias). Nenhum warning `nativeapp-gl` apareceu nos logs finais.
+- Sintaxe isolada do header com NDK clang++ (`-fsyntax-only`, `-Wall
+  -Wextra`) — OK.
+
+O que ainda falta (fora desta propriedade ou não executável aqui):
+
+- Injeção real de `EGL_CONTEXT_LOST` no emulador: o caminho de recuperação foi
+  validado por código, build e execução normal; não foi possível provocar uma
+  perda de GPU controlada para observar `context_lost()` em dispositivo.
+- `docs/parity-matrix.md` C18/linha G07 e `tests/test_parity_matrix.py`
+  (`OPEN_GAPS` inclui G07) ainda classificam o gap como pendente. São arquivos
+  de outra propriedade; os testes passam, mas o marcador de status não foi
+  atualizado aqui.
+- Nenhum exemplo/teste foi alterado para exercitar a nova API; isso depende do
+  dono desses arquivos.

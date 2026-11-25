@@ -428,7 +428,17 @@ Comportamentos concretos que valem conhecer (todos lidos das implementações):
 | `begin_frame()` | Ativa o contexto EGL, restaura `GL_DEPTH_TEST`/`GL_BLEND`, define `glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)`, `glClearColor` e limpa cor + profundidade. | Corpo vazio (`// clear acontece no render pass`). |
 | `present()` | Ativa EGL e chama `eglSwapBuffers` (com aviso no log se falhar). | Chama `render()`. |
 | `set_clear_color(...)` | Guarda `{r,g,b,a}` em `clear_`. | Guarda `{r,g,b,a}` em `clear_`. |
-| `draw(mesh, material, model)` | Faz upload temporário da malha e desenha: aplica material, textura, `depth_test`, `blend` e a matriz `model` (usa identidade quando `model == nullptr`). | Requer `set_pipeline()`; faz upload da malha para um `GpuBuffer`. Atualmente **ignora** `material` e `model` (`(void)material; (void)model; // uniforms via descriptor sets em versão futura`). |
+| Device loss | `context_lost()`/`device_lost()` viram `true` em `EGL_CONTEXT_LOST`; `needs_asset_reload()` também. `init()`/`recreate()` recupera. | `device_lost()`/`needs_asset_reload()` viram `true` em `VK_ERROR_DEVICE_LOST`; `init()` recupera. |
+| `draw(mesh, material, model)` | Faz upload temporário da malha e desenha: aplica material, textura, `depth_test`, `blend` e a matriz `model` (usa identidade quando `model == nullptr`). | Requer `set_pipeline()`; faz upload da malha para um `GpuBuffer` e enfileira `DrawItem` com `material.color`, `material.texture`, `material.depth_test`, `material.blend` e `model` (`nullptr` ⇒ identidade). Os valores são enviados ao UBO em `prepare_frame()`. |
+
+Os dois backends agora têm o mesmo contrato de perda: `device_lost()` (no GL,
+`context_lost()` é o nome primário e `device_lost()` um alias),
+`needs_asset_reload()` e inicialização explícita para voltar a desenhar. A
+diferença é o que cada um descarta: o GL usa `gl_detail::context_generation()`
+para invalidar `Shader`/`Mesh`/`Texture` sem chamar `glDelete*` sobre nomes de
+um contexto morto; o VK descarta handles de device com
+`release_without_vulkan()`. Em ambos, recursos externos precisam ser
+reenviados pelo app depois da recuperação.
 
 Exemplo de uso polimórfico (a inicialização é feita no tipo concreto):
 
@@ -503,7 +513,7 @@ scene.present();
 | Topologia incompatível com os índices | `topology` é livre, e o header não valida a combinação. | Ajuste `topology` junto com a forma como você preenche `indices`. |
 | `Material` com textura que não existe | `GLES2Scene::draw_mesh()` tenta `Texture::load()` e cai para `u_use_texture = 0` com aviso no log. | Confirme o caminho relativo em `assets/`. |
 | `model` inválido ou apontando para temporário morto | `Scene::draw` recebe `const float*`, não copia os dados. | Guarde o `Mat4` em variável e passe `.data()`; `nullptr` é aceito. |
-| Esperar que `model` e `material` alterem o desenho Vulkan | `VulkanScene::draw()` atualmente os ignora. | Use `GLES2Scene` se precisar desses efeitos já implementados. |
+| Esperar que `model` e `material` sejam ignorados no Vulkan | `VulkanScene::enqueue_draw()` já copia cor, textura, flags e matriz para o `DrawItem`; o UBO é preenchido em `prepare_frame()`. | Preencha `Material`/`model` normalmente; `set_pipeline()` continua necessário para geometria. |
 | Chamar `init()` via ponteiro `Scene*` | `init` não faz parte da interface. | Inicialize o objeto concreto antes de guardá-lo como `Scene*`. |
 | Usar `begin_frame()` esperando limpeza no Vulkan | O método é vazio; o clear acontece no render pass. | Conte com o fluxo interno do `VulkanScene`. |
 

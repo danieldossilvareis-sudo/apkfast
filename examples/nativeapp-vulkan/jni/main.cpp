@@ -106,6 +106,32 @@ private:
         if (down && code == AKEYCODE_BACK) request_exit();
     }
 
+    // Demonstração das APIs P2 (compilada, mas não chamada: a cena acima
+    // permanece pixel-a-pixel idêntica à referência GLES2).
+    void demo_p2_api() {
+        scene_.set_validation(true);  // antes de init(); degrada se não houver layer
+        scene_.load_texture("sprite.png");
+        scene_.invalidate_texture("sprite.png");
+        scene_.reload_texture("sprite.png");
+
+        std::vector<Mat4> models;
+        for (int i = 0; i < 3; ++i) {
+            models.push_back(mat4_translate(80.0f * i, 0.0f, 0.0f));
+        }
+        // Um draw real com binding de instância (inputRate=INSTANCE).
+        scene_.draw_instanced(MeshData::quad(40.0f, 40.0f), Material{}, models);
+
+        CustomUniformBinding binding;
+        binding.binding = 0;
+        binding.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        binding.size = 16;
+        const CustomUniformHandle handle = scene_.register_custom_uniforms({binding});
+        const float color[4] = {1.0f, 0.5f, 0.25f, 1.0f};
+        scene_.write_uniform(handle, 0, color, sizeof(color));
+        scene_.set_pipeline(PipelineConfig{}, handle);  // configure SPV antes de usar
+        scene_.destroy_custom_uniforms(handle);
+    }
+
     bool has_sprite_ = false;
     bool has_text_ = false;
     VulkanScene scene_;

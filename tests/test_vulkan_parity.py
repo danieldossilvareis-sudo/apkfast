@@ -120,6 +120,84 @@ class VulkanParityTests(unittest.TestCase):
             "scene_.render()",
         )
 
+    def test_instancing_real_com_divisor_de_instancia(self) -> None:
+        self.assertRegex(self.header, r"draw_instanced\s*\(")
+        self.assert_all(
+            self.header,
+            "std::vector<Mat4>",
+            "upload_instances",
+            "vkCmdDrawIndexed",
+            "instanced = true",
+            "VK_VERTEX_INPUT_RATE_INSTANCE",
+        )
+
+    def test_hooks_de_validation_layer(self) -> None:
+        self.assert_all(
+            self.header,
+            "void set_validation(bool enabled)",
+            "bool validation_enabled() const",
+            "validation_active_",
+            "VK_LAYER_KHRONOS_validation",
+            "VK_LAYER_LUNARG_standard_validation",
+            "vkEnumerateInstanceLayerProperties",
+            "VK_EXT_DEBUG_UTILS_EXTENSION_NAME",
+            "PFN_vkCreateDebugUtilsMessengerEXT",
+            "VkDebugUtilsMessengerCreateInfoEXT",
+            "VulkanScene::on_validation_message",
+            "PFN_vkDestroyDebugUtilsMessengerEXT",
+            "destroy_debug_messenger()",
+        )
+        # Já não é apenas um aviso: a layer entra na criação da instância.
+        self.assertIn("create.ppEnabledLayerNames", self.header)
+        self.assertNotIn("layers de validação não habilitadas", self.header)
+
+    def test_api_de_uniforms_e_shader_customizado(self) -> None:
+        self.assert_all(
+            self.header,
+            "using CustomUniformHandle",
+            "struct CustomUniformBinding",
+            "CustomUniformHandle register_custom_uniforms(",
+            "bool write_uniform(",
+            "bool bind_uniform_texture(",
+            "VkDescriptorSetLayout custom_uniform_layout(",
+            "VkDescriptorSet custom_uniform_descriptor(",
+            "void destroy_custom_uniforms(",
+            "void set_pipeline(PipelineConfig config, CustomUniformHandle",
+            "VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER",
+            "VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER",
+        )
+
+    def test_upload_assincrono_com_fence_e_semaphore(self) -> None:
+        self.assert_all(
+            self.header,
+            "class VulkanUploadTracker",
+            "VkSemaphore ready",
+            "VkFence fence",
+            "void track_upload(",
+            "std::vector<VkSemaphore> pending_semaphores() const",
+            "void mark_consumed()",
+            "void note_submission()",
+            "vkCreateFence(device_, &fence_info",
+            "vkCreateSemaphore(device_, &semaphore_info",
+            "upload_tracker_.pending_semaphores()",
+            "VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT",
+        )
+        # O upload da cena não pode mais parar a fila inteira.
+        self.assertNotIn("vkQueueWaitIdle(queue_)", self.header)
+        self.assertNotIn("vkQueueWaitIdle(ctx.queue)", self.header)
+
+    def test_render_legado_em_ndc(self) -> None:
+        self.assert_all(
+            self.header,
+            "void set_legacy_render(bool enabled)",
+            "bool legacy_render() const",
+            "void render_legacy()",
+            "if (legacy_render_)",
+            "uniforms.projection = legacy_render_ ? mat4_identity() : projection_;",
+            "enqueue_draw(MeshData::triangle(), Material{}",
+            "void present() override { render(); }",
+        )
+
     def test_documentacao_tabela_de_paridade(self) -> None:
         self.assert_all(
             self.docs,

@@ -34,7 +34,7 @@ cabeçalho único (`gl.hpp`), que encapsula EGL + OpenGL ES 2/3 para uma
   GLES2Scene  — orquestra tudo (implementa Scene)
       │
       ▼
-  GLES3Scene  — herda tudo e adiciona init(3) + draw_instanced()
+  GLES3Scene  — herda tudo e adiciona init(3) + instancing GLES3 real
 ```
 
 | Camada | Papel real no código | O que **não** faz |
@@ -44,7 +44,7 @@ cabeçalho único (`gl.hpp`), que encapsula EGL + OpenGL ES 2/3 para uma
 | `Mesh` | Faz upload de `MeshData` para VBO/IBO e emite `glDrawElements`/`glDrawArrays` | Não desativa os arrays de atributos após `draw()`; não faz instancing |
 | `Texture` | Decode via stb_image embutido, `glTexImage2D`, filtros/wrap, `glActiveTexture`+`glBindTexture` | Não seta o uniform sampler; não gerencia cache de caminhos |
 | `GLES2Scene` | Implementa `Scene`: inicializa GL, projection ortho2d, materiais, cache de texturas, `begin_frame`/`present`, `draw`/`draw_mesh`, `render()` legado | Não é proprietária dos ponteiros passados em `set_shader`/`set_mesh` |
-| `GLES3Scene` | Pede contexto 3 e oferece `draw_instanced()` | **Não** usa VAOs, `glVertexAttribDivisor` nem `glDrawElementsInstanced` |
+| `GLES3Scene` | Pede contexto 3, cria VAO/VBO de instâncias e oferece `draw_instanced()` com matriz/cor por instância | Não cria texturas próprias; se cair para GLES2, o caminho instanciado não existe (há fallback explícito) |
 
 Inclua tudo com um dos dois caminhos:
 
@@ -96,8 +96,17 @@ inline void gl_check(const char* operation);
   Nesse caso, loga `ANDROID_LOG_WARN` com tag `nativeapp-gl` no formato
   `"%s: glGetError=0x%x"`. Sem a macro, a função vira `(void)operation`. Ela
   apenas avisa — não lança exceção.
-- Na prática, `gl_check()` é chamado em `Mesh::draw()` (`"mesh_draw"`) e no fim
-  de `GLES2Scene::draw_mesh()` (`"draw_mesh"`).
+- Na prática, `gl_check()` é chamado em `Mesh::draw()` (`"mesh_draw"`), no fim
+  de `GLES2Scene::draw_mesh()` (`"draw_mesh"`) e no instancing (`"draw_instanced"`
+  e `"instancing_alloc"`).
+
+`gl_detail::context_generation()` é o outro mecanismo de segurança: um contador
+que muda em `GLContext::init()`, `GLContext::destroy()` e no instante em que uma
+perda de contexto é detectada. `Shader`, `Mesh` e `Texture` guardam a geração em
+que seus nomes foram criados. Se a geração atual divergir, `use()`/`draw()`/
+`bind()` são no-ops e `destroy()` não chama `glDelete*` sobre nomes mortos. Isso
+é o equivalente GLES do "descartar sem usar handles" feito pelo Vulkan em
+`VulkanScene::handle_device_loss()`.
 
 ---
 
@@ -112,16 +121,22 @@ public:
     GLContext& operator=(const GLContext&) = delete;
 
     void init(ANativeWindow* window, int client_version = 2);
-    void make_current() const;
+    bool make_current() const;           // false também quando o contexto foi perdido
     void recreate_surface(ANativeWindow* window);
     void set_swap_interval(int interval) const;
     bool swap() const;
     void clear_current() const;
     void destroy();
 
-    int        version() const;
-    EGLDisplay display() const;
-    EGLContext context() const;
+    bool context_lost() const;           // EGL_CONTEXT_LOST detectado
+    bool device_lost() const;            // alias, mesmo contrato do Vulkan
+    bool needs_asset_reload() const;     // true até init()/recreate() bem-sucedido
+
+    int           version() const;
+    int           requested_version() const;
+    EGLDisplay    display() const;
+    EGLContext    context() const;
+    ANativeWindow* window() const;
 };
 ```
 
@@ -172,24 +187,37 @@ if (ctx.version() < 3) {
 ### 2.2 `make_current()` e `clear_current()`
 
 `make_current()` só chama `eglMakeCurrent` se **display, contexto e surface**
-são válidos:
+são válidos e nenhuma perda foi marcada:
 
 ```cpp
 eglMakeCurrent(display_, surface_, surface_, context_);  // draw = read = surface
 ```
 
+Ele devolve `EGL_TRUE == ok`. Quando a chamada falha, o código consulta
+`eglGetError()`: se o valor for `EGL_CONTEXT_LOST` (`0x300E`), a perda é marcada,
+um erro é logado em `nativeapp-gl` e `gl_detail::context_generation()` avança.
+`swap()` faz o mesmo com `eglSwapBuffers` — os dois são os pontos onde o driver
+reporta a perda. Falhas por surface inválida (`EGL_BAD_SURFACE` etc.) continuam
+sendo apenas avisos: elas são tratadas por `recreate_surface()`, não como device
+loss.
+
+Depois da marcação, `make_current()`, `swap()` e `set_swap_interval()` viram
+no-ops até `init()` (ou `GLES2Scene::recreate()`).
+
 `clear_current()` chama `eglMakeCurrent(display_, EGL_NO_SURFACE,
 EGL_NO_SURFACE, EGL_NO_CONTEXT)` (se houver display). `recreate_surface()` usa
-isso internamente antes de destruir a surface antiga.
+isso internamente antes de destruir a surface antiga e também marca perda se o
+erro for `EGL_CONTEXT_LOST`.
 
-> **Observação:** quase toda operação das cenas começa com
-> `egl_.make_current()` (`resize`, `draw`, `begin_frame`, `present` e
-> `destroy`). Isso reconecta o contexto após uma recriação de surface ou após
-> outra thread ter feito current.
+> **Observação:** as cenas não chamam `egl_.make_current()` diretamente: usam
+> `ensure_current()`, que checa a perda antes e depois do `eglMakeCurrent`.
+> Isso reconecta o contexto após uma recriação de surface ou após outra thread
+> ter feito current, sem deixar um draw escapar com o contexto morto.
 
 ### 2.3 `recreate_surface(window)`
 
-1. Sai imediatamente se `display_` ou `config_` são inválidos.
+1. Sai imediatamente se o contexto foi perdido, ou se `display_`/`config_`
+   são inválidos.
 2. `make_current()`.
 3. Se existe surface: desfaz current, `eglDestroySurface`, zera `surface_`.
 4. Atualiza `window_`; se o ponteiro não for nulo, cria nova surface com o
@@ -204,12 +232,45 @@ isso internamente antes de destruir a surface antiga.
 
 | Método | Comportamento |
 |---|---|
-| `set_swap_interval(int) const` | `eglSwapInterval(display_, interval)` se houver display (`0` desliga vsync; `1` sincroniza) |
-| `swap() const` | `eglSwapBuffers(display_, surface_) == EGL_TRUE`; retorna `false` se não há display ou surface |
-| `destroy()` | Destrói surface, contexto, chama `eglTerminate` e zera display/config/window; é idempotente (`display_ == EGL_NO_DISPLAY` → retorna) |
-| `version()`, `display()`, `context()` | Acesso ao estado atual; `version()` reflete o fallback |
+| `set_swap_interval(int) const` | `eglSwapInterval(display_, interval)` se houver display e contexto íntegro (`0` desliga vsync; `1` sincroniza) |
+| `swap() const` | `eglSwapBuffers(display_, surface_) == EGL_TRUE`; retorna `false` se não há display/surface ou se a perda foi marcada |
+| `destroy()` | Destrói surface, contexto, chama `eglTerminate` e zera display/config/window. Após perda, **não** chama `eglDestroySurface`/`eglDestroyContext`: termina o display e descarta os handles com aviso explícito |
+| `context_lost()` / `device_lost()` | `true` desde que `eglGetError() == EGL_CONTEXT_LOST` foi visto até a próxima inicialização |
+| `needs_asset_reload()` | `true` no mesmo intervalo; o app deve recarregar recursos próprios antes/ao recuperar |
+| `version()`, `requested_version()`, `display()`, `context()`, `window()` | Estado atual; `version()` reflete o fallback, `requested_version()` guarda o pedido original |
 
-### 2.5 Por que **não** chamar `resize()` dentro de `init()`
+### 2.5 Perda de contexto e recuperação
+
+`EGL_CONTEXT_LOST` (`0x300E`) é detectado em `make_current()`, `swap()`,
+`recreate_surface()`, `set_swap_interval()` e `clear_current()`. O resultado é
+sempre o mesmo:
+
+1. log `ANDROID_LOG_ERROR` com tag `nativeapp-gl` e nome da operação;
+2. `context_lost_ = true` e `needs_asset_reload_ = true`;
+3. `gl_detail::bump_context_generation()` — todos os nomes GL passam a ser
+   considerados inválidos imediatamente;
+4. nenhum `glDelete*` e nenhum `eglDestroySurface`/`eglDestroyContext` é chamado
+   sobre o contexto morto.
+
+Para recuperar, chame `GLContext::init()` novamente (com a mesma janela e
+versão desejada). `init()` descarta o estado antigo com `eglTerminate`,
+recria display/config/context/surface, zera as duas flags e avança a geração.
+O mesmo vale para `GLES2Scene::recreate()` (§6.8).
+
+```cpp
+if (ctx.context_lost()) {
+    const bool reload = ctx.needs_asset_reload();  // leia ANTES de init()
+    ctx.init(janela, 3);                           // geração nova
+    // recarregue Shader/Texture/Mesh próprias se reload == true
+}
+```
+
+> **Atenção:** `EGL_CONTEXT_LOST` não é a mesma coisa que surface destruída.
+> `EGL_BAD_SURFACE`/`EGL_BAD_MATCH` durante `on_surface_destroyed()` apenas
+> geram warning; use `recreate_surface()`/`init()` normalmente nesse caso.
+> O mecanismo de device loss só dispara com o erro explícito de perda.
+
+### 2.6 Por que **não** chamar `resize()` dentro de `init()`
 
 `GLContext::init()` não configura viewport — quem faz isso é
 `GLES2Scene::resize()`, que chama `glViewport(0,0,w,h)` **e** recalcula
@@ -281,10 +342,18 @@ public:
     void set_uniform_mat4(const std::string& name, const float* matrix);
 
     GLint  attrib(const std::string& name);
-    GLuint program() const;
+    GLuint program() const;              // 0 se a geração de contexto mudou
+    bool   valid() const;                // programa vivo na geração atual
+    void   release_without_gl();         // descarta o nome sem glDeleteProgram
     void   destroy();
 };
 ```
+
+> **Device loss:** `use()` e `set_uniform*` viram no-op e `program()` devolve
+> `0` se o programa pertence a outra geração de contexto. `destroy()` só chama
+> `glDeleteProgram` quando a geração confere. `release_without_gl()` é usado
+> pela cena no instante da perda; um posterior `compile()` reconstrói o
+> programa sem tocar no nome antigo.
 
 ### 3.1 `compile()` com fontes inline
 
@@ -447,10 +516,19 @@ public:
     void draw() const;
     void destroy();
 
+    bool valid() const;                  // geração de contexto conferida
+    void release_without_gl();           // descarta VBO/IBO sem glDeleteBuffers
+
     GLsizei vertex_count() const;
     void set_vertex_count(GLsizei count);
 };
 ```
+
+`upload()` começa chamando `refresh_generation()`: se o contexto mudou, os
+nomes antigos de VBO/IBO são zerados sem `glDeleteBuffers` e novos nomes são
+gerados. `draw()` retorna imediatamente quando a geração diverge; `destroy()`
+também não apaga nomes de outra geração. Isso cobre tanto a perda detectada
+quanto uma troca explícita de `GLContext`.
 
 **`upload(data)`**:
 
@@ -509,9 +587,11 @@ oferece índices de 32 bits.
 
 ### 4.4 Sobre instancing
 
-`Mesh` **não** tem `draw_instanced()`. O único método com esse nome está em
-`GLES3Scene` (§7.2) e, na implementação atual, ele chama `draw()` em loop — ou
-seja, também passa pelo upload do `temporary_mesh_` da cena a cada iteração.
+`Mesh` **não** tem `draw_instanced()` público. O instancing está em
+`GLES3Scene` (§7): lá a malha é reaproveitada via amizade de classe (os buffers
+da `Mesh` são ligados diretamente) e o desenho sai em **um**
+`glDrawElementsInstanced`/`glDrawArraysInstanced`, com matriz/cor vindas de um
+VBO com divisor de atributo 1.
 
 ---
 
@@ -531,6 +611,9 @@ public:
                         int width = 0, int height = 0);
     bool load_rgba(const uint8_t* rgba, int width, int height);
     void bind(unsigned int unit = 0) const;
+
+    bool valid() const;                  // textura viva na geração atual
+    void release_without_gl();           // descarta o nome sem glDeleteTextures
     void destroy();
 
     int    width() const;
@@ -538,6 +621,12 @@ public:
     GLuint id() const;
 };
 ```
+
+> **Device loss:** `bind()` já checava `generation_` e continua sendo no-op com
+> nome morto. `load()`/`load_rgba()` chamam `refresh_generation()` antes do
+> upload; `destroy()` e o próprio `upload_rgba()` só chamam `glDeleteTextures`
+> se a geração ainda é a mesma. Isso evita apagar um nome que pode pertencer a
+> outro objeto no contexto recuperado.
 
 ### 5.1 `load(path)`
 
@@ -623,6 +712,11 @@ public:
     ~GLES2Scene() override;              // chama destroy()
 
     virtual void init(ANativeWindow* window);           // init(window, 2)
+    void recreate(ANativeWindow* window = nullptr, int client_version = -1);
+
+    bool context_lost() const;
+    bool device_lost() const;            // alias do contrato Vulkan
+    bool needs_asset_reload() const;     // true até init()/recreate()
 
     void set_shader(Shader* shader);
     void set_mesh(Mesh* mesh);
@@ -656,19 +750,25 @@ protected:
 
 `init(window)` chama a sobrecarga protegida `init(window, 2)`. Essa sobrecarga:
 
-1. Retorna se `initialized_` já é `true` (idempotente).
-2. `egl_.init(window, client_version)`.
-3. `glEnable(GL_DEPTH_TEST)`, `glEnable(GL_BLEND)`,
+1. Guarda `window_` e `requested_client_version_` para `recreate()`.
+2. Se uma perda está pendente, chama `handle_context_loss()` (invalida sem
+   `glDelete*`). Se `initialized_` já é `true`, retorna (idempotente).
+3. `egl_.init(window, client_version)` — descarta contexto perdido e recria EGL.
+4. `glEnable(GL_DEPTH_TEST)`, `glEnable(GL_BLEND)`,
    `glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)`.
-4. `glClearColor(clear_...)` — padrão `{0.08f, 0.08f, 0.12f, 1.0f}`.
-5. `shader_.compile(kVertexShader, kFragmentShader)` — shaders embutidos.
-6. `mesh_.upload(default_mesh())` — `MeshData::triangle()`.
-7. Tenta `resize()` com `ANativeWindow_getWidth/Height` se ambos > 0 (§2.5).
-8. Marca `initialized_ = true`.
+5. `glClearColor(clear_...)` — padrão `{0.08f, 0.08f, 0.12f, 1.0f}`.
+6. `shader_.compile(kVertexShader, kFragmentShader)` — shaders embutidos.
+7. `mesh_.upload(default_mesh())` — `MeshData::triangle()`.
+8. Tenta `resize()` com `ANativeWindow_getWidth/Height` se ambos > 0 (§2.6).
+9. Em recuperação: recarrega as texturas do cache e reenvia o atlas da fonte
+   (se `load_font()` já tiver sido chamado), restaura viewport com
+   `width_`/`height_` e limpa `needs_asset_reload()`.
+10. Marca `initialized_ = true` e loga o aviso de contexto reinicializado.
 
-> **Observação:** se `init()` lançar `GLError` antes de `initialized_ = true`,
-> `destroy()` não limpa nada (ele começa com `if (!initialized_) return;`).
-> tratamento de erro é responsabilidade do chamador.
+> **Observação:** se `init()` lançar `GLError`, ele destrói EGL, limpa os
+> objetos parciais e deixa a cena pronta para nova tentativa. Recursos
+> externos (seu `Shader`, `Mesh`, `Texture` fora da cena) continuam com a
+> geração antiga e devem ser reenviados.
 
 ### 6.2 Shader embutido (contrato dos uniforms)
 
@@ -746,14 +846,15 @@ void draw_mesh(const Mesh& mesh, const Material& material,
 
 `draw()`:
 
-1. Retorna se a cena não foi inicializada.
-2. `egl_.make_current()`.
-3. `temporary_mesh_.upload(data)`.
-4. Chama `draw_mesh(temporary_mesh_, material, model)`.
+1. Retorna se a cena não foi inicializada ou `ensure_current()` falhar.
+2. `temporary_mesh_.upload(data)`.
+3. Chama `draw_mesh(temporary_mesh_, material, model)`.
 
 `draw_mesh()` (o coração do desenho):
 
-1. Escolhe `shader_override_` se definido, senão `shader_`, e chama `use()`.
+1. Garante contexto atual (`ensure_current()`); escolhe `shader_override_` se
+   definido, senão `shader_`. Sai se `program() == 0` (geração divergente) e
+   chama `use()`.
 2. Uniforms: `u_projection = projection_`, `u_model = model ? *model : identidade`,
    `u_color = material.color[0..3]`, `u_use_texture = material.texture.empty() ? 0 : 1`.
 3. Se `material.texture` não está vazio: procura no cache por caminho; se não
@@ -765,13 +866,12 @@ void draw_mesh(const Mesh& mesh, const Material& material,
 5. Chama `mesh.draw()` e, em seguida, `glDisableVertexAttribArray(0..3)`.
 6. Chama `gl_check("draw_mesh")`.
 
-> **Atenção (bug real a evitar):** quando `texture->load()` falha, o código
-> **não** insere a textura no mapa, mas ainda executa `it->second->bind(0)` com
-> `it == textures_.end()`. Isso é dereferência de iterator inválido
-> (comportamento indefinido). Na prática: **use apenas caminhos de textura que
-> você confirmou que carregam** (por exemplo, validando com
-> `Texture::load()` antes de preencher `Material::texture`). O warning de
-> "nao carregada" é emitido, mas a chamada seguinte já é problemática.
+> **Atenção:** `cached_texture()` (protegido, usado por `draw_mesh()` e pelo
+> caminho instanciado) retorna `nullptr` quando o `load()` falha, sem inserir a
+> textura no cache. Nesse caso `u_use_texture` vira `0` e nenhum `bind()` é
+> feito: o warning `Textura nao carregada: <path>` continua sendo emitido, mas
+> não há mais dereferência de `end()`. Validar com `Texture::load()` antes de
+> preencher `Material::texture` ainda evita tentativas repetidas por frame.
 
 > **Observação:** `temporary_mesh_` é **um único** objeto reaproveitado. Cada
 > `draw()` faz novo `glBufferData` — ótimo para geometria dinâmica, ruim para
@@ -782,29 +882,30 @@ void draw_mesh(const Mesh& mesh, const Material& material,
 
 ```cpp
 void begin_frame() override {
-    if (!initialized_) return;
-    egl_.make_current();
+    if (!initialized_ || !ensure_current()) return;
     // Restaura defaults para que um material anterior não vaze estado.
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glActiveTexture(GL_TEXTURE0);
     glClearColor(clear_[0], clear_[1], clear_[2], clear_[3]);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 }
 
 void present() override {
-    if (!initialized_) return;
-    egl_.make_current();
+    if (!initialized_ || !ensure_current()) return;
     if (!egl_.swap()) {
-        __android_log_print(ANDROID_LOG_WARN, "nativeapp-gl",
-                            "eglSwapBuffers falhou");
+        if (egl_.context_lost()) handle_context_loss();
+        else __android_log_print(ANDROID_LOG_WARN, "nativeapp-gl",
+                                 "eglSwapBuffers falhou");
     }
 }
 ```
 
 `begin_frame()` restaura depth/blend/blendFunc/clearColor e faz o clear. Isso
 é o que impede que um `Material` com `depth_test=false` ou `blend=false` do
-frame anterior vaze para o próximo. `present()` troca os buffers.
+frame anterior vaze para o próximo. `present()` troca os buffers e, se
+`eglSwapBuffers` devolver `EGL_CONTEXT_LOST`, marca a perda com `handle_context_loss()`.
 
 ### 6.6 `render()` vs `draw()` — a diferença que mais confunde
 
@@ -864,24 +965,88 @@ pixels de toque para NDC, coerente com a projection identidade de `render()`.
 
 ### 6.7 `destroy()`
 
-Só age se `initialized_`. Faz `make_current()`, limpa o cache de texturas,
-destrói `temporary_mesh_`, `mesh_` e `shader_`, chama `egl_.destroy()` e zera
+Se a perda foi marcada, chama `handle_context_loss()` (descarta nomes sem
+`glDelete*`) e `egl_.destroy()` sem tocar em EGL inválido. Caso contrário, só
+age se `initialized_`: garante current, limpa o cache de texturas, destrói
+`temporary_mesh_`, `mesh_`, `shader_` e o texto, chama `egl_.destroy()` e zera
 `initialized_`.
 
 > **Observação:** ponteiros registrados com `set_shader()`/`set_mesh()` não são
 > deletados — a vida útil deles é de quem os criou.
 
+### 6.8 Device loss: detectar, parar e recuperar
+
+A cena detecta perda por dois caminhos:
+
+1. `GLContext` marca `EGL_CONTEXT_LOST` em `make_current()`/`swap()` (ou nas
+   outras chamadas EGL listadas em §2.5);
+2. `GLES2Scene::ensure_current()` compara `scene_generation_` com
+   `gl_detail::context_generation()`. Se divergirem — por exemplo porque o app
+   chamou `egl().init()` diretamente — a cena também entra em modo perdido.
+
+Em ambos os casos, `handle_context_loss()`:
+
+- loga uma vez com `ANDROID_LOG_ERROR`;
+- chama `invalidate_resources_after_loss()`: `release_without_gl()` em
+  `shader_`, `text_shader_`, `mesh_`, `temporary_mesh_` e nas texturas do cache;
+  zera `font_texture_` e `text_vbo_`; preserva `font_` (CPU-side) para reupload;
+- zera `initialized_`, então `draw()`, `begin_frame()`, `present()`,
+  `draw_text()` e `resize()` não chamam GL até a recuperação;
+- mantém `needs_asset_reload() == true` até a próxima inicialização.
+
+`GLES3Scene` estende o hook para liberar também `instance_vbo_`,
+`instance_vao_` e `instanced_shader_` sem `glDelete*`.
+
+Recuperação explícita:
+
+```cpp
+void on_update(float dt) override {
+    if (scene_.context_lost()) {
+        const bool reload = scene_.needs_asset_reload();  // leia antes
+        scene_.recreate();     // reusa janela/versão do init() anterior
+        // ou: scene_.init(window()); com a janela atual
+        if (reload) recarregar_meus_shaders_e_malhas();
+    }
+}
+```
+
+`recreate()` chama `destroy()` (se ainda initialized) ou `handle_context_loss()`
+e depois `init()` com a janela/versão salvas. `init()` reconstrói shader
+embutido, mesh padrão, texturas cacheadas e atlas de fonte; `needs_asset_reload()`
+volta a `false`. Recursos **externos** (`set_shader()`, `set_mesh()`, `Texture`
+própria, `Shader` carregado de `assets/`) precisam de `compile()`/`upload()`/
+`load()` de novo — seus nomes antigos não são reaproveitados.
+
+> **Atenção:** não tente "consertar" uma perda chamando apenas
+> `recreate_surface()`. Ela lida com janela/surface, não com contexto perdido:
+> use `init()`/`recreate()` para gerar uma geração nova de nomes GL.
+
 ---
 
-## 7. `GLES3Scene` — Contexto 3 e `draw_instanced()`
+## 7. `GLES3Scene` — Instancing GLES3 real
 
 ```cpp
 class GLES3Scene : public GLES2Scene {
 public:
-    using GLES2Scene::init;                       // expõe init(window, version)
+    /// Matriz model (column-major) + cor RGBA por instância.
+    struct Instance {
+        Mat4 model = mat4_identity();
+        std::array<float, 4> color{{1.0f, 1.0f, 1.0f, 1.0f}};
+    };
+    static_assert(sizeof(Instance) == 80);  // 4 colunas (64 B) + RGBA (16 B)
 
-    void init(ANativeWindow* window) override;    // pede versão 3
+    using GLES2Scene::init;                    // expõe init(window, version)
+    void init(ANativeWindow* window) override; // pede versão 3
+    ~GLES3Scene() override;                    // destroy() próprio + da base
+    void destroy() override;
 
+    // Caminho novo: UM glDraw*Instanced, matrizes/cores vindas de VBO.
+    bool draw_instanced(const Mesh& mesh, const Material& material,
+                        const std::vector<Instance>& instances);
+    bool draw_instanced(const MeshData& data, const Material& material,
+                        const std::vector<Instance>& instances);
+
+    // Compatibilidade: assinatura antiga preservada (cor branca por instância).
     void draw_instanced(const MeshData& data, const Material& material,
                         const std::vector<Mat4>& models);
 };
@@ -900,46 +1065,99 @@ void init(ANativeWindow* window) override {
 }
 ```
 
-Ou seja: a diferença em relação a `GLES2Scene` é o argumento `3` passado ao
-`GLContext`, que tenta o config ES3 e aplica o fallback descrito em §2.1. O
-warning usa a tag `nativeapp-gl`. `using GLES2Scene::init;` reexpõe a
-sobrecarga `init(window, client_version)`; chamar `init(window, 2)` numa
-`GLES3Scene` é possível e pede GLES2 explicitamente.
+Diferença em relação a `GLES2Scene`: o argumento `3` passado ao `GLContext`,
+que tenta o config ES3 e aplica o fallback descrito em §2.1. O `using
+GLES2Scene::init;` reexpõe `init(window, client_version)`; `init(window, 2)`
+pede GLES2 explicitamente. `destroy()` é `virtual` para que a limpeza do VAO,
+do VBO de instâncias e do shader GLES3 também aconteça via `Scene*`.
 
-> **Atenção:** apesar do comentário do cabeçalho ("GLES3Scene — VAOs,
-> instancing"), o código **não cria VAOs**, não chama
-> `glGenVertexArrays`/`glBindVertexArray`, `glVertexAttribDivisor` nem
-> `glDrawElementsInstanced`. Toda a funcionalidade de desenho vem de
-> `GLES2Scene`.
+`context_lost()`, `device_lost()`, `needs_asset_reload()` e `recreate()` são
+herdados de `GLES2Scene`. `GLES3Scene` sobrescreve apenas
+`invalidate_resources_after_loss()` para descartar `instance_vbo_`,
+`instance_vao_` e `instanced_shader_` sem `glDelete*`. Um `instance_generation_`
+próximo guarda a geração desses nomes: se divergir, `draw_instanced_impl()`
+devolve `false` e um novo VAO/VBO é gerado no próximo desenho válido.
 
-### 7.2 `draw_instanced()` — implementação honesta
+> **Atenção (builder):** `apkfast/builder.py` detecta GLES pelo **token
+> `GLES2Scene` no texto do `.cpp`** (comentários são removidos) para adicionar
+> `-lEGL -lGLESv2`. Um app que só menciona `GLES3Scene` linka sem EGL e falha no
+> `dlopen` com `cannot locate symbol "eglMakeCurrent"`. O exemplo avançado mantém
+> o token com um `static_assert(std::is_base_of<GLES2Scene, GLES3Scene>...)`.
+> Em outros projetos, use o mesmo recurso ou `--ldflags "-lEGL -lGLESv2"`.
+
+### 7.2 API de instâncias e o caminho real
+
+`Instance` é uma struct de layout fixo: `Mat4` (column-major, 64 bytes) seguida
+de RGBA (16 bytes). A cor final é:
+
+```text
+texture (se houver) × cor do vértice × Material.color × Instance.color
+```
+
+As sobrecargas com `std::vector<Instance>` retornam `bool`:
+
+| Valor | Significado |
+|---|---|
+| `true` | Houve **um** `glDrawElementsInstanced`/`glDrawArraysInstanced` real (GLES3) |
+| `false` | Nada desenhado (lista vazia), ou contexto GLES2 / shader GLES3 indisponível → fallback documentado em §7.3 |
+
+A sobrecarga com `Mesh` reaproveita geometria já na GPU (upload feito uma vez
+pelo chamador). A sobrecarga com `MeshData` faz **um único** `upload()` por
+chamada e destrói a `Mesh` local no retorno. Para muitos frames com a mesma
+geometria, prefira `Mesh`.
+
+Passos do caminho GLES3 (`draw_instanced_impl`):
+
+1. Sai se não há instâncias, se a `Mesh` não é válida na geração atual ou se
+   `egl().version() < 3`.
+2. `ensure_current()` e compilação preguiçosa de um shader `#version 300 es`
+   próprio (falha de compilação vira warning + fallback, nunca exceção).
+3. Cria um VAO e um VBO de instâncias (ambos reaproveitados entre frames).
+4. Uniforms: `u_projection` (vem de `resize()`/`set_projection()`), `u_color`
+   (`Material`) e, se houver textura, `u_texture`/`u_use_texture`.
+5. Atributos **por vértice** locations 0–3 (posição/normal/UV/cor) com
+   `glVertexAttribDivisor(loc, 0)`, apontando para o VBO da `Mesh`.
+6. Atributos **por instância**: locations 4–7 são as quatro colunas da `Mat4`
+   (`glVertexAttribPointer(4+i, 4, GL_FLOAT, ..., i*16)`), location 8 é a cor;
+   todos com `glVertexAttribDivisor(loc, 1)` e stride `sizeof(Instance) = 80`.
+7. `glDrawElementsInstanced(...)` quando há IBO válido, senão
+   `glDrawArraysInstanced(...)` — **uma chamada para N instâncias**.
+8. Restaura estado: `glVertexAttribDivisor(0..8, 0)`,
+   `glDisableVertexAttribArray(0..8)` e `glBindVertexArray(0)`, para não vazar
+   para `draw_mesh()`.
+
+> **Observação:** o shader usa `layout(location = ...)` do GLSL ES 3.00, então
+> não depende de `glBindAttribLocation` extra. `Shader::link()` continua fixando
+> 0–3 para os nomes `a_position`/`a_normal`/`a_uv`/`a_color`.
+
+### 7.3 Compatibilidade e fallback honesto
+
+A assinatura antiga continua existindo **exatamente** como antes:
 
 ```cpp
 void draw_instanced(const MeshData& data, const Material& material,
-                    const std::vector<Mat4>& models) {
-    if (models.empty()) return;
-    egl().make_current();
-    // GLES3 permite instancing via divisor de atributo; implementação
-    // simplificada usando uniforms por chamada (compatível com GLES2).
-    for (const auto& model : models) {
-        draw(data, material, model.data());
-    }
-}
+                    const std::vector<Mat4>& models);
 ```
 
-O que isso significa na prática:
+Ela converte cada `Mat4` em `Instance` com cor branca e chama a nova sobrecarga.
+Como retorna `void`, não informa se houve fallback; use a sobrecarga com
+`std::vector<Instance>` quando isso importar.
 
-| Aspecto | Comportamento atual |
-|---|---|
-| Chamadas de draw | **N** chamadas (`N = models.size()`), uma por matriz |
-| Upload de geometria | **N** uploads: cada `draw()` reaproveita `temporary_mesh_` e refaz `glBufferData` |
-| Uniforms | Cada iteração seta `u_model` com a matriz daquela instância |
-| Compatibilidade | Funciona até em contexto GLES2, porque usa apenas `draw()` |
-| VAOs / divisor / `glDrawElementsInstanced` | **Não existem** nesta versão do cabeçalho |
-| `models` vazio | Retorno imediato, sem desenho |
+| Aspecto | Loop antigo (até v2.7.3) | Instanciamento real (agora) |
+|---|---|---|
+| Chamadas de draw | N (`draw()` por matriz) | **1** (`glDrawElementsInstanced`/`glDrawArraysInstanced`) |
+| Upload de geometria | N (`temporary_mesh_` refaz `glBufferData`) | 1 por chamada (`MeshData`) ou 0 (`Mesh` já na GPU) |
+| Matriz por instância | uniform `u_model` por draw | atributo com divisor 1 (locations 4–7) |
+| Cor por instância | impossível sem outro uniform/draw | atributo com divisor 1 (location 8) |
+| VAO / divisor | inexistentes | `glGenVertexArrays` + `glVertexAttribDivisor` |
+| Contexto GLES2 | funcionava (era a única opção) | fallback explícito para o loop, com warning |
+| `models` vazio | retorno imediato | `false`, nenhum draw |
 
-Se você esperava ganho de performance, ele **não está implementado**: hoje é um
-laço de uniforms com a mesma custo por instância de um `draw()` normal.
+No fallback (GLES2 ou shader GLES3 que não compilou), a cena loga
+`nativeapp-gl: draw_instanced: GLES%d sem instancing real; fallback com N
+draws` e usa `draw_mesh()`/`draw()` com `Material.color` multiplicado pela cor
+da instância. Assim o exemplo continua desenhando sem FATAL, mas o `bool`
+deixa claro que **não** houve instanciamento.
 
 ---
 
@@ -1074,11 +1292,15 @@ Mesh gpu;
 gpu.upload(custom_);
 scene_.draw_mesh(gpu, material_, model_.data());   // sem reupload
 
-// (b) Instâncias via GLES3Scene (hoje: loop de draw()).
+// (b) Instanciamento real via GLES3Scene (um draw call).
 GLES3Scene c3;
 c3.init(window());              // tenta 3, faz fallback para 2
-c3.draw_instanced(custom_, material_, {mat4_translate(10, 0, 0),
-                                       mat4_translate(20, 0, 0)});
+std::vector<GLES3Scene::Instance> instances;
+instances.push_back({mat4_translate(10, 0, 0), {1.0f, 0.2f, 0.2f, 1.0f}});
+instances.push_back({mat4_translate(20, 0, 0), {0.2f, 0.2f, 1.0f, 1.0f}});
+const bool real = c3.draw_instanced(custom_, material_, instances);
+// Assinatura antiga (Mat4, cor branca) continua válida:
+c3.draw_instanced(custom_, material_, {mat4_translate(30, 0, 0)});
 ```
 
 > **Observação sobre o exemplo:** ele usa `set_scene(&scene_)`, então
@@ -1104,16 +1326,17 @@ c3.draw_instanced(custom_, material_, {mat4_translate(10, 0, 0),
 |---|---|---|
 | `GLContext()` | — | Construtor padrão |
 | `~GLContext()` | — | Chama `destroy()` |
-| `init(ANativeWindow*, int = 2)` | — | Cria display/context/surface; fallback 3→2 |
-| `make_current()` | `const` | `eglMakeCurrent` se tudo válido |
+| `init(ANativeWindow*, int = 2)` | — | Cria display/context/surface; fallback 3→2; recupera perda |
+| `make_current()` | `const` | `eglMakeCurrent` se tudo válido; detecta `EGL_CONTEXT_LOST` |
 | `recreate_surface(ANativeWindow*)` | — | Destrói e recria a surface com o mesmo config |
 | `set_swap_interval(int)` | `const` | `eglSwapInterval` |
-| `swap()` | `const` | `eglSwapBuffers`; `bool` de sucesso |
+| `swap()` | `const` | `eglSwapBuffers`; detecta `EGL_CONTEXT_LOST` |
 | `clear_current()` | `const` | Solta current (surface e contexto nulos) |
-| `destroy()` | — | Libera surface, contexto e display |
-| `version()` | `const` | Versão efetiva (2 ou 3) |
-| `display()` | `const` | `EGLDisplay` |
-| `context()` | `const` | `EGLContext` |
+| `destroy()` | — | Libera EGL; após perda só descarta handles |
+| `context_lost()` / `device_lost()` | `const` | Estado de perda de contexto |
+| `needs_asset_reload()` | `const` | Recursos próprios do app precisam de reload |
+| `version()` / `requested_version()` | `const` | Versão efetiva e versão pedida |
+| `display()` / `context()` / `window()` | `const` | Estado atual do EGL |
 
 Cópia e atribuição por cópia estão **deletadas**.
 
@@ -1132,8 +1355,10 @@ Cópia e atribuição por cópia estão **deletadas**.
 | `set_uniform(name, float, float, float, float)` | `glUniform4f` |
 | `set_uniform_mat4(name, const float*)` | `glUniformMatrix4fv(..., 1, GL_FALSE, ...)` |
 | `attrib(name)` | `glGetAttribLocation` (sem cache) |
-| `program() const` | `GLuint` do programa |
-| `destroy()` | Deleta programa e limpa cache de locations |
+| `program() const` | `GLuint` do programa, ou `0` se a geração divergiu |
+| `valid() const` | Programa vivo na geração atual |
+| `release_without_gl()` | Descarta nome sem `glDeleteProgram` |
+| `destroy()` | Deleta programa (geração atual) e limpa cache de locations |
 
 ### 9.4 `Mesh` e `MeshData`
 
@@ -1145,8 +1370,9 @@ Cópia e atribuição por cópia estão **deletadas**.
 | `MeshData` | `static triangle()` | Triângulo legado em NDC |
 | `Mesh` | `Mesh()` / `~Mesh()` | Construtor padrão / `destroy()` |
 | `Mesh` | `upload(const MeshData&)` | VBO + IBO opcional, `GL_STATIC_DRAW` |
-| `Mesh` | `draw() const` | Atribs 0–3, `glDrawElements`/`glDrawArrays` |
-| `Mesh` | `destroy()` | Deleta VBO e IBO |
+| `Mesh` | `draw() const` | Atribs 0–3, `glDrawElements`/`glDrawArrays`; no-op se geração divergiu |
+| `Mesh` | `valid() const` / `release_without_gl()` | Checagem e descarte seguro de nomes |
+| `Mesh` | `destroy()` | Deleta VBO e IBO da geração atual |
 | `Mesh` | `vertex_count() const` | Nº de vértices registrado no upload |
 | `Mesh` | `set_vertex_count(GLsizei)` | Sobrescreve o contador usado por `glDrawArrays` |
 
@@ -1159,18 +1385,22 @@ Campos públicos de `MeshData`: `vertices`, `indices`, `topology`.
 |---|---|
 | `Texture()` / `~Texture()` | Construtor padrão / `destroy()` |
 | `load(path) -> bool` | Decode via stb_image embutido; RGBA, `GL_LINEAR`, `CLAMP_TO_EDGE` |
-| `bind(unit=0) const` | `glActiveTexture(GL_TEXTURE0+unit)` + `glBindTexture` |
-| `destroy()` | Deleta a textura |
+| `bind(unit=0) const` | `glActiveTexture(GL_TEXTURE0+unit)` + `glBindTexture`; no-op se geração divergiu |
+| `valid() const` / `release_without_gl()` | Checagem e descarte seguro do nome |
+| `destroy()` | Deleta a textura da geração atual |
 | `width() const` / `height() const` | Dimensões do último load |
-| `id() const` | `GLuint` da textura (`0` se inexistente) |
+| `id() const` | `GLuint` da textura na geração atual (`0` se inexistente ou se o contexto mudou) |
 
 ### 9.6 `GLES2Scene` (implementa `Scene`)
 
 | Método | Origem | Descrição |
 |---|---|---|
 | `GLES2Scene()` / `~GLES2Scene()` | própria | Destrutor chama `destroy()` |
-| `init(ANativeWindow*)` | própria (`virtual`) | Chama `init(window, 2)` |
+| `init(ANativeWindow*)` | própria (`virtual`) | Chama `init(window, 2)`; recupera perda pendente |
 | `init(window, version)` | `protected` | Inicialização real; reutilizada por `GLES3Scene` |
+| `recreate(window=nullptr, version=-1)` | própria | `destroy()`/`handle_context_loss()` + `init()` |
+| `context_lost()` / `device_lost()` | própria | Estado de perda (alias do VK) |
+| `needs_asset_reload()` | própria | `true` até inicialização bem-sucedida |
 | `set_shader(Shader*)` | própria | Override não proprietário |
 | `set_mesh(Mesh*)` | própria | Override não proprietário (usado por `render()`) |
 | `resize(int,int)` | `Scene` | Viewport + `mat4_ortho2d` |
@@ -1186,13 +1416,26 @@ Campos públicos de `MeshData`: `vertices`, `indices`, `topology`.
 | `destroy()` | própria | Limpa cache, malhas, shader e EGL |
 | `egl()` / `egl() const` | própria | Acesso ao `GLContext` |
 
+`destroy()` é `virtual` (a limpeza da `GLES3Scene` acontece antes da base).
+`init(window, version)`, `projection()` e `cached_texture()` são protegidos.
+
 ### 9.7 `GLES3Scene`
 
 | Método | Descrição |
 |---|---|
+| `Instance` | Struct pública: `Mat4 model` + `std::array<float,4> color` (80 bytes) |
 | `using GLES2Scene::init` | Reexpõe a sobrecarga com versão |
 | `init(ANativeWindow*)` | Chama `GLES2Scene::init(window, 3)` + aviso se caiu para 2 |
-| `draw_instanced(const MeshData&, const Material&, const std::vector<Mat4>&)` | Loop de `draw()` com `u_model` por matriz |
+| `~GLES3Scene()` / `destroy()` | Liberam VAO, VBO de instâncias e shader antes da base (`destroy()` é virtual; sem `glDelete*` após perda) |
+| Herdadas de `GLES2Scene` | `context_lost()`, `device_lost()`, `needs_asset_reload()`, `recreate()` |
+| `draw_instanced(const Mesh&, const Material&, const std::vector<Instance>&) -> bool` | 1 `glDraw*Instanced`; `false` no fallback e com geração divergente |
+| `draw_instanced(const MeshData&, const Material&, const std::vector<Instance>&) -> bool` | Upload único + 1 `glDraw*Instanced`; `false` no fallback |
+| `draw_instanced(const MeshData&, const Material&, const std::vector<Mat4>&)` | Assinatura antiga preservada; converte para `Instance` com cor branca |
+
+Membros protegidos acrescentados em `GLES2Scene` para a subclasse:
+`const Mat4& projection() const` e `Texture* cached_texture(const std::string&)`.
+`Mesh` declara `GLES3Scene` como `friend` para reaproveitar VBO/IBO sem um
+`draw()` normal.
 
 ---
 
@@ -1209,6 +1452,10 @@ mesh.draw();
 for (GLuint i = 0; i < 4; ++i) glDisableVertexAttribArray(i);
 ```
 
+O caminho instanciado (§7.2) liga temporariamente os atributos 0–8 com divisor
+1 em 4–8 e, ao final, zera os divisores, desliga os arrays e desfaz o
+`glBindVertexArray`: chamar `draw_mesh()` logo depois é seguro.
+
 O mesmo vale para estados de `Material`: `depth_test`/`blend` são alterados a
 cada `draw_mesh()` e só voltam ao padrão no próximo `begin_frame()` — se você
 gerencia o frame sem `begin_frame()` da cena, restaure-os você mesmo.
@@ -1216,14 +1463,15 @@ gerencia o frame sem `begin_frame()` da cena, restaure-os você mesmo.
 ### 10.2 Textura falha e o cache
 
 - Caminhos de textura são cacheados por string em `textures_`.
-- Um `load()` com falha **não entra** no cache (a tentativa se repete a cada
-  draw) e, pior, o código chama `it->second->bind(0)` com `it == end()` —
-  comportamento indefinido.
-- **Mitigação segura:** valide com `Texture prova; if (prova.load(caminho))`
-  antes de colocar `caminho` em `Material::texture`; nunca deixe um caminho
-  inválido chegar a `draw_mesh()`.
+- `cached_texture()` centraliza o cache para `draw_mesh()` e para o caminho
+  instanciado. Um `load()` com falha **não entra** no cache, loga o warning e
+  devolve `nullptr`; `u_use_texture` vira `0` e nenhum `bind()` é chamado.
+- A tentativa se repete a cada draw enquanto o caminho for inválido: valide com
+  `Texture prova; if (prova.load(caminho))` antes de preencher
+  `Material::texture` se isso importar.
 - O cache só é limpo em `destroy()`; renomear/sobrescrever um asset em runtime
-  não atualiza a textura já carregada.
+  não atualiza a textura já carregada. Em recuperação de device loss,
+  `init()`/`recreate()` recarrega cada caminho do cache automaticamente.
 
 ### 10.3 `glGetError` só em `APKFAST_DEBUG`
 
@@ -1231,9 +1479,19 @@ Sem `APKFAST_DEBUG`, `gl_check()` não chama `glGetError()` — erros GL silenci
 não aparecem. Compilações de debug devem definir a macro para ver os warnings
 `nativeapp-gl: <operação>: glGetError=0x...`. Mesmo em debug, `gl_check()` só
 **loga**; não interrompe a execução. Falhas de `glCompileShader`/link e de EGL
-já lançam `GLError` independentemente da macro.
+já lançam `GLError` independentemente da macro. A detecção de device loss,
+diferente de `gl_check()`, **não** depende de `APKFAST_DEBUG`: `eglGetError()`
+é consultado nas chamadas EGL críticas mesmo em release.
 
-### 10.4 Duplo frame boundary: `render()` + `set_scene()`
+### 10.4 Device loss não é `eglSwapBuffers falhou`
+
+Um `eglSwapBuffers` que retorna `false` com `EGL_BAD_SURFACE` é problema de
+janela/surface, não perda de contexto — gera apenas warning e a cena continua.
+Somente `EGL_CONTEXT_LOST` (`0x300E`) dispara `context_lost()`/
+`needs_asset_reload()`. Não tente reanimar a cena com `make_current()` nesse
+estado: ele é no-op até `init()`/`recreate()` (§6.8).
+
+### 10.5 Duplo frame boundary: `render()` + `set_scene()`
 
 O `App` executa, a cada frame:
 
@@ -1263,7 +1521,7 @@ driver. Escolha **um** dos estilos:
 > exemplo `nativeapp-gl` faz; chamar `draw()` sem `set_scene()` não limpa a tela
 > nem troca buffers — você teria que fazer `begin_frame()`/`present()` na mão.
 
-### 10.5 NDC vs coordenadas de tela
+### 10.6 NDC vs coordenadas de tela
 
 | Contexto | Sistema de coordenadas |
 |---|---|
@@ -1283,7 +1541,7 @@ Erros comuns:
 - esquecer `resize()` após `recreate_surface()` → viewport/projection
   defasados com a nova janela.
 
-### 10.6 Outras armadilhas menores
+### 10.7 Outras armadilhas menores
 
 - `Shader::use()` não é implícito nos setters; `glUniform*` atua no programa
   atual. `draw_mesh()` já chama `use()`.
@@ -1294,7 +1552,7 @@ Erros comuns:
 - `set_shader()`/`set_mesh()` guardam ponteiros crus: a cena não os deleta e
   não verifica se continuam vivos.
 - `SpriteVertex` não tem caminho de upload neste cabeçalho.
-- `draw_instanced()` não é instancing real (§7.2): N matrizes = N `draw()`s com
-  N uploads.
+- `draw_instanced()` só é real em contexto GLES3 (§7): com fallback para GLES2
+  ele vira N `draw()`s e avisa no log; use o retorno `bool` para detectar isso.
 - `init()` é idempotente enquanto `initialized_` for `true`; `destroy()` só
   libera se `initialized_` for `true`.
